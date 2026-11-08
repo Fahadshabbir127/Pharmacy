@@ -8,3 +8,5 @@ coverage/
 !.env.example
 *.db
 *.sqlite
+# generated test fixtures (synthetic legacy databases)
+tests/.fixtures/
