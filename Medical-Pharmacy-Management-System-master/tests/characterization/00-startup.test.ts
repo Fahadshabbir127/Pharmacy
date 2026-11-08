@@ -18,14 +18,15 @@ describe('startup on an empty data directory', () => {
     expect(fs.existsSync(srv.dbFile)).toBe(true);
   });
 
-  it('creates all 17 legacy tables', async () => {
+  it('creates all 17 legacy tables plus schema_migrations (Phase 3) and uses WAL', async () => {
     const db = await openReadOnly(srv.dbFile);
     expect(tableNames(db)).toEqual([
       'audit_logs', 'categories', 'customer_ledger', 'customers', 'email_queue', 'otp_verifications',
-      'products', 'purchase_headers', 'purchase_items', 'sale_items', 'sales_headers', 'settings',
+      'products', 'purchase_headers', 'purchase_items', 'sale_items', 'sales_headers', 'schema_migrations', 'settings',
       'sms_queue', 'stock_adjustments', 'suppliers', 'tenants', 'users',
     ]);
     expect(integrityCheck(db)).toEqual([]);
+    expect(db.pragma('journal_mode', { simple: true })).toBe('wal');
   });
 
   it('seeds demo data: 11 categories, 3 suppliers, 3 customers, 12 products, 1 sale', async () => {
@@ -121,17 +122,17 @@ describe('persistence across restart', () => {
 });
 
 describe('startup with a corrupt database file', () => {
-  it('[LEGACY-BUG R10] renames the corrupt file and silently starts a fresh demo database', async () => {
+  // Phase 3 fix of R10 (was: renamed the file and silently started a fresh demo database)
+  it('[FIXED R10] refuses to start, exits with an explanation, and leaves the damaged file untouched', async () => {
     const { makeTempDir } = await import('../helpers/server');
+    const crypto = await import('node:crypto');
+    const workDir = makeTempDir();
     const seed = `${makeTempDir()}/bad.sqlite`;
     fs.writeFileSync(seed, Buffer.from('this is not a sqlite database at all'.repeat(200)));
-    const srv = await startServer({ seedDb: seed });
-    try {
-      const files = fs.readdirSync(`${srv.workDir}/data`);
-      expect(files.some((f) => f.includes('.corrupt.'))).toBe(true);
-      expect((await new Api().login('admin', 'admin123')).role).toBe('ADMIN');
-    } finally {
-      await srv.stop();
-    }
+    const before = crypto.createHash('sha256').update(fs.readFileSync(seed)).digest('hex');
+    await expect(startServer({ workDir, seedDb: seed })).rejects.toThrow(/exited early with code 1[\s\S]*STARTUP STOPPED[\s\S]*failed its integrity check and was NOT opened or modified/);
+    const files = fs.readdirSync(`${workDir}/data`);
+    expect(files).toEqual(['khushi_pharmacy.sqlite']);
+    expect(crypto.createHash('sha256').update(fs.readFileSync(`${workDir}/data/khushi_pharmacy.sqlite`)).digest('hex')).toBe(before);
   });
 });

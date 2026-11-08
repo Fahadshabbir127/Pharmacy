@@ -11,11 +11,15 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import net from 'node:net';
+import { pathToFileURL } from 'node:url';
+import { createRequire } from 'node:module';
 
 export const PROJECT_ROOT = path.resolve(__dirname, '..', '..');
 export const CURRENT_SERVER = path.join(PROJECT_ROOT, 'server.ts');
 export const ORIGINAL_SERVER = path.join(PROJECT_ROOT, 'tests', 'legacy', 'server.original.ts');
-const TSX_BIN = path.join(PROJECT_ROOT, 'node_modules', '.bin', process.platform === 'win32' ? 'tsx.cmd' : 'tsx');
+// Run node directly with the tsx loader (one process). The `tsx` CLI runs the script in a
+// child process, so killing the CLI with SIGKILL would orphan the real server.
+const TSX_LOADER = pathToFileURL(createRequire(__filename).resolve('tsx')).href;
 
 export const PORT = 3000;
 export const BASE_URL = `http://127.0.0.1:${PORT}`;
@@ -25,6 +29,8 @@ export interface RunningServer {
   dbFile: string;
   logs: () => string;
   stop: () => Promise<void>;
+  /** Hard kill (SIGKILL): simulates a crash or power cut - no shutdown code runs. */
+  kill: () => Promise<void>;
 }
 
 export function makeTempDir(prefix = 'pharmacy-test-'): string {
@@ -73,7 +79,7 @@ export async function startServer(opts: { workDir?: string; entry?: string; seed
   if (opts.seedDb) fs.copyFileSync(opts.seedDb, dbFile);
 
   let output = '';
-  const proc = spawn(TSX_BIN, [opts.entry ?? CURRENT_SERVER], {
+  const proc = spawn(process.execPath, ['--import', TSX_LOADER, opts.entry ?? CURRENT_SERVER], {
     cwd: workDir,
     env: { ...process.env, NODE_ENV: 'production', ...opts.env },
     stdio: ['ignore', 'pipe', 'pipe'],
@@ -89,10 +95,19 @@ export async function startServer(opts: { workDir?: string; entry?: string; seed
     throw e;
   }
 
+  const waitPortFree = async () => {
+    for (let i = 0; i < 40 && (await portInUse(PORT)); i++) await new Promise((r) => setTimeout(r, 100));
+  };
   return {
     workDir,
     dbFile,
     logs,
+    kill: () =>
+      new Promise<void>((resolve) => {
+        if (proc.exitCode !== null || proc.signalCode) return resolve();
+        proc.once('exit', () => resolve());
+        proc.kill('SIGKILL');
+      }).then(waitPortFree),
     stop: () =>
       new Promise<void>((resolve) => {
         if (proc.exitCode !== null) return resolve();

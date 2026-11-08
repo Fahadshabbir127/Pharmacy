@@ -180,7 +180,7 @@ describe('OTP expiry comparison', () => {
     const now = new Date();
     const expired = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 1)).toISOString();
     await editDbFile(dbFile, (db) => {
-      db.run("INSERT INTO otp_verifications (email, otp_code, expires_at) VALUES ('expired@test.local', '123456', ?)", [expired]);
+      db.prepare("INSERT INTO otp_verifications (email, otp_code, expires_at) VALUES ('expired@test.local', '123456', ?)").run(expired);
     });
     srv = await startServer({ workDir });
     try {

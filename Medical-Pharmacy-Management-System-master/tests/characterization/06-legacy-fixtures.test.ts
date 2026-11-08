@@ -83,6 +83,15 @@ describe('generated legacy fixtures', () => {
     expect(mig.rowCounts.tenants).toBe(1);
   });
 
+  it('[LEGACY-BUG] on the oldest schema the original app\'s users rebuild drops users.allowed_services (re-added only on the next start)', async () => {
+    const Database = (await import('better-sqlite3')).default;
+    const d = new Database(path.join(FIXTURE_DIR, 'pre-tenant-migrated-by-original.sqlite'), { readonly: true });
+    const cols = (d.prepare('PRAGMA table_info(users)').all() as { name: string }[]).map((c) => c.name);
+    d.close();
+    expect(cols).toContain('tenant_id');
+    expect(cols).not.toContain('allowed_services');
+  });
+
   it('writes a manifest.json next to the fixtures', () => {
     expect(fs.existsSync(path.join(FIXTURE_DIR, 'manifest.json'))).toBe(true);
   });
