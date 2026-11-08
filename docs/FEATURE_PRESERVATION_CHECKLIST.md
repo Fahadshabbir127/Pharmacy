@@ -9,6 +9,8 @@ Every feature found in the existing source (revision `ec90af3`) must keep workin
 
 All rows start as `pending`.
 
+**Phase 2 baseline:** the automated characterisation suite (`tests/characterization/`, 111 tests, see `TESTING_REPORT.md`) now covers the backend behaviour behind sections 1–12. Each item's `Status` stays `pending` until it is verified again after the conversion, in the desktop app, on Windows.
+
 ## 1. Authentication & accounts
 
 | # | Feature | Source | Auto | Manual | Status |

@@ -258,6 +258,23 @@ See `ARCHITECTURE.md`. In summary:
 | C10 | Email/SMS "Process queue" marks messages SENT without sending | Kept as is, but relabelled "Mark as sent (manual dispatch)" so it no longer suggests automatic delivery. Real SMTP sending can be added later as an optional internet feature. | Honesty; offline-first |
 | C11 | `startup` invents barcodes `8901000000NNN` for products without one | Stop inventing barcodes for new products. Existing invented barcodes are left unchanged. | Data integrity |
 
+## 15. Additional defects confirmed by the Phase 2 baseline tests
+
+The executed baseline suite (`TESTING_REPORT.md`) confirmed the findings above and found more. The full table with the test that proves each one is in `TESTING_REPORT.md`.
+
+- **First boot leaves every seeded row with `tenant_id NULL`.** The admin's audit log is empty, the demo sale is missing from the register, and other stores can see store #1 data until the app is restarted.
+- **Deleting a product removes its lines from past invoices.** The invoice view uses an inner JOIN.
+- **Deleting a customer erases their ledger** and writes no audit entry.
+- **Deleting a store leaves orphaned child rows.**
+- **Sales referencing a non-existent product are accepted.**
+- **Customer portal logins are created with the default password `customer123`.**
+- **An expired OTP stays valid until UTC midnight.**
+- **The login-OTP endpoint reveals whether an account exists.**
+- **CUSTOMER role can read cost prices** through `/api/inventory`.
+- **Any store's ADMIN can clear every store's audit log.**
+- **Overpayment makes customer balances negative.**
+- **The original app injects its two SUPER_ADMIN accounts into an existing customer database during upgrade.**
+
 ---
 
 ## Appendix A: Route and DB call-site inventory (`server.ts`)

@@ -10,7 +10,10 @@
     "start": "node dist/server.cjs",
     "electron": "electron .",
     "clean": "rm -rf dist server.cjs",
-    "lint": "tsc --noEmit"
+    "lint": "tsc --noEmit",
+    "test": "vitest run",
+    "test:characterization": "vitest run tests/characterization",
+    "fixtures:legacy": "vitest run tests/characterization/06-legacy-fixtures.test.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -45,6 +48,7 @@
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
-    "vite": "^6.2.3"
+    "vite": "^6.2.3",
+    "vitest": "^3.2.4"
   }
 }
