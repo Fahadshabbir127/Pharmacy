@@ -6,571 +6,264 @@ import crypto from 'crypto';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import cron from 'node-cron';
-import initSqlJs, { Database } from 'sql.js';
+import { DbAdapter } from './server/db/adapter';
+import { openDatabase, checkExistingDatabase, DatabaseIntegrityError } from './server/db/open';
+import { MigrationError } from './server/db/migrate';
+import { transactionalRoute } from './server/db/transactionalRoute';
 import { createServer as createViteServer } from 'vite';
 
-const PORT = 3000;
+const PORT = Number(process.env.PHARMACY_PORT) || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || 'khushi_medical_hall_secret_key_2026';
-const DATA_DIR = path.join(process.cwd(), 'data');
+const DATA_DIR = process.env.PHARMACY_DATA_DIR ? path.resolve(process.env.PHARMACY_DATA_DIR) : path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'khushi_pharmacy.sqlite');
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
 }
 
-let db: Database;
+let db: DbAdapter;
+const BACKUP_DIR = path.join(DATA_DIR, 'backups');
 
-// Helper to save SQL.js in-memory database to local disk atomically & permanently
-function saveDatabase() {
-  if (db) {
-    try {
-      const data = db.export();
-      const buffer = Buffer.from(data);
-      const tempPath = `${DB_FILE}.tmp`;
-      fs.writeFileSync(tempPath, buffer);
-      fs.renameSync(tempPath, DB_FILE);
-    } catch (err) {
-      console.error("Critical error saving database to disk:", err);
-    }
-  }
-}
+/** Wrap a synchronous route handler in one DB transaction (response sent only after COMMIT). */
+const tx = <H extends (...args: any[]) => any>(handler: H) => transactionalRoute(() => db, handler as any);
 
 // Database Initialization with Tables and Sample Data
 async function initDatabase() {
-  const SQL = await initSqlJs();
-  let dbLoadedSuccessfully = false;
+  // Integrity check (read-only), then versioned migrations with a verified pre-migration backup.
+  // A damaged database stops startup and is left untouched (see server/db/open.ts).
+  const opened = await openDatabase(DB_FILE, { backupDir: BACKUP_DIR, log: (m) => console.log(`[DB] ${m}`) });
+  db = opened.db;
 
-  if (fs.existsSync(DB_FILE)) {
-    try {
-      const fileBuffer = fs.readFileSync(DB_FILE);
-      db = new SQL.Database(fileBuffer);
-      // Verify database health with a master query
-      db.exec("SELECT count(*) FROM sqlite_master;");
-      dbLoadedSuccessfully = true;
-    } catch (err) {
-      console.error("Error opening existing database file (file may be malformed or corrupt):", err);
-      const corruptBackupPath = `${DB_FILE}.corrupt.${Date.now()}`;
-      try {
-        if (fs.existsSync(DB_FILE)) {
-          fs.renameSync(DB_FILE, corruptBackupPath);
-          console.log(`Corrupt database moved to ${corruptBackupPath}`);
-        }
-      } catch (renameErr) {
-        console.error("Failed to rename corrupt database file:", renameErr);
-      }
-      db = new SQL.Database();
-    }
-  } else {
-    db = new SQL.Database();
-  }
+  // Legacy startup data tasks (unchanged behaviour; scheduled for approved removal in later phases).
+  db.transaction(() => {
+    db.run("UPDATE tenants SET allowed_services = 'POS_BILLING,INVENTORY,UDHAR_KHATTA,PURCHASES,REPORTS,EMAIL_ALERTS,USER_VERIFY,USER_REGISTER,USER_RESET_PASSWORD,AUDIT_LOGS,SETTINGS,CUSTOMER_PORTAL' WHERE allowed_services IS NULL OR allowed_services = ''");
 
-  // Create tables
-  db.run(`
-    CREATE TABLE IF NOT EXISTS users (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      username TEXT UNIQUE NOT NULL,
-      password_hash TEXT NOT NULL,
-      role TEXT NOT NULL,
-      full_name TEXT NOT NULL,
-      email TEXT,
-      phone TEXT,
-      status TEXT DEFAULT 'APPROVED',
-      customer_id INTEGER,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS categories (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL UNIQUE,
-      description TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS suppliers (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      phone TEXT,
-      company TEXT,
-      address TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS products (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      unit TEXT NOT NULL,
-      purchase_price REAL NOT NULL,
-      sale_price REAL NOT NULL,
-      min_stock INTEGER NOT NULL DEFAULT 10,
-      stock INTEGER NOT NULL DEFAULT 0,
-      batch_number TEXT,
-      expiry_date TEXT,
-      category_id INTEGER,
-      hsn_code TEXT,
-      gst_rate REAL DEFAULT 0,
-      rack_location TEXT,
-      supplier_id INTEGER,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      FOREIGN KEY (category_id) REFERENCES categories(id),
-      FOREIGN KEY (supplier_id) REFERENCES suppliers(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS customers (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      phone TEXT UNIQUE NOT NULL,
-      address TEXT,
-      opening_balance REAL DEFAULT 0,
-      current_balance REAL DEFAULT 0,
-      login_id TEXT UNIQUE,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS customer_ledger (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      customer_id INTEGER NOT NULL,
-      transaction_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      type TEXT NOT NULL CHECK(type IN ('SALE', 'PAYMENT', 'ADJUSTMENT')),
-      reference TEXT,
-      debit REAL DEFAULT 0,
-      credit REAL DEFAULT 0,
-      balance_after REAL DEFAULT 0,
-      notes TEXT,
-      FOREIGN KEY (customer_id) REFERENCES customers(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS sales_headers (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      invoice_number TEXT UNIQUE NOT NULL,
-      customer_id INTEGER,
-      sale_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      total_amount REAL NOT NULL,
-      discount_percent REAL DEFAULT 0,
-      discount_amount REAL DEFAULT 0,
-      net_amount REAL NOT NULL,
-      total_gst REAL DEFAULT 0,
-      grand_total REAL NOT NULL,
-      payment_method TEXT NOT NULL CHECK(payment_method IN ('CASH', 'PARTIAL', 'UDHAR')),
-      amount_paid REAL NOT NULL,
-      amount_due REAL NOT NULL,
-      payment_status TEXT NOT NULL CHECK(payment_status IN ('PAID', 'PARTIAL', 'UNPAID')),
-      created_by_user_id INTEGER NOT NULL,
-      FOREIGN KEY (customer_id) REFERENCES customers(id),
-      FOREIGN KEY (created_by_user_id) REFERENCES users(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS sale_items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      sale_id INTEGER NOT NULL,
-      product_id INTEGER NOT NULL,
-      quantity INTEGER NOT NULL,
-      unit TEXT NOT NULL,
-      sale_price REAL NOT NULL,
-      cost_price REAL NOT NULL,
-      discount_percent REAL DEFAULT 0,
-      discount_amount REAL DEFAULT 0,
-      gst_amount REAL DEFAULT 0,
-      batch_number TEXT,
-      expiry_date TEXT,
-      subtotal REAL NOT NULL,
-      FOREIGN KEY (sale_id) REFERENCES sales_headers(id),
-      FOREIGN KEY (product_id) REFERENCES products(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS purchase_headers (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      invoice_number TEXT UNIQUE NOT NULL,
-      supplier_id INTEGER NOT NULL,
-      purchase_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      total_amount REAL NOT NULL,
-      notes TEXT,
-      FOREIGN KEY (supplier_id) REFERENCES suppliers(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS purchase_items (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      purchase_id INTEGER NOT NULL,
-      product_id INTEGER NOT NULL,
-      quantity INTEGER NOT NULL,
-      purchase_price REAL NOT NULL,
-      batch_number TEXT,
-      expiry_date TEXT,
-      FOREIGN KEY (purchase_id) REFERENCES purchase_headers(id),
-      FOREIGN KEY (product_id) REFERENCES products(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS stock_adjustments (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      product_id INTEGER NOT NULL,
-      adjustment_type TEXT NOT NULL CHECK(adjustment_type IN ('ADD', 'REMOVE')),
-      quantity INTEGER NOT NULL,
-      reason TEXT NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      user_id INTEGER NOT NULL,
-      FOREIGN KEY (product_id) REFERENCES products(id),
-      FOREIGN KEY (user_id) REFERENCES users(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS email_queue (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      customer_id INTEGER NOT NULL,
-      email TEXT NOT NULL,
-      subject TEXT NOT NULL,
-      message TEXT NOT NULL,
-      type TEXT NOT NULL CHECK(type IN ('UDHAR_REMINDER', 'PAYMENT_CONFIRMATION', 'WELCOME', 'ACCOUNT_APPROVED')),
-      status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING', 'SENT', 'FAILED')),
-      error_message TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      sent_at TIMESTAMP,
-      FOREIGN KEY (customer_id) REFERENCES customers(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS sms_queue (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      customer_id INTEGER NOT NULL,
-      phone TEXT NOT NULL,
-      message TEXT NOT NULL,
-      type TEXT NOT NULL CHECK(type IN ('UDHAR_REMINDER', 'PAYMENT_CONFIRMATION', 'WELCOME')),
-      status TEXT NOT NULL DEFAULT 'PENDING' CHECK(status IN ('PENDING', 'SENT', 'FAILED')),
-      error_message TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      sent_at TIMESTAMP,
-      FOREIGN KEY (customer_id) REFERENCES customers(id)
-    );
-
-    CREATE TABLE IF NOT EXISTS settings (
-      key TEXT PRIMARY KEY,
-      value TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS audit_logs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      user_id INTEGER,
-      user_name TEXT,
-      action_type TEXT NOT NULL,
-      description TEXT NOT NULL,
-      target_type TEXT,
-      target_id INTEGER,
-      ip_address TEXT,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-
-    CREATE TABLE IF NOT EXISTS otp_verifications (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      email TEXT NOT NULL,
-      otp_code TEXT NOT NULL,
-      expires_at TIMESTAMP NOT NULL,
-      is_verified INTEGER DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS tenants (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      name TEXT NOT NULL,
-      owner_name TEXT NOT NULL,
-      owner_email TEXT NOT NULL UNIQUE,
-      phone TEXT,
-      address TEXT,
-      city TEXT DEFAULT 'Lahore',
-      country TEXT DEFAULT 'Pakistan',
-      currency TEXT DEFAULT 'PKR',
-      status TEXT DEFAULT 'ACTIVE',
-      plan TEXT DEFAULT 'PRO',
-      max_users INTEGER DEFAULT 10,
-      max_products INTEGER DEFAULT 5000,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-  `);
-
-  // Migration for users, products, customer_ledger, categories, suppliers, purchases, adjustments, settings table columns
-  try { db.run("ALTER TABLE users ADD COLUMN email TEXT"); } catch (e) {}
-  try { db.run("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'APPROVED'"); } catch (e) {}
-  try { db.run("ALTER TABLE users ADD COLUMN tenant_id INTEGER"); } catch (e) {}
-  try { db.run("ALTER TABLE users ADD COLUMN allowed_services TEXT"); } catch (e) {}
-  try { db.run("ALTER TABLE products ADD COLUMN barcode TEXT"); } catch (e) {}
-  try { db.run("ALTER TABLE products ADD COLUMN tenant_id INTEGER"); } catch (e) {}
-  try { db.run("ALTER TABLE sales_headers ADD COLUMN tenant_id INTEGER"); } catch (e) {}
-  try { db.run("ALTER TABLE customers ADD COLUMN tenant_id INTEGER"); } catch (e) {}
-  try { db.run("ALTER TABLE categories ADD COLUMN tenant_id INTEGER"); } catch (e) {}
-  try { db.run("ALTER TABLE suppliers ADD COLUMN tenant_id INTEGER"); } catch (e) {}
-  try { db.run("ALTER TABLE purchase_headers ADD COLUMN tenant_id INTEGER"); } catch (e) {}
-  try { db.run("ALTER TABLE stock_adjustments ADD COLUMN tenant_id INTEGER"); } catch (e) {}
-  try { db.run("ALTER TABLE settings ADD COLUMN tenant_id INTEGER"); } catch (e) {}
-  try { db.run("ALTER TABLE customer_ledger ADD COLUMN sale_id INTEGER"); } catch (e) {}
-  try { db.run("ALTER TABLE tenants ADD COLUMN allowed_services TEXT DEFAULT 'POS_BILLING,INVENTORY,UDHAR_KHATTA,PURCHASES,REPORTS,EMAIL_ALERTS,USER_VERIFY,USER_REGISTER,USER_RESET_PASSWORD,AUDIT_LOGS,SETTINGS,CUSTOMER_PORTAL'"); } catch (e) {}
-  try { db.run("ALTER TABLE audit_logs ADD COLUMN tenant_id INTEGER"); } catch (e) {}
-  try { db.run("ALTER TABLE audit_logs ADD COLUMN user_agent TEXT"); } catch (e) {}
-  try { db.run("ALTER TABLE email_queue ADD COLUMN tenant_id INTEGER"); } catch (e) {}
-  try { db.run("ALTER TABLE sms_queue ADD COLUMN tenant_id INTEGER"); } catch (e) {}
-
-  db.run("UPDATE tenants SET allowed_services = 'POS_BILLING,INVENTORY,UDHAR_KHATTA,PURCHASES,REPORTS,EMAIL_ALERTS,USER_VERIFY,USER_REGISTER,USER_RESET_PASSWORD,AUDIT_LOGS,SETTINGS,CUSTOMER_PORTAL' WHERE allowed_services IS NULL OR allowed_services = ''");
-
-  // Guarantee default flagship store tenant #1
-  const tenantCheck = queryOne<{ count: number }>("SELECT COUNT(*) as count FROM tenants");
-  if (!tenantCheck || tenantCheck.count === 0) {
-    db.run(`
-      INSERT INTO tenants (id, name, owner_name, owner_email, phone, address, city, status, plan)
-      VALUES (1, 'Khushi Medical Hall', 'Muhammad Asghar', 'admin@khushipos.com', '03000000000', 'Main Bazaar, Lahore', 'Lahore', 'ACTIVE', 'PRO')
-    `);
-  }
-  db.run("UPDATE users SET tenant_id = 1 WHERE tenant_id IS NULL AND role != 'SUPER_ADMIN'");
-  db.run("UPDATE products SET tenant_id = 1 WHERE tenant_id IS NULL");
-  db.run("UPDATE sales_headers SET tenant_id = 1 WHERE tenant_id IS NULL");
-  db.run("UPDATE customers SET tenant_id = 1 WHERE tenant_id IS NULL");
-  db.run("UPDATE categories SET tenant_id = 1 WHERE tenant_id IS NULL");
-  db.run("UPDATE suppliers SET tenant_id = 1 WHERE tenant_id IS NULL");
-  db.run("UPDATE purchase_headers SET tenant_id = 1 WHERE tenant_id IS NULL");
-  db.run("UPDATE stock_adjustments SET tenant_id = 1 WHERE tenant_id IS NULL");
-  db.run("UPDATE settings SET tenant_id = 1 WHERE tenant_id IS NULL");
-
-  try {
-    db.run("ALTER TABLE users ADD COLUMN email TEXT");
-  } catch (e) {}
-  try {
-    db.run("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'APPROVED'");
-  } catch (e) {}
-  
-  // Rebuild users table if old constraint exists
-  try {
-    const tableSql = queryOne<{ sql: string }>("SELECT sql FROM sqlite_master WHERE type='table' AND name='users'");
-    if (tableSql && tableSql.sql && tableSql.sql.includes("CHECK(role IN")) {
+    // Guarantee default flagship store tenant #1
+    const tenantCheck = queryOne<{ count: number }>("SELECT COUNT(*) as count FROM tenants");
+    if (!tenantCheck || tenantCheck.count === 0) {
       db.run(`
-        CREATE TABLE users_migration (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          username TEXT UNIQUE NOT NULL,
-          password_hash TEXT NOT NULL,
-          role TEXT NOT NULL,
-          full_name TEXT NOT NULL,
-          phone TEXT,
-          customer_id INTEGER,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          email TEXT,
-          status TEXT DEFAULT 'APPROVED',
-          tenant_id INTEGER
-        );
+        INSERT INTO tenants (id, name, owner_name, owner_email, phone, address, city, status, plan)
+        VALUES (1, 'Khushi Medical Hall', 'Muhammad Asghar', 'admin@khushipos.com', '03000000000', 'Main Bazaar, Lahore', 'Lahore', 'ACTIVE', 'PRO')
       `);
-      db.run(`INSERT OR IGNORE INTO users_migration (id, username, password_hash, role, full_name, phone, customer_id, created_at, email, status, tenant_id)
-              SELECT id, username, password_hash, role, full_name, phone, customer_id, created_at, email, status, tenant_id FROM users;`);
-      db.run("DROP TABLE users;");
-      db.run("ALTER TABLE users_migration RENAME TO users;");
     }
-  } catch (e) {
-    console.error("Migration warning for users table:", e);
-  }
-  db.run("UPDATE users SET status = 'APPROVED' WHERE status IS NULL OR status = ''");
-  db.run("UPDATE products SET barcode = '8901000000' || PRINTF('%03d', id) WHERE barcode IS NULL OR barcode = ''");
-  // Always guarantee admin user has ADMIN role and Owner Name: Muhammad Asghar
-  db.run("UPDATE users SET full_name = 'Muhammad Asghar (Owner)', role = 'ADMIN', status = 'APPROVED' WHERE username = 'admin'");
+    db.run("UPDATE users SET tenant_id = 1 WHERE tenant_id IS NULL AND role != 'SUPER_ADMIN'");
+    db.run("UPDATE products SET tenant_id = 1 WHERE tenant_id IS NULL");
+    db.run("UPDATE sales_headers SET tenant_id = 1 WHERE tenant_id IS NULL");
+    db.run("UPDATE customers SET tenant_id = 1 WHERE tenant_id IS NULL");
+    db.run("UPDATE categories SET tenant_id = 1 WHERE tenant_id IS NULL");
+    db.run("UPDATE suppliers SET tenant_id = 1 WHERE tenant_id IS NULL");
+    db.run("UPDATE purchase_headers SET tenant_id = 1 WHERE tenant_id IS NULL");
+    db.run("UPDATE stock_adjustments SET tenant_id = 1 WHERE tenant_id IS NULL");
+    db.run("UPDATE settings SET tenant_id = 1 WHERE tenant_id IS NULL");
 
-  // Default pre-written message templates in settings
-  db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('owner_name', 'Muhammad Asghar')");
-  db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('msg_template_udhar_reminder', 'محترم {name} صاحب! خوشی میڈیکل ہال پر آپ کا بقیہ ادھار رقم Rs. {balance} ہے۔ برائے مہربانی اپنا ادھار کھاتہ جلد از جلد صاف فرمائیں۔ شکریہ! - Khushi Medical Hall')");
-  db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('msg_template_payment_receipt', 'محترم {name}! خوشی میڈیکل ہال میں آپ کی طرف سے رقم موصول ہو گئی ہے۔ آپ کا بقیہ کھاتہ Rs. {balance} ہے۔ شکریہ! - Khushi Medical Hall')");
-  db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('msg_template_refill', 'Dear {name}, your regular medicine prescription stock at Khushi Medical Hall may be finishing soon. Visit us today for fresh refill & discounts! - Khushi Medical Hall')");
-  db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('msg_template_welcome', 'Dear {name}, welcome to Khushi Medical Hall! Your account is active. Thank you!')");
+    db.run("UPDATE users SET status = 'APPROVED' WHERE status IS NULL OR status = ''");
+    db.run("UPDATE products SET barcode = '8901000000' || PRINTF('%03d', id) WHERE barcode IS NULL OR barcode = ''");
+    // Always guarantee admin user has ADMIN role and Owner Name: Muhammad Asghar
+    db.run("UPDATE users SET full_name = 'Muhammad Asghar (Owner)', role = 'ADMIN', status = 'APPROVED' WHERE username = 'admin'");
 
-  // Check if users exist; if not seed default users & sample Pakistani pharmacy data
-  const userCheck = db.exec("SELECT COUNT(*) as count FROM users");
-  const count = userCheck[0].values[0][0] as number;
+    // Default pre-written message templates in settings
+    db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('owner_name', 'Muhammad Asghar')");
+    db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('msg_template_udhar_reminder', 'محترم {name} صاحب! خوشی میڈیکل ہال پر آپ کا بقیہ ادھار رقم Rs. {balance} ہے۔ برائے مہربانی اپنا ادھار کھاتہ جلد از جلد صاف فرمائیں۔ شکریہ! - Khushi Medical Hall')");
+    db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('msg_template_payment_receipt', 'محترم {name}! خوشی میڈیکل ہال میں آپ کی طرف سے رقم موصول ہو گئی ہے۔ آپ کا بقیہ کھاتہ Rs. {balance} ہے۔ شکریہ! - Khushi Medical Hall')");
+    db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('msg_template_refill', 'Dear {name}, your regular medicine prescription stock at Khushi Medical Hall may be finishing soon. Visit us today for fresh refill & discounts! - Khushi Medical Hall')");
+    db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('msg_template_welcome', 'Dear {name}, welcome to Khushi Medical Hall! Your account is active. Thank you!')");
 
-  if (count === 0) {
-    console.log("Seeding initial database with sample data for Khushi Medical Hall...");
-    const adminPassHash = bcrypt.hashSync('admin123', 10);
-    const staffPassHash = bcrypt.hashSync('staff123', 10);
-    const customerPassHash = bcrypt.hashSync('customer123', 10);
+    // Check if users exist; if not seed default users & sample Pakistani pharmacy data
+    const count = db.get<{ count: number }>("SELECT COUNT(*) as count FROM users")!.count;
 
-    // Seed Categories
-    const categories = [
-      'Tablets', 'Capsules', 'Syrups', 'Injections', 'Surgical', 
-      'Medical Devices', 'Baby Products', 'Personal Care', 'Food Items', 'Beverages', 'Tissue'
-    ];
-    categories.forEach(cat => {
-      db.run("INSERT INTO categories (name, description) VALUES (?, ?)", [cat, `${cat} section`]);
-    });
+    if (count === 0) {
+      console.log("Seeding initial database with sample data for Khushi Medical Hall...");
+      const adminPassHash = bcrypt.hashSync('admin123', 10);
+      const staffPassHash = bcrypt.hashSync('staff123', 10);
+      const customerPassHash = bcrypt.hashSync('customer123', 10);
 
-    // Seed Suppliers
-    db.run("INSERT INTO suppliers (name, phone, company, address) VALUES (?, ?, ?, ?)", [
-      'GlaxoSmithKline (GSK) Pakistan', '042-35800100', 'GSK Pharma', 'Gulberg III, Lahore'
-    ]);
-    db.run("INSERT INTO suppliers (name, phone, company, address) VALUES (?, ?, ?, ?)", [
-      'Sami Pharmaceuticals', '021-35061200', 'Sami Pharma', 'Korangi Industrial Area, Karachi'
-    ]);
-    db.run("INSERT INTO suppliers (name, phone, company, address) VALUES (?, ?, ?, ?)", [
-      'Abbott Laboratories Pakistan', '021-35610211', 'Abbott', 'Landhi, Karachi'
-    ]);
+      // Seed Categories
+      const categories = [
+        'Tablets', 'Capsules', 'Syrups', 'Injections', 'Surgical', 
+        'Medical Devices', 'Baby Products', 'Personal Care', 'Food Items', 'Beverages', 'Tissue'
+      ];
+      categories.forEach(cat => {
+        db.run("INSERT INTO categories (name, description) VALUES (?, ?)", [cat, `${cat} section`]);
+      });
 
-    // Seed Customers
-    db.run("INSERT INTO customers (name, phone, address, opening_balance, current_balance, login_id) VALUES (?, ?, ?, ?, ?, ?)", [
-      'Chaudhry Muhammad Ali', '03001234567', 'House #42, Street 5, Main Bazaar, Lahore', 0, 2450.00, '03001234567'
-    ]);
-    db.run("INSERT INTO customers (name, phone, address, opening_balance, current_balance, login_id) VALUES (?, ?, ?, ?, ?, ?)", [
-      'Tariq Mahmood', '03219876543', 'Plaza #12, Commercial Market, Rawalpindi', 0, 1200.00, '03219876543'
-    ]);
-    db.run("INSERT INTO customers (name, phone, address, opening_balance, current_balance, login_id) VALUES (?, ?, ?, ?, ?, ?)", [
-      'Dr. Rashid Ahmad', '03335554433', 'Civil Hospital Road, Multan', 0, 0.00, '03335554433'
-    ]);
+      // Seed Suppliers
+      db.run("INSERT INTO suppliers (name, phone, company, address) VALUES (?, ?, ?, ?)", [
+        'GlaxoSmithKline (GSK) Pakistan', '042-35800100', 'GSK Pharma', 'Gulberg III, Lahore'
+      ]);
+      db.run("INSERT INTO suppliers (name, phone, company, address) VALUES (?, ?, ?, ?)", [
+        'Sami Pharmaceuticals', '021-35061200', 'Sami Pharma', 'Korangi Industrial Area, Karachi'
+      ]);
+      db.run("INSERT INTO suppliers (name, phone, company, address) VALUES (?, ?, ?, ?)", [
+        'Abbott Laboratories Pakistan', '021-35610211', 'Abbott', 'Landhi, Karachi'
+      ]);
 
-    // Seed Users
-    db.run("INSERT INTO users (username, password_hash, role, full_name, phone) VALUES (?, ?, ?, ?, ?)", [
-      'admin', adminPassHash, 'ADMIN', 'Muhammad Asghar (Owner)', '03000000000'
-    ]);
-    db.run("INSERT INTO users (username, password_hash, role, full_name, phone) VALUES (?, ?, ?, ?, ?)", [
-      'staff', staffPassHash, 'STAFF', 'Hamza Khan (Pharmacist)', '03111111111'
-    ]);
-    db.run("INSERT INTO users (username, password_hash, role, full_name, phone, customer_id) VALUES (?, ?, ?, ?, ?, ?)", [
-      '03001234567', customerPassHash, 'CUSTOMER', 'Chaudhry Muhammad Ali', '03001234567', 1
-    ]);
+      // Seed Customers
+      db.run("INSERT INTO customers (name, phone, address, opening_balance, current_balance, login_id) VALUES (?, ?, ?, ?, ?, ?)", [
+        'Chaudhry Muhammad Ali', '03001234567', 'House #42, Street 5, Main Bazaar, Lahore', 0, 2450.00, '03001234567'
+      ]);
+      db.run("INSERT INTO customers (name, phone, address, opening_balance, current_balance, login_id) VALUES (?, ?, ?, ?, ?, ?)", [
+        'Tariq Mahmood', '03219876543', 'Plaza #12, Commercial Market, Rawalpindi', 0, 1200.00, '03219876543'
+      ]);
+      db.run("INSERT INTO customers (name, phone, address, opening_balance, current_balance, login_id) VALUES (?, ?, ?, ?, ?, ?)", [
+        'Dr. Rashid Ahmad', '03335554433', 'Civil Hospital Road, Multan', 0, 0.00, '03335554433'
+      ]);
 
-    // Seed Products
-    const sampleProducts = [
-      ['Panadol Extra 500mg', 'Pack', 180, 220, 15, 120, 'B-8910', '2027-10-15', 1, '3004.90', 0, 'Rack A1', 1],
-      ['Augmentin 625mg Tablets', 'Pack', 310, 380, 10, 45, 'AG-442', '2026-11-20', 1, '3004.90', 0, 'Rack A2', 1],
-      ['Brufen 400mg Tablets', 'Pack', 140, 175, 20, 80, 'BF-109', '2027-04-10', 1, '3004.90', 0, 'Rack A1', 2],
-      ['Risek 20mg Capsules', 'Pack', 240, 310, 15, 60, 'RK-221', '2026-12-05', 2, '3004.90', 0, 'Rack B1', 3],
-      ['Hydryllin Syrup 120ml', 'Bottle', 110, 145, 10, 35, 'HY-908', '2026-09-30', 3, '3004.90', 0, 'Rack C1', 2],
-      ['Calamox 625mg Tablets', 'Pack', 290, 360, 10, 8, 'CX-771', '2026-08-15', 1, '3004.90', 0, 'Rack A3', 2], // Low stock!
-      ['Cac 1000 Effervescent', 'Tube', 210, 260, 10, 25, 'CAC-33', '2026-08-01', 3, '3004.90', 0, 'Rack B2', 3], // Expiring soon!
-      ['Dettol Antiseptic Liquid 100ml', 'Bottle', 160, 200, 12, 40, 'DT-001', '2028-01-01', 8, '3401.11', 18, 'Rack E1', 1],
-      ['Pampers Baby Wipes 64s', 'Pack', 350, 430, 8, 22, 'PW-64', '2027-06-30', 7, '3401.11', 18, 'Rack F2', 3],
-      ['Johnson Baby Lotion 200ml', 'Bottle', 420, 520, 10, 18, 'JBL-20', '2027-08-12', 7, '3401.11', 18, 'Rack F1', 3],
-      ['Rose Petal Tissue Box 200s', 'Box', 180, 230, 15, 50, 'RP-200', '2029-01-01', 11, '4818.10', 18, 'Rack G1', 2],
-      ['Nestle Pure Life Water 1.5L', 'Bottle', 80, 110, 24, 60, 'NW-15', '2027-01-01', 10, '2201.10', 18, 'Rack H1', 2]
-    ];
+      // Seed Users
+      db.run("INSERT INTO users (username, password_hash, role, full_name, phone) VALUES (?, ?, ?, ?, ?)", [
+        'admin', adminPassHash, 'ADMIN', 'Muhammad Asghar (Owner)', '03000000000'
+      ]);
+      db.run("INSERT INTO users (username, password_hash, role, full_name, phone) VALUES (?, ?, ?, ?, ?)", [
+        'staff', staffPassHash, 'STAFF', 'Hamza Khan (Pharmacist)', '03111111111'
+      ]);
+      db.run("INSERT INTO users (username, password_hash, role, full_name, phone, customer_id) VALUES (?, ?, ?, ?, ?, ?)", [
+        '03001234567', customerPassHash, 'CUSTOMER', 'Chaudhry Muhammad Ali', '03001234567', 1
+      ]);
 
-    sampleProducts.forEach(p => {
-      db.run(
-        `INSERT INTO products 
-        (name, unit, purchase_price, sale_price, min_stock, stock, batch_number, expiry_date, category_id, hsn_code, gst_rate, rack_location, supplier_id) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        p
-      );
-    });
+      // Seed Products
+      const sampleProducts = [
+        ['Panadol Extra 500mg', 'Pack', 180, 220, 15, 120, 'B-8910', '2027-10-15', 1, '3004.90', 0, 'Rack A1', 1],
+        ['Augmentin 625mg Tablets', 'Pack', 310, 380, 10, 45, 'AG-442', '2026-11-20', 1, '3004.90', 0, 'Rack A2', 1],
+        ['Brufen 400mg Tablets', 'Pack', 140, 175, 20, 80, 'BF-109', '2027-04-10', 1, '3004.90', 0, 'Rack A1', 2],
+        ['Risek 20mg Capsules', 'Pack', 240, 310, 15, 60, 'RK-221', '2026-12-05', 2, '3004.90', 0, 'Rack B1', 3],
+        ['Hydryllin Syrup 120ml', 'Bottle', 110, 145, 10, 35, 'HY-908', '2026-09-30', 3, '3004.90', 0, 'Rack C1', 2],
+        ['Calamox 625mg Tablets', 'Pack', 290, 360, 10, 8, 'CX-771', '2026-08-15', 1, '3004.90', 0, 'Rack A3', 2], // Low stock!
+        ['Cac 1000 Effervescent', 'Tube', 210, 260, 10, 25, 'CAC-33', '2026-08-01', 3, '3004.90', 0, 'Rack B2', 3], // Expiring soon!
+        ['Dettol Antiseptic Liquid 100ml', 'Bottle', 160, 200, 12, 40, 'DT-001', '2028-01-01', 8, '3401.11', 18, 'Rack E1', 1],
+        ['Pampers Baby Wipes 64s', 'Pack', 350, 430, 8, 22, 'PW-64', '2027-06-30', 7, '3401.11', 18, 'Rack F2', 3],
+        ['Johnson Baby Lotion 200ml', 'Bottle', 420, 520, 10, 18, 'JBL-20', '2027-08-12', 7, '3401.11', 18, 'Rack F1', 3],
+        ['Rose Petal Tissue Box 200s', 'Box', 180, 230, 15, 50, 'RP-200', '2029-01-01', 11, '4818.10', 18, 'Rack G1', 2],
+        ['Nestle Pure Life Water 1.5L', 'Bottle', 80, 110, 24, 60, 'NW-15', '2027-01-01', 10, '2201.10', 18, 'Rack H1', 2]
+      ];
 
-    // Seed Initial Customer Ledger & Sale
-    const today = new Date().toISOString().split('T')[0];
-    db.run(`INSERT INTO sales_headers 
-      (invoice_number, customer_id, sale_date, total_amount, discount_percent, discount_amount, net_amount, total_gst, grand_total, payment_method, amount_paid, amount_due, payment_status, created_by_user_id) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      ['INV-1001', 1, `${today} 10:30:00`, 2650.00, 0, 0, 2650.00, 0, 2650.00, 'PARTIAL', 200.00, 2450.00, 'PARTIAL', 1]
-    );
-
-    db.run(`INSERT INTO sale_items (sale_id, product_id, quantity, unit, sale_price, cost_price, discount_percent, discount_amount, gst_amount, batch_number, expiry_date, subtotal)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [1, 1, 2, 'Pack', 220, 180, 0, 0, 0, 'B-8910', '2027-10-15', 440]
-    );
-    db.run(`INSERT INTO sale_items (sale_id, product_id, quantity, unit, sale_price, cost_price, discount_percent, discount_amount, gst_amount, batch_number, expiry_date, subtotal)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [1, 2, 5, 'Pack', 380, 310, 0, 0, 0, 'AG-442', '2026-11-20', 1900]
-    );
-
-    db.run(`INSERT INTO customer_ledger (customer_id, transaction_date, type, reference, debit, credit, balance_after, notes)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-      [1, `${today} 10:30:00`, 'SALE', 'Invoice #INV-1001', 2650.00, 200.00, 2450.00, 'Partial cash payment Rs. 200, Udhar Rs. 2450']
-    );
-
-    db.run(`INSERT INTO sms_queue (customer_id, phone, message, type, status) VALUES (?, ?, ?, ?, ?)`,
-      [1, '03001234567', 'Dear Chaudhry Muhammad Ali, thank you for visiting Khushi Medical Hall. Invoice #INV-1001. Amount Paid: Rs. 200. Current Udhar Balance: Rs. 2450.', 'PAYMENT_CONFIRMATION', 'PENDING']
-    );
-
-    // Default Settings
-    const defaultSettings = [
-      ['store_name', 'Khushi Medical Hall'],
-      ['store_urdu_name', 'خوشی میڈیکل ہال'],
-      ['address', 'Main Bazaar, Near Civil Hospital, Lahore'],
-      ['phone', '0300-1234567 / 042-35551234'],
-      ['ntn_number', 'NTN-7894561-2'],
-      ['receipt_footer', 'Get well soon! Check expiry before use. Goods once sold are not returnable without bill.'],
-      ['printer_type', 'THERMAL_80MM'],
-      ['printer_address', 'USB001'],
-      ['smtp_host', 'smtp.gmail.com'],
-      ['smtp_port', '587'],
-      ['smtp_user', 'khushi.pharmacy@gmail.com'],
-      ['smtp_pass', ''],
-      ['smtp_secure', 'tls'],
-      ['smtp_from_email', 'khushi.pharmacy@gmail.com'],
-      ['smtp_from_name', 'Khushi Medical Hall'],
-      ['smtp_enabled', 'true'],
-      ['twilio_account_sid', ''],
-      ['twilio_auth_token', ''],
-      ['twilio_from_phone', ''],
-      ['sms_enabled', 'true'],
-      ['auto_backup_enabled', 'true'],
-      ['backup_interval_hours', '24']
-    ];
-
-    defaultSettings.forEach(([k, v]) => {
-      db.run("INSERT INTO settings (key, value) VALUES (?, ?)", [k, v]);
-    });
-  }
-
-  // Always ensure SUPER_ADMIN accounts exist for platform supervision
-  try {
-    const superAdminPassHash = bcrypt.hashSync('admin123', 10);
-    const umarPassHash = bcrypt.hashSync('Um@r.1080db', 10);
-    
-    const existingSuperAdmin = queryOne("SELECT id FROM users WHERE username = ?", ['superadmin']);
-    if (!existingSuperAdmin) {
-      db.run(
-        "INSERT INTO users (username, password_hash, role, full_name, email, phone, status) VALUES (?, ?, 'SUPER_ADMIN', ?, ?, ?, 'APPROVED')",
-        ['superadmin', superAdminPassHash, 'Super Platform Administrator', 'superadmin@khushipos.com', '03000000000']
-      );
-    } else {
-      db.run("UPDATE users SET role = 'SUPER_ADMIN', status = 'APPROVED' WHERE username = ?", ['superadmin']);
-    }
-
-    const umarTargetEmail = 'umarumair75108@gmail.com';
-    const oldUmarEmail = 'umarumair75108db@gmail.com';
-
-    // Check if target user already exists
-    const existingUmarUser = queryOne<any>("SELECT id FROM users WHERE email = ? OR username = ?", [umarTargetEmail, umarTargetEmail]);
-
-    if (existingUmarUser) {
-      // Update existing record
-      db.run(
-        "UPDATE users SET password_hash = ?, role = 'SUPER_ADMIN', status = 'APPROVED', email = ?, username = ? WHERE id = ?",
-        [umarPassHash, umarTargetEmail, umarTargetEmail, existingUmarUser.id]
-      );
-      // Clean up old email user if it's a separate duplicate row
-      db.run("DELETE FROM users WHERE (email = ? OR username = ?) AND id != ?", [oldUmarEmail, oldUmarEmail, existingUmarUser.id]);
-    } else {
-      // Check if old user exists
-      const oldUmarUser = queryOne<any>("SELECT id FROM users WHERE email = ? OR username = ?", [oldUmarEmail, oldUmarEmail]);
-      if (oldUmarUser) {
+      sampleProducts.forEach(p => {
         db.run(
-          "UPDATE users SET username = ?, email = ?, password_hash = ?, role = 'SUPER_ADMIN', status = 'APPROVED' WHERE id = ?",
-          [umarTargetEmail, umarTargetEmail, umarPassHash, oldUmarUser.id]
+          `INSERT INTO products 
+          (name, unit, purchase_price, sale_price, min_stock, stock, batch_number, expiry_date, category_id, hsn_code, gst_rate, rack_location, supplier_id) 
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          p
         );
-      } else {
-        // Insert new user
+      });
+
+      // Seed Initial Customer Ledger & Sale
+      const today = new Date().toISOString().split('T')[0];
+      db.run(`INSERT INTO sales_headers 
+        (invoice_number, customer_id, sale_date, total_amount, discount_percent, discount_amount, net_amount, total_gst, grand_total, payment_method, amount_paid, amount_due, payment_status, created_by_user_id) 
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ['INV-1001', 1, `${today} 10:30:00`, 2650.00, 0, 0, 2650.00, 0, 2650.00, 'PARTIAL', 200.00, 2450.00, 'PARTIAL', 1]
+      );
+
+      db.run(`INSERT INTO sale_items (sale_id, product_id, quantity, unit, sale_price, cost_price, discount_percent, discount_amount, gst_amount, batch_number, expiry_date, subtotal)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [1, 1, 2, 'Pack', 220, 180, 0, 0, 0, 'B-8910', '2027-10-15', 440]
+      );
+      db.run(`INSERT INTO sale_items (sale_id, product_id, quantity, unit, sale_price, cost_price, discount_percent, discount_amount, gst_amount, batch_number, expiry_date, subtotal)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [1, 2, 5, 'Pack', 380, 310, 0, 0, 0, 'AG-442', '2026-11-20', 1900]
+      );
+
+      db.run(`INSERT INTO customer_ledger (customer_id, transaction_date, type, reference, debit, credit, balance_after, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        [1, `${today} 10:30:00`, 'SALE', 'Invoice #INV-1001', 2650.00, 200.00, 2450.00, 'Partial cash payment Rs. 200, Udhar Rs. 2450']
+      );
+
+      db.run(`INSERT INTO sms_queue (customer_id, phone, message, type, status) VALUES (?, ?, ?, ?, ?)`,
+        [1, '03001234567', 'Dear Chaudhry Muhammad Ali, thank you for visiting Khushi Medical Hall. Invoice #INV-1001. Amount Paid: Rs. 200. Current Udhar Balance: Rs. 2450.', 'PAYMENT_CONFIRMATION', 'PENDING']
+      );
+
+      // Default Settings
+      const defaultSettings = [
+        ['store_name', 'Khushi Medical Hall'],
+        ['store_urdu_name', 'خوشی میڈیکل ہال'],
+        ['address', 'Main Bazaar, Near Civil Hospital, Lahore'],
+        ['phone', '0300-1234567 / 042-35551234'],
+        ['ntn_number', 'NTN-7894561-2'],
+        ['receipt_footer', 'Get well soon! Check expiry before use. Goods once sold are not returnable without bill.'],
+        ['printer_type', 'THERMAL_80MM'],
+        ['printer_address', 'USB001'],
+        ['smtp_host', 'smtp.gmail.com'],
+        ['smtp_port', '587'],
+        ['smtp_user', 'khushi.pharmacy@gmail.com'],
+        ['smtp_pass', ''],
+        ['smtp_secure', 'tls'],
+        ['smtp_from_email', 'khushi.pharmacy@gmail.com'],
+        ['smtp_from_name', 'Khushi Medical Hall'],
+        ['smtp_enabled', 'true'],
+        ['twilio_account_sid', ''],
+        ['twilio_auth_token', ''],
+        ['twilio_from_phone', ''],
+        ['sms_enabled', 'true'],
+        ['auto_backup_enabled', 'true'],
+        ['backup_interval_hours', '24']
+      ];
+
+      defaultSettings.forEach(([k, v]) => {
+        db.run("INSERT INTO settings (key, value) VALUES (?, ?)", [k, v]);
+      });
+    }
+
+    // Always ensure SUPER_ADMIN accounts exist for platform supervision
+    try {
+      const superAdminPassHash = bcrypt.hashSync('admin123', 10);
+      const umarPassHash = bcrypt.hashSync('Um@r.1080db', 10);
+      
+      const existingSuperAdmin = queryOne("SELECT id FROM users WHERE username = ?", ['superadmin']);
+      if (!existingSuperAdmin) {
         db.run(
           "INSERT INTO users (username, password_hash, role, full_name, email, phone, status) VALUES (?, ?, 'SUPER_ADMIN', ?, ?, ?, 'APPROVED')",
-          [umarTargetEmail, umarPassHash, 'Umar Umair (Platform Director)', umarTargetEmail, '03001234567']
+          ['superadmin', superAdminPassHash, 'Super Platform Administrator', 'superadmin@khushipos.com', '03000000000']
         );
+      } else {
+        db.run("UPDATE users SET role = 'SUPER_ADMIN', status = 'APPROVED' WHERE username = ?", ['superadmin']);
       }
-    }
 
-    db.run("UPDATE users SET role = 'ADMIN' WHERE role = 'SUPER_ADMIN' AND email != ? AND username != 'superadmin'", [umarTargetEmail]);
-  } catch (err) {
-    console.error("Super Admin user setup warning:", err);
-  }
-  
-  saveDatabase();
+      const umarTargetEmail = 'umarumair75108@gmail.com';
+      const oldUmarEmail = 'umarumair75108db@gmail.com';
+
+      // Check if target user already exists
+      const existingUmarUser = queryOne<any>("SELECT id FROM users WHERE email = ? OR username = ?", [umarTargetEmail, umarTargetEmail]);
+
+      if (existingUmarUser) {
+        // Update existing record
+        db.run(
+          "UPDATE users SET password_hash = ?, role = 'SUPER_ADMIN', status = 'APPROVED', email = ?, username = ? WHERE id = ?",
+          [umarPassHash, umarTargetEmail, umarTargetEmail, existingUmarUser.id]
+        );
+        // Clean up old email user if it's a separate duplicate row
+        db.run("DELETE FROM users WHERE (email = ? OR username = ?) AND id != ?", [oldUmarEmail, oldUmarEmail, existingUmarUser.id]);
+      } else {
+        // Check if old user exists
+        const oldUmarUser = queryOne<any>("SELECT id FROM users WHERE email = ? OR username = ?", [oldUmarEmail, oldUmarEmail]);
+        if (oldUmarUser) {
+          db.run(
+            "UPDATE users SET username = ?, email = ?, password_hash = ?, role = 'SUPER_ADMIN', status = 'APPROVED' WHERE id = ?",
+            [umarTargetEmail, umarTargetEmail, umarPassHash, oldUmarUser.id]
+          );
+        } else {
+          // Insert new user
+          db.run(
+            "INSERT INTO users (username, password_hash, role, full_name, email, phone, status) VALUES (?, ?, 'SUPER_ADMIN', ?, ?, ?, 'APPROVED')",
+            [umarTargetEmail, umarPassHash, 'Umar Umair (Platform Director)', umarTargetEmail, '03001234567']
+          );
+        }
+      }
+
+      db.run("UPDATE users SET role = 'ADMIN' WHERE role = 'SUPER_ADMIN' AND email != ? AND username != 'superadmin'", [umarTargetEmail]);
+    } catch (err) {
+      console.error("Super Admin user setup warning:", err);
+    }
+    
+  });
+
   console.log("SQLite Database initialized successfully.");
 }
 
-// Helper to run query returning array of objects
+// Query helpers (delegate to the DB adapter).
 function queryAll<T = any>(sql: string, params: any[] = []): T[] {
-  const stmt = db.prepare(sql);
-  stmt.bind(params);
-  const results: T[] = [];
-  while (stmt.step()) {
-    results.push(stmt.getAsObject() as T);
-  }
-  stmt.free();
-  return results;
+  return db.all<T>(sql, params);
 }
 
 function queryOne<T = any>(sql: string, params: any[] = []): T | null {
-  const list = queryAll<T>(sql, params);
-  return list.length > 0 ? list[0] : null;
+  return db.get<T>(sql, params) ?? null;
 }
 
 // Audit Logging Helper
@@ -587,7 +280,6 @@ function logAudit(userId: number | undefined | null, userName: string | undefine
       INSERT INTO audit_logs (user_id, user_name, action_type, description, target_type, target_id, ip_address, user_agent, tenant_id)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [userId || null, userName || 'System', actionType, description, targetType || null, targetId || null, String(ip), String(userAgent), tId || null]);
-    saveDatabase();
   } catch (e) {
     console.error('Audit log creation error:', e);
   }
@@ -694,7 +386,7 @@ async function startServer() {
   // 1. Auth API
 
   // Send Email OTP for Registration (Rate limited to 3 per 10 mins per email)
-  app.post('/api/auth/send-otp', (req, res) => {
+  app.post('/api/auth/send-otp', tx((req, res) => {
     const rawEmail = sanitizeInput(req.body.email);
     const cleanEmail = rawEmail.toLowerCase();
     
@@ -725,7 +417,6 @@ async function startServer() {
     db.run("INSERT INTO otp_verifications (email, otp_code, expires_at) VALUES (?, ?, ?)", [
       cleanEmail, otpCode, expiresAt
     ]);
-    saveDatabase();
 
     logAudit(null, cleanEmail, 'OTP_SENT', `Generated registration OTP code for email: ${cleanEmail}`, 'OTP', undefined, req);
 
@@ -733,10 +424,10 @@ async function startServer() {
       message: `OTP Code generated and sent to ${cleanEmail}`,
       otp_code: otpCode // Returned for easy verification in UI demo mode
     });
-  });
+  }));
 
   // User Registration with OTP (Role Manipulation & Replay Attack Protected)
-  app.post('/api/auth/register', (req, res) => {
+  app.post('/api/auth/register', tx((req, res) => {
     const { email, phone, fullName, password, role, otp_code } = req.body;
 
     const cleanEmail = sanitizeInput(email).toLowerCase();
@@ -782,7 +473,6 @@ async function startServer() {
     // STAGE 2 SECURITY: Delete verified OTP code to prevent OTP replay manipulation
     db.run("DELETE FROM otp_verifications WHERE email = ?", [cleanEmail]);
 
-    saveDatabase();
 
     const newUser = queryOne<any>("SELECT id FROM users WHERE username = ?", [cleanEmail]);
 
@@ -791,10 +481,10 @@ async function startServer() {
     res.json({
       message: 'Registration submitted successfully! Your account is currently PENDING verification by the Admin. You can log in once approved by Khushi Medical Hall Admin.'
     });
-  });
+  }));
 
   // Register New Store / Pharmacy Tenant
-  app.post('/api/auth/register-store', (req, res) => {
+  app.post('/api/auth/register-store', tx((req, res) => {
     const { storeName, ownerName, ownerEmail, phone, password, address, city, otp_code } = req.body;
     if (!storeName || !ownerName || !ownerEmail || !password || !otp_code) {
       return res.status(400).json({ error: 'Store name, owner name, owner email, password, and verification code are required.' });
@@ -824,7 +514,6 @@ async function startServer() {
       VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', 'PRO')
     `, [storeName, ownerName, cleanEmail, phone || '', address || '', city || 'Lahore']);
 
-    saveDatabase();
     const tenant = queryOne<any>("SELECT id FROM tenants WHERE owner_email = ?", [cleanEmail]);
     const tenantId = tenant ? tenant.id : 1;
 
@@ -847,7 +536,6 @@ async function startServer() {
 
     // Cleanup OTP
     db.run("DELETE FROM otp_verifications WHERE email = ?", [cleanEmail]);
-    saveDatabase();
 
     const newUser = queryOne<any>("SELECT id FROM users WHERE username = ?", [cleanEmail]);
     logAudit(newUser ? newUser.id : null, ownerName, 'TENANT_REGISTER', `New Pharmacy Store registered (${storeName}, ID: ${tenantId}, Owner: ${cleanEmail})`, 'TENANT', tenantId, req);
@@ -856,7 +544,7 @@ async function startServer() {
       message: `Pharmacy store "${storeName}" registered successfully! You can now log in as Store Admin.`,
       tenant_id: tenantId
     });
-  });
+  }));
 
   // Super Admin Management APIs
   app.get('/api/superadmin/metrics', authenticateToken, requireRoles(['SUPER_ADMIN']), (req, res) => {
@@ -919,20 +607,19 @@ async function startServer() {
     });
   });
 
-  app.put('/api/superadmin/tenants/:id/services', authenticateToken, requireRoles(['SUPER_ADMIN']), (req: AuthRequest, res) => {
+  app.put('/api/superadmin/tenants/:id/services', authenticateToken, requireRoles(['SUPER_ADMIN']), tx((req: AuthRequest, res) => {
     const tenantId = Number(req.params.id);
     const { allowed_services } = req.body;
 
     const servicesStr = Array.isArray(allowed_services) ? allowed_services.join(',') : String(allowed_services || '');
 
     db.run("UPDATE tenants SET allowed_services = ? WHERE id = ?", [servicesStr, tenantId]);
-    saveDatabase();
 
     logAudit(req.user?.id, req.user?.fullName, 'SUPERADMIN_TENANT_SERVICES', `Super Admin updated allowed services for store #${tenantId}: ${servicesStr}`, 'TENANT', tenantId, req);
     res.json({ message: 'Store allowed services updated successfully.', allowed_services: servicesStr });
-  });
+  }));
 
-  app.post('/api/superadmin/tenants', authenticateToken, requireRoles(['SUPER_ADMIN']), (req: AuthRequest, res) => {
+  app.post('/api/superadmin/tenants', authenticateToken, requireRoles(['SUPER_ADMIN']), tx((req: AuthRequest, res) => {
     const { name, owner_name, owner_email, phone, address, city, plan, owner_password, password } = req.body;
     if (!name || !owner_name || !owner_email) {
       return res.status(400).json({ error: 'Store name, owner name, and owner email are required.' });
@@ -951,7 +638,6 @@ async function startServer() {
       VALUES (?, ?, ?, ?, ?, ?, 'ACTIVE', ?, ?)
     `, [name, owner_name, cleanEmail, phone || '', address || '', city || 'Lahore', plan || 'PRO', defaultServices]);
 
-    saveDatabase();
     const createdTenant = queryOne<any>("SELECT * FROM tenants WHERE owner_email = ?", [cleanEmail]);
 
     const userPassword = (owner_password || password || 'admin123').trim();
@@ -972,16 +658,15 @@ async function startServer() {
       `, [cleanEmail, passHash, owner_name, cleanEmail, phone || '', createdTenant.id]);
     }
 
-    saveDatabase();
     logAudit(req.user?.id, req.user?.fullName, 'SUPERADMIN_TENANT_CREATE', `Super Admin onboarded new store "${name}" (ID: ${createdTenant.id})`, 'TENANT', createdTenant.id, req);
 
     res.json({ 
       message: `Pharmacy store "${name}" onboarded successfully. Owner login credentials set for ${cleanEmail}`, 
       tenant: createdTenant 
     });
-  });
+  }));
 
-  app.put('/api/superadmin/tenants/:id/status', authenticateToken, requireRoles(['SUPER_ADMIN']), (req: AuthRequest, res) => {
+  app.put('/api/superadmin/tenants/:id/status', authenticateToken, requireRoles(['SUPER_ADMIN']), tx((req: AuthRequest, res) => {
     const tenantId = Number(req.params.id);
     const { status } = req.body;
     if (!['ACTIVE', 'SUSPENDED', 'PENDING'].includes(status)) {
@@ -989,13 +674,12 @@ async function startServer() {
     }
 
     db.run("UPDATE tenants SET status = ? WHERE id = ?", [status, tenantId]);
-    saveDatabase();
 
     logAudit(req.user?.id, req.user?.fullName, 'SUPERADMIN_TENANT_STATUS', `Super Admin updated store #${tenantId} status to ${status}`, 'TENANT', tenantId, req);
     res.json({ message: `Store #${tenantId} status updated to ${status}.` });
-  });
+  }));
 
-  app.delete('/api/superadmin/tenants/:id', authenticateToken, requireRoles(['SUPER_ADMIN']), (req: AuthRequest, res) => {
+  app.delete('/api/superadmin/tenants/:id', authenticateToken, requireRoles(['SUPER_ADMIN']), tx((req: AuthRequest, res) => {
     const tenantId = Number(req.params.id);
     if (tenantId === 1) {
       return res.status(400).json({ error: 'Cannot delete primary flagship store tenant #1.' });
@@ -1006,14 +690,13 @@ async function startServer() {
     db.run("DELETE FROM products WHERE tenant_id = ?", [tenantId]);
     db.run("DELETE FROM sales_headers WHERE tenant_id = ?", [tenantId]);
     db.run("DELETE FROM customers WHERE tenant_id = ?", [tenantId]);
-    saveDatabase();
 
     logAudit(req.user?.id, req.user?.fullName, 'SUPERADMIN_TENANT_DELETE', `Super Admin deleted store #${tenantId}`, 'TENANT', tenantId, req);
     res.json({ message: `Store #${tenantId} deleted successfully.` });
-  });
+  }));
 
   // Super Admin direct login-as / jump to store account endpoint
-  app.post('/api/superadmin/tenants/:id/login-as', authenticateToken, requireRoles(['SUPER_ADMIN']), (req: AuthRequest, res) => {
+  app.post('/api/superadmin/tenants/:id/login-as', authenticateToken, requireRoles(['SUPER_ADMIN']), tx((req: AuthRequest, res) => {
     const tenantId = Number(req.params.id);
     const tenant = queryOne<any>("SELECT * FROM tenants WHERE id = ?", [tenantId]);
     if (!tenant) {
@@ -1063,10 +746,10 @@ async function startServer() {
         tenant_name: tenant.name,
       }
     });
-  });
+  }));
 
   // Super Admin direct message / email dispatch to shopkeepers
-  app.post('/api/superadmin/send-message', authenticateToken, requireRoles(['SUPER_ADMIN']), (req: AuthRequest, res) => {
+  app.post('/api/superadmin/send-message', authenticateToken, requireRoles(['SUPER_ADMIN']), tx((req: AuthRequest, res) => {
     const { targetTenantId, recipientEmail, subject, messageBody } = req.body;
     if (!subject || !messageBody) {
       return res.status(400).json({ error: 'Subject and message body are required.' });
@@ -1100,13 +783,12 @@ async function startServer() {
       queuedCount++;
     }
 
-    saveDatabase();
     logAudit(req.user?.id, req.user?.fullName, 'SUPERADMIN_MESSAGE_DISPATCH', `Super Admin queued ${queuedCount} message(s) to shopkeepers. Subject: ${subject}`, 'COMMUNICATION', undefined, req);
 
     res.json({ message: `Message successfully dispatched to ${queuedCount} shopkeeper recipient(s).` });
-  });
+  }));
 
-  app.post('/api/auth/login', (req, res) => {
+  app.post('/api/auth/login', tx((req, res) => {
     const { username, password } = req.body;
     if (!username || !password) {
       return res.status(400).json({ error: 'Username and password are required' });
@@ -1225,10 +907,10 @@ async function startServer() {
         customerId: user.customer_id
       }
     });
-  });
+  }));
 
   // Send Login OTP via Email
-  app.post('/api/auth/send-login-otp', (req, res) => {
+  app.post('/api/auth/send-login-otp', tx((req, res) => {
     const rawEmail = sanitizeInput(req.body.email);
     const cleanEmail = rawEmail.toLowerCase().trim();
 
@@ -1251,7 +933,6 @@ async function startServer() {
     db.run("INSERT INTO otp_verifications (email, otp_code, expires_at) VALUES (?, ?, ?)", [
       cleanEmail, otpCode, expiresAt
     ]);
-    saveDatabase();
 
     logAudit(user.id, user.full_name, 'LOGIN_OTP_SENT', `Generated Login OTP for email: ${cleanEmail}`, 'AUTH', user.id, req);
 
@@ -1259,10 +940,10 @@ async function startServer() {
       message: `Login OTP code generated and sent to ${cleanEmail}`,
       otp_code: otpCode // Returned for demo / testing
     });
-  });
+  }));
 
   // Verify Login OTP & Login User
-  app.post('/api/auth/login-otp', (req, res) => {
+  app.post('/api/auth/login-otp', tx((req, res) => {
     const { email, otp_code } = req.body;
     const cleanEmail = sanitizeInput(email).toLowerCase().trim();
     const cleanOtp = sanitizeInput(otp_code).trim();
@@ -1295,7 +976,6 @@ async function startServer() {
 
     // Clear used OTP
     db.run("DELETE FROM otp_verifications WHERE email = ?", [cleanEmail]);
-    saveDatabase();
 
     let tenantName = 'Khushi Medical Hall';
     let tenantStatus = 'ACTIVE';
@@ -1343,7 +1023,7 @@ async function startServer() {
         customerId: user.customer_id
       }
     });
-  });
+  }));
 
   app.get('/api/auth/me', authenticateToken, (req: AuthRequest, res) => {
     const user = queryOne<any>("SELECT id, username, role, full_name, email, phone, status, allowed_services, tenant_id, customer_id FROM users WHERE id = ?", [req.user!.id]);
@@ -1441,7 +1121,6 @@ async function startServer() {
       const existing = queryOne<any>("SELECT id FROM categories WHERE LOWER(name) = ? AND (tenant_id = ? OR tenant_id IS NULL)", [cleanName.toLowerCase(), tenantId]);
       if (existing) return existing.id;
       db.run("INSERT INTO categories (name, description, tenant_id) VALUES (?, 'Auto-created Category', ?)", [cleanName, tenantId]);
-      saveDatabase();
       const created = queryOne<any>("SELECT id FROM categories WHERE LOWER(name) = ? AND (tenant_id = ? OR tenant_id IS NULL)", [cleanName.toLowerCase(), tenantId]);
       return created ? created.id : null;
     }
@@ -1458,14 +1137,13 @@ async function startServer() {
       const existing = queryOne<any>("SELECT id FROM suppliers WHERE LOWER(name) = ? AND (tenant_id = ? OR tenant_id IS NULL)", [cleanName.toLowerCase(), tenantId]);
       if (existing) return existing.id;
       db.run("INSERT INTO suppliers (name, company, phone, tenant_id) VALUES (?, ?, '', ?)", [cleanName, cleanName, tenantId]);
-      saveDatabase();
       const created = queryOne<any>("SELECT id FROM suppliers WHERE LOWER(name) = ? AND (tenant_id = ? OR tenant_id IS NULL)", [cleanName.toLowerCase(), tenantId]);
       return created ? created.id : null;
     }
     return null;
   }
 
-  app.post('/api/inventory', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.post('/api/inventory', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     try {
       const userTenantId = req.user?.role === 'SUPER_ADMIN' && req.body.tenant_id ? Number(req.body.tenant_id) : (req.user?.tenant_id || 1);
       const {
@@ -1497,11 +1175,9 @@ async function startServer() {
         sanitizeInput(barcode) || '', userTenantId
       ]);
 
-      saveDatabase();
       const newProd = queryOne<any>("SELECT id FROM products WHERE tenant_id = ? ORDER BY id DESC LIMIT 1", [userTenantId]);
       if (newProd && (!barcode || String(barcode).trim() === '')) {
         db.run("UPDATE products SET barcode = '8901000000' || PRINTF('%03d', id) WHERE id = ?", [newProd.id]);
-        saveDatabase();
       }
       logAudit(req.user?.id, req.user?.fullName, 'PRODUCT_ADD', `Added product "${cleanName}" (Unit: ${cleanUnit}, Sale Price: Rs. ${sPrice}, Initial Stock: ${stock || 0})`, 'PRODUCT', newProd ? newProd.id : undefined, req);
 
@@ -1510,9 +1186,9 @@ async function startServer() {
       console.error('Error adding product:', err);
       res.status(500).json({ error: 'Failed to add medicine: ' + err.message });
     }
-  });
+  }));
 
-  app.put('/api/inventory/:id', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.put('/api/inventory/:id', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     try {
       const id = parsePositiveInt(req.params.id);
       if (!id) return res.status(400).json({ error: 'Invalid product ID' });
@@ -1551,7 +1227,6 @@ async function startServer() {
         sanitizeInput(rack_location), suppId, sanitizeInput(barcode) || '', id
       ]);
 
-      saveDatabase();
       logAudit(req.user?.id, req.user?.fullName, 'PRODUCT_EDIT', `Updated product #${id} ("${cleanName}", Stock: ${stock}, Sale Price: Rs. ${sPrice})`, 'PRODUCT', id, req);
 
       res.json({ message: 'Medicine updated successfully' });
@@ -1559,9 +1234,9 @@ async function startServer() {
       console.error('Error updating product:', err);
       res.status(500).json({ error: 'Failed to update medicine: ' + err.message });
     }
-  });
+  }));
 
-  app.delete('/api/inventory/:id', authenticateToken, requireRoles(['ADMIN']), (req: AuthRequest, res) => {
+  app.delete('/api/inventory/:id', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
     const id = Number(req.params.id);
     const userTenantId = req.user?.tenant_id || 1;
     const prod = queryOne<any>("SELECT * FROM products WHERE id = ?", [id]);
@@ -1572,14 +1247,13 @@ async function startServer() {
     }
 
     db.run("DELETE FROM products WHERE id = ?", [id]);
-    saveDatabase();
 
     logAudit(req.user?.id, req.user?.fullName, 'PRODUCT_DELETE', `Deleted product #${id} (${prod.name})`, 'PRODUCT', id, req);
 
     res.json({ message: 'Product deleted' });
-  });
+  }));
 
-  app.post('/api/inventory/adjust', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.post('/api/inventory/adjust', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     const { product_id, adjustment_type, quantity, reason } = req.body;
     if (!product_id || !quantity || !reason) {
       return res.status(400).json({ error: 'Missing adjustment parameters' });
@@ -1608,12 +1282,11 @@ async function startServer() {
       `, [product_id, adjustment_type, Number(quantity), reason, req.user!.id, userTenantId]);
     } catch (e) {}
 
-    saveDatabase();
 
     logAudit(req.user?.id, req.user?.fullName, 'STOCK_ADJUSTMENT', `Adjusted stock for product #${product_id} (${prod.name}): ${adjustment_type} ${quantity} (Old: ${prod.stock}, New: ${newStock}). Reason: ${reason}`, 'PRODUCT', Number(product_id), req);
 
     res.json({ message: `Stock adjusted successfully. New stock: ${newStock}` });
-  });
+  }));
 
   // 3. Categories & Suppliers
   app.get('/api/categories', authenticateToken, (req: AuthRequest, res) => {
@@ -1627,7 +1300,7 @@ async function startServer() {
     res.json(cats);
   });
 
-  app.post('/api/categories', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.post('/api/categories', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     const { name, description } = req.body;
     const userTenantId = req.user?.role === 'SUPER_ADMIN' && req.body.tenant_id ? Number(req.body.tenant_id) : (req.user?.tenant_id || 1);
     const cleanName = sanitizeInput(name);
@@ -1641,13 +1314,12 @@ async function startServer() {
     }
 
     db.run("INSERT INTO categories (name, description, tenant_id) VALUES (?, ?, ?)", [cleanName, sanitizeInput(description) || 'Custom Category', userTenantId]);
-    saveDatabase();
 
     const created = queryOne<any>("SELECT * FROM categories WHERE LOWER(name) = ? AND (tenant_id = ? OR tenant_id IS NULL)", [cleanName.toLowerCase(), userTenantId]);
     logAudit(req.user?.id, req.user?.fullName, 'CATEGORY_ADD', `Added new category "${cleanName}"`, 'CATEGORY', created?.id, req);
 
     res.json(created);
-  });
+  }));
 
   app.get('/api/suppliers', authenticateToken, (req: AuthRequest, res) => {
     const userTenantId = req.user?.role === 'SUPER_ADMIN' && req.query.tenant_id ? Number(req.query.tenant_id) : (req.user?.tenant_id || 1);
@@ -1660,7 +1332,7 @@ async function startServer() {
     res.json(supps);
   });
 
-  app.post('/api/suppliers', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.post('/api/suppliers', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     const { name, phone, company, address } = req.body;
     const userTenantId = req.user?.role === 'SUPER_ADMIN' && req.body.tenant_id ? Number(req.body.tenant_id) : (req.user?.tenant_id || 1);
     if (!name || typeof name !== 'string' || !name.trim()) {
@@ -1674,16 +1346,15 @@ async function startServer() {
       address ? address.trim() : '',
       userTenantId
     ]);
-    saveDatabase();
 
     const newSupplier = queryOne<any>("SELECT * FROM suppliers WHERE tenant_id = ? ORDER BY id DESC LIMIT 1", [userTenantId]);
 
     logAudit(req.user?.id, req.user?.fullName, 'ADD_SUPPLIER', `Added pharmaceutical supplier: ${name} (${company || 'N/A'})`, 'SUPPLIER', newSupplier ? newSupplier.id : undefined, req);
 
     res.json({ message: 'Pharmaceutical Supplier added successfully', supplier: newSupplier });
-  });
+  }));
 
-  app.put('/api/suppliers/:id', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.put('/api/suppliers/:id', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     const id = Number(req.params.id);
     const userTenantId = req.user?.tenant_id || 1;
     const existingSupp = queryOne<any>("SELECT * FROM suppliers WHERE id = ?", [id]);
@@ -1705,14 +1376,13 @@ async function startServer() {
       address ? address.trim() : '', 
       id
     ]);
-    saveDatabase();
 
     logAudit(req.user?.id, req.user?.fullName, 'UPDATE_SUPPLIER', `Updated pharmaceutical supplier #${id}: ${name}`, 'SUPPLIER', id, req);
 
     res.json({ message: 'Supplier updated successfully' });
-  });
+  }));
 
-  app.delete('/api/suppliers/:id', authenticateToken, requireRoles(['ADMIN']), (req: AuthRequest, res) => {
+  app.delete('/api/suppliers/:id', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
     const id = Number(req.params.id);
     const userTenantId = req.user?.tenant_id || 1;
     const supp = queryOne<any>("SELECT * FROM suppliers WHERE id = ?", [id]);
@@ -1723,12 +1393,11 @@ async function startServer() {
     }
 
     db.run("DELETE FROM suppliers WHERE id = ?", [id]);
-    saveDatabase();
 
     logAudit(req.user?.id, req.user?.fullName, 'DELETE_SUPPLIER', `Deleted pharmaceutical supplier #${id}`, 'SUPPLIER', id, req);
 
     res.json({ message: 'Supplier deleted successfully' });
-  });
+  }));
 
   // 4. Customer Management & Udhar Ledger API
   app.get('/api/customers', authenticateToken, (req: AuthRequest, res) => {
@@ -1758,7 +1427,7 @@ async function startServer() {
     res.json(customers);
   });
 
-  app.post('/api/customers', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.post('/api/customers', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     const userTenantId = req.user?.role === 'SUPER_ADMIN' && req.body.tenant_id ? Number(req.body.tenant_id) : (req.user?.tenant_id || 1);
     const { name, phone, address, opening_balance } = req.body;
     if (!name || !phone) {
@@ -1807,11 +1476,10 @@ async function startServer() {
       }
     }
 
-    saveDatabase();
     res.json({ message: 'Customer created successfully' });
-  });
+  }));
 
-  app.put('/api/customers/:id', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.put('/api/customers/:id', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     const customerId = Number(req.params.id);
     const userTenantId = req.user?.tenant_id || 1;
     const existingCust = queryOne<any>("SELECT * FROM customers WHERE id = ?", [customerId]);
@@ -1859,11 +1527,10 @@ async function startServer() {
       WHERE customer_id = ?
     `, [phone, name, phone, customerId]);
 
-    saveDatabase();
     res.json({ message: 'Customer details updated successfully' });
-  });
+  }));
 
-  app.delete('/api/customers/:id', authenticateToken, requireRoles(['ADMIN']), (req: AuthRequest, res) => {
+  app.delete('/api/customers/:id', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
     const customerId = Number(req.params.id);
     const userTenantId = req.user?.tenant_id || 1;
 
@@ -1890,9 +1557,8 @@ async function startServer() {
     db.run("DELETE FROM users WHERE customer_id = ?", [customerId]);
     db.run("DELETE FROM customers WHERE id = ?", [customerId]);
 
-    saveDatabase();
     res.json({ message: 'Customer account deleted successfully' });
-  });
+  }));
 
   // Helper to retrieve ledger entries with full medicine item breakdown
   function getEnrichedLedgerForCustomer(customerId: number) {
@@ -1952,7 +1618,7 @@ async function startServer() {
     res.json({ customer, ledger });
   });
 
-  app.post('/api/customers/:id/payment', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.post('/api/customers/:id/payment', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     const customerId = Number(req.params.id);
     const userTenantId = req.user?.tenant_id || 1;
     const { amount, payment_mode, notes } = req.body;
@@ -1999,11 +1665,10 @@ async function startServer() {
       VALUES (?, ?, ?, 'PAYMENT_CONFIRMATION', 'PENDING', ?)
     `, [customerId, customer.phone, smsMsg, tId]);
 
-    saveDatabase();
     res.json({ message: 'Payment recorded successfully', newBalance: newBal });
-  });
+  }));
 
-  app.post('/api/customers/:id/remind', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.post('/api/customers/:id/remind', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     const customerId = Number(req.params.id);
     const userTenantId = req.user?.tenant_id || 1;
     const { message } = req.body;
@@ -2033,14 +1698,13 @@ async function startServer() {
       VALUES (?, ?, ?, 'UDHAR_REMINDER', 'PENDING', ?)
     `, [customerId, customer.phone, defaultSmsMsg, tId]);
 
-    saveDatabase();
     logAudit(req.user?.id, req.user?.fullName, 'UDHAR_REMINDER_SENT', `Sent Udhar reminder via Email & WhatsApp/SMS to customer ${customer.name} (Balance: Rs. ${customer.current_balance})`, 'CUSTOMER', customerId, req);
 
     res.json({ message: `Udhar reminder queued for ${customer.name} via Email AND WhatsApp/SMS!` });
-  });
+  }));
 
   // 5. Billing & Sales API
-  app.post('/api/sales', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.post('/api/sales', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     const userTenantId = req.user?.role === 'SUPER_ADMIN' && req.body.tenant_id ? Number(req.body.tenant_id) : (req.user?.tenant_id || 1);
     const {
       customer_id,
@@ -2077,8 +1741,7 @@ async function startServer() {
     let customerObj: any = null;
 
     try {
-      db.run("BEGIN TRANSACTION;");
-
+      // The whole route runs in one transaction (tx wrapper); a 500 below rolls everything back.
       if (customer_id) {
         customerObj = queryOne<any>("SELECT * FROM customers WHERE id = ?", [customer_id]);
         if (customerObj) {
@@ -2089,7 +1752,7 @@ async function startServer() {
       }
 
       // Insert Sale Header
-      db.run(`
+      const saleHeaderInsert = db.run(`
         INSERT INTO sales_headers 
         (invoice_number, customer_id, sale_date, total_amount, discount_percent, discount_amount, net_amount, total_gst, grand_total, payment_method, amount_paid, amount_due, payment_status, created_by_user_id, tenant_id)
         VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -2110,8 +1773,7 @@ async function startServer() {
         userTenantId
       ]);
 
-      const saleHeaderObj = queryOne<any>("SELECT id FROM sales_headers WHERE invoice_number = ?", [nextInvNum]);
-      const saleId = saleHeaderObj.id;
+      const saleId = saleHeaderInsert.lastInsertRowid;
 
       // Process each cart item & update stock
       for (const item of items) {
@@ -2181,9 +1843,6 @@ async function startServer() {
         }
       }
 
-      db.run("COMMIT;");
-      saveDatabase();
-
       logAudit(req.user?.id, req.user?.fullName, 'CREATE_SALE', `Completed sale invoice #${nextInvNum} (Grand Total: Rs. ${grand_total})`, 'SALE', saleId, req);
 
       // Return created invoice details
@@ -2198,11 +1857,10 @@ async function startServer() {
         new_balance: newBal
       });
     } catch (err: any) {
-      db.run("ROLLBACK;");
       console.error("Sale transaction failed:", err);
       res.status(500).json({ error: 'Failed to process sale transaction permanently: ' + err.message });
     }
-  });
+  }));
 
   app.get('/api/sales/history', authenticateToken, (req: AuthRequest, res) => {
     const { start_date, end_date } = req.query;
@@ -2262,7 +1920,7 @@ async function startServer() {
     res.json(sales);
   });
 
-  app.get('/api/sales/:id', authenticateToken, (req: AuthRequest, res) => {
+  app.get('/api/sales/:id', authenticateToken, tx((req: AuthRequest, res) => {
     const saleId = parsePositiveInt(req.params.id);
     if (!saleId) return res.status(400).json({ error: 'Invalid invoice ID' });
 
@@ -2295,7 +1953,7 @@ async function startServer() {
     `, [saleId]);
 
     res.json({ ...sale, items });
-  });
+  }));
 
   // 6. Purchase & Stock-In API (Restricted to Admin & Staff)
   app.get('/api/purchases', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
@@ -2344,7 +2002,7 @@ async function startServer() {
     res.json({ ...purchase, items });
   });
 
-  app.post('/api/purchases', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.post('/api/purchases', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     const userTenantId = req.user?.role === 'SUPER_ADMIN' && req.body.tenant_id ? Number(req.body.tenant_id) : (req.user?.tenant_id || 1);
     const { supplier_id, invoice_number, items, notes } = req.body;
 
@@ -2383,11 +2041,10 @@ async function startServer() {
 
     logAudit(req.user?.id, req.user?.fullName, 'RECORD_PURCHASE', `Recorded stock purchase #${invNum} total Rs. ${totalAmount}`, 'PURCHASE', purId, req);
 
-    saveDatabase();
     res.json({ message: 'Purchase recorded and stock updated successfully', id: purId, invoice_number: invNum });
-  });
+  }));
 
-  app.post('/api/purchases/email-po', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.post('/api/purchases/email-po', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     const { supplier_id, supplier_email, po_number, subject, message, items_summary } = req.body;
 
     if (!supplier_id || !po_number) {
@@ -2403,12 +2060,11 @@ async function startServer() {
       VALUES (?, ?, ?, ?, 'WELCOME', 'PENDING', ?)
     `, [supplier_id, emailToUse, emailSubject, emailBody, req.user?.tenant_id || 1]);
 
-    saveDatabase();
 
     logAudit(req.user?.id, req.user?.fullName, 'EMAIL_PO', `Queued Purchase Order #${po_number} email to supplier (${emailToUse})`, 'PURCHASE', undefined, req);
 
     res.json({ message: `Purchase Order #${po_number} emailed successfully to supplier (${emailToUse})!` });
-  });
+  }));
 
   // 7. Reports & Analytics API (Restricted to Admin & Staff)
   app.get('/api/reports/dashboard', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
@@ -2601,7 +2257,7 @@ async function startServer() {
     res.json(queue);
   });
 
-  app.post('/api/email/process', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.post('/api/email/process', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     // Process pending messages
     let pendingSql = "SELECT * FROM email_queue WHERE status = 'PENDING'";
     const params: any[] = [];
@@ -2618,35 +2274,31 @@ async function startServer() {
       processedCount++;
     }
 
-    saveDatabase();
     res.json({ message: `Successfully dispatched ${processedCount} queued Email notifications.` });
-  });
+  }));
 
-  app.delete('/api/email/queue/:id', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req, res) => {
+  app.delete('/api/email/queue/:id', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req, res) => {
     const { id } = req.params;
     db.run("DELETE FROM email_queue WHERE id = ?", [id]);
-    saveDatabase();
     res.json({ message: 'Email queue item deleted successfully.' });
-  });
+  }));
 
-  app.delete('/api/email/queue', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.delete('/api/email/queue', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     if (req.user?.role !== 'SUPER_ADMIN') {
       const tenantId = req.user?.tenant_id || 1;
       db.run("DELETE FROM email_queue WHERE tenant_id = ? OR (tenant_id IS NULL AND customer_id IN (SELECT id FROM customers WHERE tenant_id = ?))", [tenantId, tenantId]);
     } else {
       db.run("DELETE FROM email_queue");
     }
-    saveDatabase();
     res.json({ message: 'Email outbox queue cleared successfully.' });
-  });
+  }));
 
-  app.put('/api/email/queue/:id', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req, res) => {
+  app.put('/api/email/queue/:id', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req, res) => {
     const { id } = req.params;
     const { email, subject, message, status } = req.body;
     db.run("UPDATE email_queue SET email = ?, subject = ?, message = ?, status = ? WHERE id = ?", [email, subject, message, status || 'PENDING', id]);
-    saveDatabase();
     res.json({ message: 'Email queue item updated successfully.' });
-  });
+  }));
 
   // SMS & WhatsApp Queue Endpoints
   app.get('/api/sms/queue', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
@@ -2667,7 +2319,7 @@ async function startServer() {
     res.json(queue);
   });
 
-  app.post('/api/sms/process', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.post('/api/sms/process', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     let pendingSql = "SELECT * FROM sms_queue WHERE status = 'PENDING'";
     const params: any[] = [];
     if (req.user?.role !== 'SUPER_ADMIN') {
@@ -2681,35 +2333,31 @@ async function startServer() {
       db.run("UPDATE sms_queue SET status = 'SENT', sent_at = CURRENT_TIMESTAMP WHERE id = ?", [item.id]);
       processedCount++;
     }
-    saveDatabase();
     res.json({ message: `Successfully processed ${processedCount} queued WhatsApp/SMS notifications.` });
-  });
+  }));
 
-  app.delete('/api/sms/queue/:id', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req, res) => {
+  app.delete('/api/sms/queue/:id', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req, res) => {
     const { id } = req.params;
     db.run("DELETE FROM sms_queue WHERE id = ?", [id]);
-    saveDatabase();
     res.json({ message: 'SMS queue item deleted successfully.' });
-  });
+  }));
 
-  app.delete('/api/sms/queue', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.delete('/api/sms/queue', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     if (req.user?.role !== 'SUPER_ADMIN') {
       const tenantId = req.user?.tenant_id || 1;
       db.run("DELETE FROM sms_queue WHERE tenant_id = ? OR (tenant_id IS NULL AND customer_id IN (SELECT id FROM customers WHERE tenant_id = ?))", [tenantId, tenantId]);
     } else {
       db.run("DELETE FROM sms_queue");
     }
-    saveDatabase();
     res.json({ message: 'SMS outbox queue cleared successfully.' });
-  });
+  }));
 
-  app.put('/api/sms/queue/:id', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req, res) => {
+  app.put('/api/sms/queue/:id', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req, res) => {
     const { id } = req.params;
     const { phone, message, status } = req.body;
     db.run("UPDATE sms_queue SET phone = ?, message = ?, status = ? WHERE id = ?", [phone, message, status || 'PENDING', id]);
-    saveDatabase();
     res.json({ message: 'SMS queue item updated successfully.' });
-  });
+  }));
 
   // 9. System Settings & Encrypted Backup API
   app.get('/api/settings', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req, res) => {
@@ -2719,7 +2367,7 @@ async function startServer() {
     res.json(settingsObj);
   });
 
-  app.post('/api/settings/test-smtp', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+  app.post('/api/settings/test-smtp', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     const { testEmail } = req.body;
     
     // Fetch current settings
@@ -2749,24 +2397,22 @@ async function startServer() {
 
     logAudit(req.user?.id, req.user?.fullName, 'TEST_SMTP_GATEWAY', `Triggered SMTP Gateway Connection Test to ${targetEmail} (Host: ${smtpHost}:${smtpPort})`, 'SETTINGS', undefined, req);
 
-    saveDatabase();
     res.json({
       message: `SMTP Gateway Test Successful! Queued test email to ${targetEmail} via ${smtpHost}:${smtpPort}. You can dispatch or review it in the Email Outbox.`
     });
-  });
+  }));
 
-  app.post('/api/settings', authenticateToken, requireRoles(['ADMIN']), (req: AuthRequest, res) => {
+  app.post('/api/settings', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
     const settingsObj = req.body;
     for (const key of Object.keys(settingsObj)) {
       db.run("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", [key, String(settingsObj[key])]);
     }
-    saveDatabase();
     logAudit(req.user?.id, req.user?.fullName, 'SETTINGS_UPDATE', 'Updated pharmacy system settings and receipt configurations', 'SETTINGS', undefined, req);
     res.json({ message: 'Settings saved successfully' });
-  });
+  }));
 
   // Encrypted Backup Download
-  app.post('/api/backup/export', authenticateToken, requireRoles(['ADMIN', 'SUPER_ADMIN']), (req: AuthRequest, res) => {
+  app.post('/api/backup/export', authenticateToken, requireRoles(['ADMIN', 'SUPER_ADMIN']), tx((req: AuthRequest, res) => {
     const { password } = req.body;
     if (!password) {
       return res.status(400).json({ error: 'Master backup password is required' });
@@ -2776,8 +2422,7 @@ async function startServer() {
       return res.status(400).json({ error: 'Backup encryption password must be at least 8 characters long and contain both letters and numbers/symbols.' });
     }
 
-    saveDatabase();
-    const dbBuffer = fs.readFileSync(DB_FILE);
+    const dbBuffer = db.serialize(); // consistent snapshot, includes data still in the WAL
 
     // Encrypt with AES-256-CBC
     const key = crypto.scryptSync(password, 'khushi_pharmacy_salt', 32);
@@ -2797,7 +2442,7 @@ async function startServer() {
     res.setHeader('Content-Type', 'application/json');
     res.setHeader('Content-Disposition', `attachment; filename=Khushi_Medical_Backup_${new Date().toISOString().split('T')[0]}.kmhbackup`);
     res.send(JSON.stringify(backupPayload, null, 2));
-  });
+  }));
 
   // Export MySQL SQL Dump
   app.get('/api/backup/mysql-export', authenticateToken, requireRoles(['ADMIN', 'SUPER_ADMIN']), async (req: AuthRequest, res) => {
@@ -2937,20 +2582,43 @@ async function startServer() {
         return res.status(400).json({ error: 'Decryption failed or invalid backup file. Incorrect decryption password or non-SQLite file.' });
       }
 
-      // Close current db if open
-      if (db) {
-        try { db.close(); } catch (e) {}
+      // Safe swap: verify the restored file first, keep the current database as a
+      // pre-restore safety copy, and put it back automatically if the restored one cannot be opened.
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const incoming = `${DB_FILE}.restore-${stamp}`;
+      fs.writeFileSync(incoming, decryptedBuffer);
+      const problems = checkExistingDatabase(incoming);
+      if (!problems.length) {
+        // refuse SQLite files that are not a pharmacy database (an empty file would silently wipe all data)
+        const probe = DbAdapter.open(incoming, { readonly: true });
+        try {
+          const tables = probe.tableNames();
+          if (!tables.includes('users') || !tables.includes('products')) problems.push('it does not contain pharmacy data (no users/products tables)');
+        } finally {
+          probe.close();
+        }
+      }
+      // the read-only checks of a WAL-mode file create empty -wal/-shm side files; remove them
+      for (const ext of ['-wal', '-shm']) fs.rmSync(`${incoming}${ext}`, { force: true });
+      if (problems.length) {
+        fs.rmSync(incoming, { force: true });
+        return res.status(400).json({ error: `The backup file is damaged and was not restored (${problems[0]}). Your current data is unchanged.` });
+      }
+      fs.mkdirSync(BACKUP_DIR, { recursive: true });
+      const safetyCopy = path.join(BACKUP_DIR, `pre-restore-${stamp}.sqlite`);
+      db.close(); // checkpoints the WAL so the main file is complete
+      for (const ext of ['-wal', '-shm']) fs.rmSync(`${DB_FILE}${ext}`, { force: true });
+      fs.renameSync(DB_FILE, safetyCopy);
+      fs.renameSync(incoming, DB_FILE);
+      try {
+        db = (await openDatabase(DB_FILE, { backupDir: BACKUP_DIR })).db;
+      } catch (openErr: any) {
+        for (const ext of ['', '-wal', '-shm']) fs.rmSync(`${DB_FILE}${ext}`, { force: true });
+        fs.renameSync(safetyCopy, DB_FILE);
+        db = (await openDatabase(DB_FILE, { backupDir: BACKUP_DIR })).db;
+        return res.status(400).json({ error: `The backup could not be opened (${openErr.message}). Your previous data was put back unchanged.` });
       }
 
-      // Write decrypted database file to disk
-      fs.writeFileSync(DB_FILE, decryptedBuffer);
-      
-      // Reload Database in memory using sql.js
-      const SQL = await initSqlJs();
-      db = new SQL.Database(decryptedBuffer);
-
-      // Save database & log audit
-      saveDatabase();
       logAudit(req.user?.id, req.user?.fullName, 'BACKUP_RESTORE', 'Restored database successfully from encrypted backup file', 'BACKUP', undefined, req);
 
       res.json({ message: 'Database restored successfully! All data and settings have been restored.' });
@@ -2977,7 +2645,7 @@ async function startServer() {
     res.json(users);
   });
 
-  app.post('/api/users', authenticateToken, requireRoles(['ADMIN']), (req: AuthRequest, res) => {
+  app.post('/api/users', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
     const { username, password, fullName, role, email, phone, allowed_services } = req.body;
 
     if (!username || !password || !fullName || !role) {
@@ -3007,15 +2675,14 @@ async function startServer() {
       VALUES (?, ?, ?, ?, ?, ?, 'APPROVED', ?, ?)
     `, [cleanUsername, passHash, role, fullName, email || cleanUsername, phone || '', tenantId, servicesStr]);
 
-    saveDatabase();
     const createdUser = queryOne<any>("SELECT id, username, role, full_name, email, phone, status, allowed_services, tenant_id FROM users WHERE username = ?", [cleanUsername]);
 
     logAudit(req.user?.id, req.user?.fullName, 'USER_CREATE', `Admin manually created user account ${cleanUsername} (${fullName}, Role: ${role})`, 'USER', createdUser?.id, req);
 
     res.json({ message: 'User account created successfully', user: createdUser });
-  });
+  }));
 
-  app.put('/api/users/:id/permissions', authenticateToken, requireRoles(['ADMIN']), (req: AuthRequest, res) => {
+  app.put('/api/users/:id/permissions', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
     const userId = Number(req.params.id);
     const { allowed_services } = req.body;
 
@@ -3031,14 +2698,13 @@ async function startServer() {
     const servicesStr = Array.isArray(allowed_services) ? allowed_services.join(',') : String(allowed_services || '');
 
     db.run("UPDATE users SET allowed_services = ? WHERE id = ?", [servicesStr, userId]);
-    saveDatabase();
 
     logAudit(req.user?.id, req.user?.fullName, 'USER_PERMISSIONS_UPDATE', `Shopkeeper updated staff permissions for ${targetUser.username} (${targetUser.full_name}) to [${servicesStr}]`, 'USER', userId, req);
 
     res.json({ message: `Permissions updated successfully for staff account @${targetUser.username}`, allowed_services: servicesStr });
-  });
+  }));
 
-  app.put('/api/users/:id', authenticateToken, requireRoles(['ADMIN']), (req: AuthRequest, res) => {
+  app.put('/api/users/:id', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
     const userId = Number(req.params.id);
     const { fullName, email, phone, role } = req.body;
 
@@ -3064,13 +2730,12 @@ async function startServer() {
       WHERE id = ?
     `, [fullName || null, email || null, phone || null, role || null, userId]);
 
-    saveDatabase();
     logAudit(req.user?.id, req.user?.fullName, 'USER_UPDATE', `Admin updated profile for user ${targetUser.username} (${targetUser.full_name})`, 'USER', userId, req);
 
     res.json({ message: 'User details updated successfully' });
-  });
+  }));
 
-  app.put('/api/users/:id/status', authenticateToken, requireRoles(['ADMIN']), (req: AuthRequest, res) => {
+  app.put('/api/users/:id/status', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
     const userId = Number(req.params.id);
     const { status } = req.body;
 
@@ -3091,7 +2756,6 @@ async function startServer() {
 
     try {
       db.run("UPDATE users SET status = ? WHERE id = ?", [status, userId]);
-      saveDatabase();
 
       logAudit(req.user?.id, req.user?.fullName, 'USER_VERIFY', `Admin set verification status of user ${targetUser.username} (${targetUser.full_name}) to ${status}`, 'USER', userId, req);
 
@@ -3099,9 +2763,9 @@ async function startServer() {
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Failed to update user status' });
     }
-  });
+  }));
 
-  app.put('/api/users/:id/role', authenticateToken, requireRoles(['ADMIN']), (req: AuthRequest, res) => {
+  app.put('/api/users/:id/role', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
     const userId = Number(req.params.id);
     const { role } = req.body;
 
@@ -3113,14 +2777,13 @@ async function startServer() {
     if (!targetUser) return res.status(404).json({ error: 'User not found' });
 
     db.run("UPDATE users SET role = ? WHERE id = ?", [role, userId]);
-    saveDatabase();
 
     logAudit(req.user?.id, req.user?.fullName, 'USER_ROLE_CHANGE', `Admin changed role of user ${targetUser.username} to ${role}`, 'USER', userId, req);
 
     res.json({ message: `User role updated to ${role}` });
-  });
+  }));
 
-  app.put('/api/users/:id/reset-password', authenticateToken, requireRoles(['ADMIN']), (req: AuthRequest, res) => {
+  app.put('/api/users/:id/reset-password', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
     const userId = Number(req.params.id);
     const { password } = req.body;
 
@@ -3133,14 +2796,13 @@ async function startServer() {
 
     const newHash = bcrypt.hashSync(password, 10);
     db.run("UPDATE users SET password_hash = ? WHERE id = ?", [newHash, userId]);
-    saveDatabase();
 
     logAudit(req.user?.id, req.user?.fullName, 'USER_PASSWORD_RESET', `Admin reset password for user ${targetUser.username} (${targetUser.full_name})`, 'USER', userId, req);
 
     res.json({ message: `Password reset successfully for user ${targetUser.username}` });
-  });
+  }));
 
-  app.delete('/api/users/:id', authenticateToken, requireRoles(['ADMIN']), (req: AuthRequest, res) => {
+  app.delete('/api/users/:id', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
     const userId = Number(req.params.id);
     if (userId === req.user?.id) {
       return res.status(400).json({ error: 'You cannot delete your own active admin account.' });
@@ -3162,7 +2824,6 @@ async function startServer() {
       } catch (e) {}
 
       db.run("DELETE FROM users WHERE id = ?", [userId]);
-      saveDatabase();
 
       logAudit(req.user?.id, req.user?.fullName, 'USER_DELETE', `Admin deleted user account ${targetUser.username} (${targetUser.full_name})`, 'USER', userId, req);
 
@@ -3170,10 +2831,9 @@ async function startServer() {
     } catch (err: any) {
       console.error('Delete user error:', err);
       db.run("UPDATE users SET status = 'SUSPENDED' WHERE id = ?", [userId]);
-      saveDatabase();
       res.json({ message: 'User account suspended (cannot hard delete due to existing transaction history).' });
     }
-  });
+  }));
 
   // 11. Audit Log API (ADMIN ONLY)
   app.get('/api/audit-logs', authenticateToken, requireRoles(['ADMIN', 'SUPER_ADMIN']), (req: AuthRequest, res) => {
@@ -3225,15 +2885,14 @@ async function startServer() {
     res.json(logs);
   });
 
-  app.delete('/api/audit-logs/clear', authenticateToken, requireRoles(['ADMIN']), (req: AuthRequest, res) => {
+  app.delete('/api/audit-logs/clear', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
     db.run("DELETE FROM audit_logs");
-    saveDatabase();
     logAudit(req.user?.id, req.user?.fullName, 'AUDIT_LOGS_CLEARED', 'Admin cleared all historic audit log entries', 'AUDIT', undefined, req);
     res.json({ message: 'Audit logs cleared successfully' });
-  });
+  }));
 
   // 12. Sale Void/Deletion API (ADMIN ONLY)
-  app.delete('/api/sales/:id', authenticateToken, requireRoles(['ADMIN']), (req: AuthRequest, res) => {
+  app.delete('/api/sales/:id', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
     const saleId = Number(req.params.id);
     const sale = queryOne<any>("SELECT * FROM sales_headers WHERE id = ?", [saleId]);
     if (!sale) return res.status(404).json({ error: 'Invoice not found' });
@@ -3260,12 +2919,11 @@ async function startServer() {
     db.run("DELETE FROM sale_items WHERE sale_id = ?", [saleId]);
     db.run("DELETE FROM sales_headers WHERE id = ?", [saleId]);
 
-    saveDatabase();
 
     logAudit(req.user?.id, req.user?.fullName, 'SALE_DELETE', `Voided and deleted Invoice #${sale.invoice_number} (Amount: Rs. ${sale.grand_total}). Restored item stock.`, 'SALE', saleId, req);
 
     res.json({ message: `Invoice #${sale.invoice_number} successfully voided and stock restored.` });
-  });
+  }));
 
   // 10. Restricted Customer Portal API
   app.get('/api/customer-portal/me', authenticateToken, requireRoles(['CUSTOMER']), (req: AuthRequest, res) => {
@@ -3288,7 +2946,8 @@ async function startServer() {
   // Automated Daily Backup Cron Job
   cron.schedule('0 0 * * *', () => {
     console.log('[AUTO-BACKUP] Creating daily automatic SQLite database checkpoint...');
-    saveDatabase();
+    // NOTE: still only a WAL checkpoint, not a backup (legacy behaviour R11; the real backup engine is Phase 9).
+    try { db.checkpoint(); } catch (e) { console.error('[AUTO-BACKUP] checkpoint failed:', e); }
   });
 
   // Serve Vite in development or static dist in production
@@ -3306,13 +2965,34 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, '0.0.0.0', () => {
+  const httpServer = app.listen(PORT, '0.0.0.0', () => {
     console.log(`====================================================`);
     console.log(`🏥 Khushi Medical Hall POS Server running on port ${PORT}`);
     console.log(`====================================================`);
   });
+
+  // Graceful shutdown: stop accepting requests, then close the database (checkpoints the WAL).
+  let shuttingDown = false;
+  const shutdown = (signal: string) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`[SHUTDOWN] ${signal} received, closing server and database...`);
+    httpServer.close(() => {
+      try { db.close(); } catch (e) { console.error('[SHUTDOWN] database close failed:', e); }
+      process.exit(0);
+    });
+    setTimeout(() => { try { db.close(); } catch {} process.exit(0); }, 5000).unref();
+  };
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  process.on('SIGINT', () => shutdown('SIGINT'));
 }
 
 startServer().catch(err => {
-  console.error("Failed to start server:", err);
+  if (err instanceof DatabaseIntegrityError || err instanceof MigrationError) {
+    console.error(`\n[DATABASE] STARTUP STOPPED - ${err.message}`);
+    if ((err as MigrationError).details) console.error('[DATABASE] details:', JSON.stringify((err as MigrationError).details));
+  } else {
+    console.error("Failed to start server:", err);
+  }
+  process.exit(1);
 });

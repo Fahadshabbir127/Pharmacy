@@ -87,6 +87,16 @@ describe('settings', () => {
   });
 });
 
+/** Self-contained copy of a live WAL database (the main file alone may not hold recent pages). */
+async function snapshot(file: string): Promise<string> {
+  const { makeTempDir } = await import('../helpers/server');
+  const out = `${makeTempDir()}/snapshot.sqlite`;
+  const db = await openReadOnly(file);
+  db.exec(`VACUUM INTO '${out}'`);
+  db.close();
+  return out;
+}
+
 describe('backup & restore', () => {
   it('rejects a weak backup password', async () => {
     expect((await admin.post('/backup/export', { password: 'short' })).status).toBe(400);
@@ -108,16 +118,52 @@ describe('backup & restore', () => {
     expect((await admin.get('/categories')).body.map((c: any) => c.name)).not.toContain('After Backup');
   });
 
-  it('[LEGACY-BUG S8] restore keeps no safety copy of the database it replaces', async () => {
-    const exp = await admin.post('/backup/export', { password: 'Backup123!' });
-    await admin.post('/backup/import', { backupPayload: exp.body, password: 'Backup123!' });
-    const files = fs.readdirSync(`${srv.workDir}/data`);
-    expect(files).toEqual(['khushi_pharmacy.sqlite']);
+  // Phase 3 fix of S8 (was: the replaced database was overwritten with no copy)
+  it('[FIXED S8] restore keeps the replaced database as a verified pre-restore safety copy and leaves no temp files', async () => {
+    await admin.post('/categories', { name: 'Only In Replaced DB' });
+    const exp0 = await admin.post('/backup/export', { password: 'Backup123!' });
+    await admin.post('/categories', { name: 'Newer Than Backup' });
+    expect((await admin.post('/backup/import', { backupPayload: exp0.body, password: 'Backup123!' })).status).toBe(200);
+    const files = fs.readdirSync(`${srv.workDir}/data`).filter((f) => !/-(wal|shm)$/.test(f));
+    expect(files.sort()).toEqual(['backups', 'khushi_pharmacy.sqlite']);
+    const safety = fs.readdirSync(`${srv.workDir}/data/backups`).filter((f) => f.startsWith('pre-restore-'));
+    expect(safety).toHaveLength(1);
+    const copy = await openReadOnly(`${srv.workDir}/data/backups/${safety[0]}`);
+    expect(integrityCheck(copy)).toEqual([]);
+    expect(all(copy, "SELECT name FROM categories WHERE name='Newer Than Backup'")).toHaveLength(1);
+    copy.close();
+  });
+
+  it('an empty / non-pharmacy SQLite file is refused (400) instead of wiping the data', async () => {
+    const { makeTempDir } = await import('../helpers/server');
+    const Database = (await import('better-sqlite3')).default;
+    const f = `${makeTempDir()}/empty.sqlite`;
+    const d = new Database(f);
+    d.exec('CREATE TABLE notes (x)');
+    d.close();
+    const r = await admin.post('/backup/import', { backupPayload: fs.readFileSync(f).toString('base64') });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/does not contain pharmacy data/);
+    expect((await admin.get('/inventory')).body).toHaveLength(12);
+  });
+
+  it('a damaged backup is refused (400) and the current data is unchanged', async () => {
+    const raw = fs.readFileSync(await snapshot(srv.dbFile));
+    const damaged = Buffer.from(raw);
+    damaged.fill(0x41, 4096 * 2, 4096 * 2 + 3000);
+    const r = await admin.post('/backup/import', { backupPayload: damaged.toString('base64') });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/damaged and was not restored/);
+    expect((await admin.get('/inventory')).body).toHaveLength(12);
+    expect(fs.readdirSync(`${srv.workDir}/data`).filter((f) => f.includes('restore'))).toEqual([]);
   });
 
   it('accepts a raw base64 SQLite file without a password', async () => {
-    const raw = fs.readFileSync(srv.dbFile).toString('base64');
+    const raw = fs.readFileSync(await snapshot(srv.dbFile)).toString('base64');
+    await admin.post('/categories', { name: 'Added After Snapshot' });
     expect((await admin.post('/backup/import', { backupPayload: raw })).status).toBe(200);
+    expect((await admin.get('/inventory')).body).toHaveLength(12);
+    expect((await admin.get('/categories')).body.map((c: any) => c.name)).not.toContain('Added After Snapshot');
   });
 
   it('MySQL dump export returns SQL text with CREATE TABLE and INSERT statements', async () => {
@@ -134,10 +180,10 @@ describe('backup & restore', () => {
     expect((await staff.post('/backup/export', { password: 'Backup123!' })).status).toBe(403);
   });
 
-  it('[LEGACY-BUG R11] the "daily backup" cron only re-saves the live file (source check)', () => {
+  it('[LEGACY-BUG R11] the "daily backup" cron still only checkpoints the live file (real backups: Phase 9)', () => {
     const src = fs.readFileSync(`${__dirname}/../../server.ts`, 'utf8');
-    const cronBlock = src.slice(src.indexOf("cron.schedule('0 0 * * *'"), src.indexOf("cron.schedule('0 0 * * *'") + 250);
-    expect(cronBlock).toMatch(/saveDatabase\(\)/);
+    const cronBlock = src.slice(src.indexOf("cron.schedule('0 0 * * *'"), src.indexOf("cron.schedule('0 0 * * *'") + 400);
+    expect(cronBlock).toMatch(/db\.checkpoint\(\)/);
     expect(cronBlock).not.toMatch(/backup\(|copyFile|writeFile/);
   });
 });

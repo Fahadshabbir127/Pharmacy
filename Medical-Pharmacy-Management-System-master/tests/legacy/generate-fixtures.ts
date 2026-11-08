@@ -263,3 +263,10 @@ export async function salvageReport(originalFile: string): Promise<{ readable: R
   }
   return { readable, integrity };
 }
+
+/** Generate the fixtures once (they are git-ignored); reuse them when the manifest exists. */
+export async function ensureFixtures(outDir: string): Promise<Record<string, FixtureManifestEntry>> {
+  const manifestFile = path.join(outDir, 'manifest.json');
+  if (fs.existsSync(manifestFile)) return JSON.parse(fs.readFileSync(manifestFile, 'utf8'));
+  return generateFixtures(outDir);
+}

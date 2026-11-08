@@ -4,6 +4,44 @@ This report contains only results that were actually executed. Anything not exec
 
 ---
 
+## Phase 3: database layer (better-sqlite3), migrations, transactions, FK audit
+
+| | |
+|---|---|
+| Date | 2026-11-08 |
+| Command | `cd Medical-Pharmacy-Management-System-master && npm test` |
+| Result | **12 files, 178 tests, all passing on two consecutive full runs.** `npm run lint` is clean, `npm run audit:db-callsites` reports 288 call sites and 0 problems, and `npm run build` succeeds. The bundled `dist/server.cjs` was started, served a login and shut down cleanly. |
+
+| New test file | Tests | Covers |
+|---|---|---|
+| `tests/unit/db-adapter.test.ts` | 22 | Parameter rules, pragmas (WAL, FULL sync, busy_timeout, FK OFF), commit/rollback, nested savepoints, busy-lock behaviour, online backup, `serialize()` includes WAL data, damaged files |
+| `tests/unit/transactional-route.test.ts` | 7 | Commit-then-respond, rollback on throw and on 5xx, keep 4xx audit writes, failed COMMIT never sends success |
+| `tests/unit/migrations.test.ts` | 22 | **All 7 legacy fixtures migrated on copies:** every row count and money/stock/ledger total unchanged, verified pre-migration backup, originals byte-identical, full legacy column set. Failure cases: corrupt or non-DB file refused untouched, row-deleting migration rolled back, throwing migration rolled back, backup failure blocks migration, newer-version DB refused. Copy-only import (source byte-identical, no overwrite, corrupt/non-pharmacy refused, repo sample refused and untouched). |
+| `tests/unit/fk-audit.test.ts` | 11 | Audit is read-only; orphan findings per fixture; what breaks if FK enforcement were switched on |
+| `tests/characterization/07-durability.test.ts` | 2 | `SIGKILL` during a burst of concurrent sales: **25/25 acknowledged sales survived**, 30 in-flight requests were interrupted, no partial sale, stock equals stored sales, integrity ok (3 standalone runs + 2 full-suite runs, identical) |
+
+**Characterisation tests changed on purpose.** Each was relabelled `[FIXED …]` with its old behaviour noted in a comment:
+- R3: a failed purchase is now fully rolled back.
+- R10: a damaged DB stops startup and the file is left untouched.
+- S8: restore keeps a verified pre-restore safety copy.
+- Schema test: the `schema_migrations` table and WAL mode are expected.
+- R11: the daily job is still not a real backup (Phase 9); its source check was updated.
+
+**New tests added:**
+- a damaged backup is refused;
+- an empty or non-pharmacy SQLite file is refused by restore.
+
+The second closes a gap that existed in the original code too: it only checked the file header, so "restoring" an empty database would silently wipe all data. All other 105 Phase 2 tests pass unchanged.
+
+**Defects found in Phase 3:**
+- **Legacy (original app):** on the oldest schema the users-table rebuild drops `users.allowed_services` until the next start. Migration `0003` handles it, and a test records the legacy behaviour.
+- **Legacy (original app):** restore accepted any SQLite file, including an empty one. Now refused.
+- **Introduced during this phase and fixed before commit:** the restore integrity check left empty `-wal`/`-shm` side files behind. They are now removed, and a test asserts no leftovers.
+
+Foreign keys: see `FK_AUDIT_REPORT.md`. Enforcement stays OFF pending approval of FK1–FK5.
+
+---
+
 ## Phase 2: baseline characterisation suite (original application, before functional changes)
 
 | | |

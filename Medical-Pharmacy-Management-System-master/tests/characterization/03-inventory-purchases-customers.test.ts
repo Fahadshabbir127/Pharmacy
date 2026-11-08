@@ -130,14 +130,17 @@ describe('purchases', () => {
     expect(r.body.invoice_number).toMatch(/^PUR-1-\d{6}$/);
   });
 
-  it('[LEGACY-BUG R3] purchases are not transactional: a failing 2nd item leaves a header, the 1st item and its stock increase', async () => {
+  // Phase 3 fix of R3 (was: header, first line and its stock increase were left behind)
+  it('[FIXED R3] a purchase whose 2nd item fails is rolled back completely', async () => {
     const r = await admin.post('/purchases', { supplier_id: 1, invoice_number: 'PARTIAL-1', items: [
       { product_id: 1, quantity: 5, purchase_price: 180 },
       { product_id: null, quantity: 1, purchase_price: 300 }, // violates purchase_items.product_id NOT NULL
     ] });
     expect(r.status).toBe(500);
-    expect((await prod(1)).stock).toBe(125); // first item's stock increase was applied
-    expect((await admin.get('/purchases')).body.map((p: any) => p.invoice_number)).toContain('PARTIAL-1');
+    expect((await prod(1)).stock).toBe(120);
+    expect((await admin.get('/purchases')).body.map((p: any) => p.invoice_number)).not.toContain('PARTIAL-1');
+    const db = await openReadOnly(srv.dbFile);
+    expect(one(db, 'SELECT COUNT(*) n FROM purchase_items')).toEqual({ n: 0 });
   });
 });
 
