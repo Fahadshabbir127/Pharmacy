@@ -131,21 +131,30 @@ describe('known defects in the sale path', () => {
     expect(s2.body.invoice_number).toBe(s1.body.invoice_number);
   });
 
-  it('[LEGACY-BUG] a sale referencing a non-existent product id is recorded (no FK / existence check)', async () => {
+  // FK5 fix (was: the sale was recorded against a product that does not exist)
+  it('[FIXED FK5] a sale referencing a non-existent product id is rejected and nothing is recorded', async () => {
     const ghost = { id: 99999, name: 'Ghost', unit: 'Pack', sale_price: 10, purchase_price: 5, gst_rate: 0 };
     const r = await admin.post('/sales', salePayload([cartItem(ghost, 1)]));
-    expect(r.status).toBe(200);
+    expect(r.status).toBe(500);
+    expect(r.body.error).toMatch(/FOREIGN KEY/);
+    const db = await openReadOnly(srv.dbFile);
+    expect(one(db, "SELECT COUNT(*) n FROM sales_headers WHERE invoice_number LIKE 'INV-1-%'")).toEqual({ n: 0 });
   });
 
-  it('[LEGACY-BUG] deleting a product hides its lines from past invoice details (inner JOIN)', async () => {
+  // FK2 fix (was: deleting the product made its lines disappear from past invoices)
+  it('[FIXED FK2] deleting a sold product archives it: past invoices keep the line, the product leaves the active list', async () => {
     const add = await admin.post('/inventory', { name: 'Temp Med', unit: 'Pack', purchase_price: 5, sale_price: 10, stock: 10 });
     const p = await product(add.body.id);
     const s = await admin.post('/sales', salePayload([cartItem(p, 1)]));
     expect((await admin.get(`/sales/${s.body.sale_id}`)).body.items).toHaveLength(1);
-    expect((await admin.del(`/inventory/${p.id}`)).status).toBe(200);
+    const del = await admin.del(`/inventory/${p.id}`);
+    expect(del.status).toBe(200);
+    expect(del.body.archived).toBe(true);
     const after = await admin.get(`/sales/${s.body.sale_id}`);
-    expect(after.body.items).toHaveLength(0);
+    expect(after.body.items).toHaveLength(1);
+    expect(after.body.items[0]).toMatchObject({ product_name: 'Temp Med', subtotal: 10 });
     expect(after.body.grand_total).toBe(10);
+    expect(await product(p.id)).toBeUndefined();
   });
 });
 

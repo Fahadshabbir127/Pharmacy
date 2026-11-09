@@ -292,6 +292,37 @@ function logAudit(userId: number | undefined | null, userName: string | undefine
   }
 }
 
+// ---- Archiving (FK2/FK3): records with history are archived, never deleted ----
+function hasHistory(checks: [string, any[]][]): boolean {
+  return checks.some(([sql, params]) => !!db.get(sql, params));
+}
+
+function archiveRow(table: string, id: number, userId: number | undefined | null, reason: string) {
+  db.run(`UPDATE "${table}" SET archived_at = ?, archived_by = ?, archive_reason = ? WHERE id = ?`, [new Date().toISOString(), userId ?? null, reason, id]);
+}
+
+/**
+ * An archived row keeps its UNIQUE values (phone, username, owner email) so its history stays readable.
+ * When a NEW active record needs the same value, rename the archived row's value and remember the original
+ * in archived_key. Only archived rows are ever touched.
+ */
+function releaseArchivedUnique(table: string, column: string, value: string) {
+  if (!value) return;
+  const holder = db.get<{ id: number }>(`SELECT id FROM "${table}" WHERE "${column}" = ? AND archived_at IS NOT NULL`, [value]);
+  if (!holder) return;
+  db.run(`UPDATE "${table}" SET archived_key = COALESCE(archived_key, "${column}"), "${column}" = ? WHERE id = ?`, [`${value}~archived-${holder.id}`, holder.id]);
+}
+
+/** Hidden record that non-customer emails (supplier POs, SMTP tests, platform messages) are attached to. */
+function systemCustomerId(): number {
+  const row = db.get<{ id: number }>("SELECT id FROM customers WHERE phone = '__system_messages__'");
+  if (row) return row.id;
+  return db.run(
+    "INSERT INTO customers (name, phone, opening_balance, current_balance, archived_at, archive_reason, is_placeholder) VALUES ('[System messages]', '__system_messages__', 0, 0, ?, 'System record for non-customer messages', 1)",
+    [new Date().toISOString()],
+  ).lastInsertRowid;
+}
+
 // Password Strength Checker
 function isPasswordStrong(pwd: string): boolean {
   if (!pwd || pwd.length < 8) return false;
@@ -352,7 +383,7 @@ function authenticateToken(req: AuthRequest, res: express.Response, next: expres
 
     if (payload.role !== 'SUPER_ADMIN' && dbUser.tenant_id) {
       const tenant = queryOne<any>("SELECT status FROM tenants WHERE id = ?", [dbUser.tenant_id]);
-      if (tenant && tenant.status === 'SUSPENDED') {
+      if (tenant && (tenant.status === 'SUSPENDED' || tenant.status === 'DELETED')) {
         return res.status(403).json({ error: 'This pharmacy store account is currently SUSPENDED by Platform Super Admin. Please contact support.' });
       }
     }
@@ -555,10 +586,10 @@ async function startServer() {
 
   // Super Admin Management APIs
   app.get('/api/superadmin/metrics', authenticateToken, requireRoles(['SUPER_ADMIN']), (req, res) => {
-    const totalTenantsRes = queryOne<any>("SELECT COUNT(*) as count FROM tenants");
+    const totalTenantsRes = queryOne<any>("SELECT COUNT(*) as count FROM tenants WHERE archived_at IS NULL");
     const activeTenantsRes = queryOne<any>("SELECT COUNT(*) as count FROM tenants WHERE status = 'ACTIVE'");
     const totalSalesRes = queryOne<any>("SELECT COUNT(*) as count, COALESCE(SUM(grand_total), 0) as revenue FROM sales_headers");
-    const totalUsersRes = queryOne<any>("SELECT COUNT(*) as count FROM users");
+    const totalUsersRes = queryOne<any>("SELECT COUNT(*) as count FROM users WHERE archived_at IS NULL");
 
     res.json({
       totalTenants: totalTenantsRes?.count || 0,
@@ -570,10 +601,10 @@ async function startServer() {
   });
 
   app.get('/api/superadmin/tenants', authenticateToken, requireRoles(['SUPER_ADMIN']), (req, res) => {
-    const tenants = queryAll<any>("SELECT * FROM tenants ORDER BY id DESC");
+    const tenants = queryAll<any>("SELECT * FROM tenants WHERE archived_at IS NULL ORDER BY id DESC");
     const enriched = tenants.map(t => {
-      const userCount = queryOne<any>("SELECT COUNT(*) as count FROM users WHERE tenant_id = ?", [t.id])?.count || 0;
-      const productCount = queryOne<any>("SELECT COUNT(*) as count FROM products WHERE tenant_id = ?", [t.id])?.count || 0;
+      const userCount = queryOne<any>("SELECT COUNT(*) as count FROM users WHERE tenant_id = ? AND archived_at IS NULL", [t.id])?.count || 0;
+      const productCount = queryOne<any>("SELECT COUNT(*) as count FROM products WHERE tenant_id = ? AND archived_at IS NULL", [t.id])?.count || 0;
       const salesTotal = queryOne<any>("SELECT COALESCE(SUM(grand_total), 0) as total FROM sales_headers WHERE tenant_id = ?", [t.id])?.total || 0;
 
       return {
@@ -593,10 +624,10 @@ async function startServer() {
       return res.status(404).json({ error: 'Pharmacy store tenant not found.' });
     }
 
-    const users = queryAll<any>("SELECT id, username, role, full_name, email, phone, status, tenant_id, created_at FROM users WHERE tenant_id = ? ORDER BY id DESC", [tenantId]);
+    const users = queryAll<any>("SELECT id, username, role, full_name, email, phone, status, tenant_id, created_at FROM users WHERE tenant_id = ? AND archived_at IS NULL ORDER BY id DESC", [tenantId]);
     const sales = queryAll<any>("SELECT * FROM sales_headers WHERE tenant_id = ? ORDER BY id DESC LIMIT 100", [tenantId]);
-    const products = queryAll<any>("SELECT * FROM products WHERE tenant_id = ? ORDER BY id DESC LIMIT 100", [tenantId]);
-    const customers = queryAll<any>("SELECT * FROM customers WHERE tenant_id = ? ORDER BY id DESC LIMIT 100", [tenantId]);
+    const products = queryAll<any>("SELECT * FROM products WHERE tenant_id = ? AND archived_at IS NULL ORDER BY id DESC LIMIT 100", [tenantId]);
+    const customers = queryAll<any>("SELECT * FROM customers WHERE tenant_id = ? AND archived_at IS NULL ORDER BY id DESC LIMIT 100", [tenantId]);
     const auditLogs = queryAll<any>(`
       SELECT a.* FROM audit_logs a 
       LEFT JOIN users u ON a.user_id = u.id 
@@ -633,7 +664,8 @@ async function startServer() {
     }
 
     const cleanEmail = owner_email.trim().toLowerCase();
-    const existing = queryOne<any>("SELECT id FROM tenants WHERE owner_email = ?", [cleanEmail]);
+    const existing = queryOne<any>("SELECT id FROM tenants WHERE owner_email = ? AND archived_at IS NULL", [cleanEmail]);
+    if (!existing) releaseArchivedUnique('tenants', 'owner_email', cleanEmail);
     if (existing) {
       return res.status(400).json({ error: 'A store with this owner email address already exists.' });
     }
@@ -692,14 +724,15 @@ async function startServer() {
       return res.status(400).json({ error: 'Cannot delete primary flagship store tenant #1.' });
     }
 
-    db.run("DELETE FROM tenants WHERE id = ?", [tenantId]);
-    db.run("DELETE FROM users WHERE tenant_id = ?", [tenantId]);
-    db.run("DELETE FROM products WHERE tenant_id = ?", [tenantId]);
-    db.run("DELETE FROM sales_headers WHERE tenant_id = ?", [tenantId]);
-    db.run("DELETE FROM customers WHERE tenant_id = ?", [tenantId]);
+    const tenantRow = queryOne<any>("SELECT id, name FROM tenants WHERE id = ? AND archived_at IS NULL", [tenantId]);
+    if (!tenantRow) return res.status(404).json({ error: 'Pharmacy store tenant not found.' });
 
-    logAudit(req.user?.id, req.user?.fullName, 'SUPERADMIN_TENANT_DELETE', `Super Admin deleted store #${tenantId}`, 'TENANT', tenantId, req);
-    res.json({ message: `Store #${tenantId} deleted successfully.` });
+    // FK3: the store is archived (status DELETED, sign-in blocked for its users); none of its data is deleted
+    db.run("UPDATE tenants SET status = 'DELETED' WHERE id = ?", [tenantId]);
+    archiveRow('tenants', tenantId, req.user?.id, 'Deleted by Super Admin; data kept');
+
+    logAudit(req.user?.id, req.user?.fullName, 'SUPERADMIN_TENANT_ARCHIVE', `Super Admin removed store #${tenantId} (${tenantRow.name}); store archived, sign-in disabled, all data kept`, 'TENANT', tenantId, req);
+    res.json({ message: `Store #${tenantId} removed. Its data has been archived and kept; its users can no longer sign in.`, archived: true });
   }));
 
   // Super Admin direct login-as / jump to store account endpoint
@@ -710,7 +743,7 @@ async function startServer() {
       return res.status(404).json({ error: 'Store not found.' });
     }
 
-    if (tenant.status === 'SUSPENDED') {
+    if (tenant.status === 'SUSPENDED' || tenant.status === 'DELETED') {
       return res.status(400).json({ error: 'Cannot access a suspended store. Please activate it first.' });
     }
 
@@ -786,7 +819,7 @@ async function startServer() {
       db.run(`
         INSERT INTO email_queue (customer_id, email, subject, message, type, status, tenant_id)
         VALUES (?, ?, ?, ?, 'WELCOME', 'PENDING', ?)
-      `, [1, r.email, subject, messageBody, r.tenant_id || 1]);
+      `, [systemCustomerId(), r.email, subject, messageBody, r.tenant_id || 1]);
       queuedCount++;
     }
 
@@ -856,6 +889,11 @@ async function startServer() {
       return res.status(403).json({ error: 'Your account registration was rejected by the Admin.' });
     }
 
+    if (user.status === 'ARCHIVED' || user.archived_at) {
+      logAudit(user.id, user.full_name, 'LOGIN_BLOCKED', `Login blocked: Account is ARCHIVED (${user.username})`, 'AUTH', user.id, req);
+      return res.status(403).json({ error: 'This account has been archived and can no longer sign in.' });
+    }
+
     if (user.status === 'SUSPENDED') {
       logAudit(user.id, user.full_name, 'LOGIN_BLOCKED', `Login blocked: Account SUSPENDED by Admin (${user.username})`, 'AUTH', user.id, req);
       return res.status(403).json({ error: 'Your account is currently suspended. Please contact Admin.' });
@@ -878,7 +916,7 @@ async function startServer() {
       allowedServices = user.allowed_services;
     }
 
-    if (user.role !== 'SUPER_ADMIN' && tenantStatus === 'SUSPENDED') {
+    if (user.role !== 'SUPER_ADMIN' && (tenantStatus === 'SUSPENDED' || tenantStatus === 'DELETED')) {
       logAudit(user.id, user.full_name, 'LOGIN_BLOCKED_TENANT_SUSPENDED', `Login blocked: Store tenant "${tenantName}" is SUSPENDED (${user.username})`, 'AUTH', user.id, req);
       return res.status(403).json({ error: 'This pharmacy store account is currently SUSPENDED by Platform Super Admin. Please contact support.' });
     }
@@ -930,7 +968,7 @@ async function startServer() {
       return res.status(404).json({ error: 'No registered user account found for this email address.' });
     }
 
-    if (user.status === 'SUSPENDED' || user.status === 'REJECTED') {
+    if (user.status === 'SUSPENDED' || user.status === 'REJECTED' || user.status === 'ARCHIVED' || user.archived_at) {
       return res.status(403).json({ error: `Account is ${user.status.toLowerCase()}. Please contact Admin.` });
     }
 
@@ -979,6 +1017,9 @@ async function startServer() {
     }
     if (user.status === 'SUSPENDED') {
       return res.status(403).json({ error: 'Your account access has been suspended.' });
+    }
+    if (user.status === 'ARCHIVED' || user.archived_at) {
+      return res.status(403).json({ error: 'This account has been archived and can no longer sign in.' });
     }
 
     // Clear used OTP
@@ -1079,7 +1120,7 @@ async function startServer() {
       FROM products p
       LEFT JOIN categories c ON p.category_id = c.id
       LEFT JOIN suppliers s ON p.supplier_id = s.id
-      WHERE 1=1
+      WHERE p.archived_at IS NULL
     `;
     const params: any[] = [];
 
@@ -1253,6 +1294,17 @@ async function startServer() {
       return res.status(403).json({ error: 'Access denied: Product belongs to another store.' });
     }
 
+    // FK2: a product with sales/purchase/adjustment history is archived (kept for invoices and reports)
+    if (hasHistory([
+      ["SELECT 1 x FROM sale_items WHERE product_id = ? LIMIT 1", [id]],
+      ["SELECT 1 x FROM purchase_items WHERE product_id = ? LIMIT 1", [id]],
+      ["SELECT 1 x FROM stock_adjustments WHERE product_id = ? LIMIT 1", [id]],
+    ])) {
+      archiveRow('products', id, req.user?.id, 'Deleted by user; kept because it has transaction history');
+      logAudit(req.user?.id, req.user?.fullName, 'PRODUCT_ARCHIVE', `Archived product #${id} (${prod.name}); it has transaction history, which is kept`, 'PRODUCT', id, req);
+      return res.json({ message: 'Product removed from the list. It has sales/purchase history, so it was archived and its history is kept.', archived: true });
+    }
+
     db.run("DELETE FROM products WHERE id = ?", [id]);
 
     logAudit(req.user?.id, req.user?.fullName, 'PRODUCT_DELETE', `Deleted product #${id} (${prod.name})`, 'PRODUCT', id, req);
@@ -1300,9 +1352,9 @@ async function startServer() {
     const userTenantId = req.user?.role === 'SUPER_ADMIN' && req.query.tenant_id ? Number(req.query.tenant_id) : (req.user?.tenant_id || 1);
     let cats: any[];
     if (req.user?.role === 'SUPER_ADMIN') {
-      cats = queryAll("SELECT * FROM categories ORDER BY name ASC");
+      cats = queryAll("SELECT * FROM categories WHERE archived_at IS NULL ORDER BY name ASC");
     } else {
-      cats = queryAll("SELECT * FROM categories WHERE tenant_id = ? OR tenant_id IS NULL ORDER BY name ASC", [userTenantId]);
+      cats = queryAll("SELECT * FROM categories WHERE (tenant_id = ? OR tenant_id IS NULL) AND archived_at IS NULL ORDER BY name ASC", [userTenantId]);
     }
     res.json(cats);
   });
@@ -1332,9 +1384,9 @@ async function startServer() {
     const userTenantId = req.user?.role === 'SUPER_ADMIN' && req.query.tenant_id ? Number(req.query.tenant_id) : (req.user?.tenant_id || 1);
     let supps: any[];
     if (req.user?.role === 'SUPER_ADMIN') {
-      supps = queryAll("SELECT * FROM suppliers ORDER BY name ASC");
+      supps = queryAll("SELECT * FROM suppliers WHERE archived_at IS NULL ORDER BY name ASC");
     } else {
-      supps = queryAll("SELECT * FROM suppliers WHERE tenant_id = ? OR tenant_id IS NULL ORDER BY name ASC", [userTenantId]);
+      supps = queryAll("SELECT * FROM suppliers WHERE (tenant_id = ? OR tenant_id IS NULL) AND archived_at IS NULL ORDER BY name ASC", [userTenantId]);
     }
     res.json(supps);
   });
@@ -1399,6 +1451,15 @@ async function startServer() {
       return res.status(403).json({ error: 'Access denied: Supplier belongs to another store.' });
     }
 
+    if (hasHistory([
+      ["SELECT 1 x FROM purchase_headers WHERE supplier_id = ? LIMIT 1", [id]],
+      ["SELECT 1 x FROM products WHERE supplier_id = ? LIMIT 1", [id]],
+    ])) {
+      archiveRow('suppliers', id, req.user?.id, 'Deleted by user; kept because purchases or products reference it');
+      logAudit(req.user?.id, req.user?.fullName, 'ARCHIVE_SUPPLIER', `Archived supplier #${id} (${supp.name}); purchase history is kept`, 'SUPPLIER', id, req);
+      return res.json({ message: 'Supplier removed from the list. It has purchase history, so it was archived and its history is kept.', archived: true });
+    }
+
     db.run("DELETE FROM suppliers WHERE id = ?", [id]);
 
     logAudit(req.user?.id, req.user?.fullName, 'DELETE_SUPPLIER', `Deleted pharmaceutical supplier #${id}`, 'SUPPLIER', id, req);
@@ -1416,7 +1477,7 @@ async function startServer() {
 
     const userTenantId = req.user?.role === 'SUPER_ADMIN' && req.query.tenant_id ? Number(req.query.tenant_id) : (req.user?.tenant_id || 1);
     const { search } = req.query;
-    let sql = "SELECT * FROM customers WHERE 1=1";
+    let sql = "SELECT * FROM customers WHERE archived_at IS NULL";
     const params: any[] = [];
 
     if (req.user?.role !== 'SUPER_ADMIN') {
@@ -1449,7 +1510,7 @@ async function startServer() {
     const existingByPhone = queryOne<any>(`
       SELECT id, name FROM customers 
       WHERE (REPLACE(REPLACE(phone, '-', ''), ' ', '') = ? OR REPLACE(REPLACE(login_id, '-', ''), ' ', '') = ?) 
-        AND (tenant_id = ? OR tenant_id IS NULL)
+        AND (tenant_id = ? OR tenant_id IS NULL) AND archived_at IS NULL
     `, [cleanPhone, cleanPhone, userTenantId]);
 
     if (existingByPhone) {
@@ -1457,6 +1518,11 @@ async function startServer() {
         error: `Customer '${existingByPhone.name}' is already registered with phone number '${phone}'. Duplication is not allowed.` 
       });
     }
+
+    // An archived customer may still hold this phone / login (kept for their history): free it for the new record
+    releaseArchivedUnique('customers', 'phone', phone.trim());
+    releaseArchivedUnique('customers', 'login_id', cleanPhone);
+    releaseArchivedUnique('users', 'username', cleanPhone);
 
     // Default customer portal password is 'customer123'
     const defaultPasswordHash = bcrypt.hashSync('customer123', 10);
@@ -1557,12 +1623,24 @@ async function startServer() {
       });
     }
 
-    // Delete customer ledger, user login, email queue, and customer record
+    // FK2: a customer with invoices or ledger entries is archived; the ledger and invoices are kept intact
+    if (hasHistory([
+      ["SELECT 1 x FROM sales_headers WHERE customer_id = ? LIMIT 1", [customerId]],
+      ["SELECT 1 x FROM customer_ledger WHERE customer_id = ? LIMIT 1", [customerId]],
+    ])) {
+      archiveRow('customers', customerId, req.user?.id, 'Deleted by user; kept because it has invoices or ledger history');
+      db.run("UPDATE users SET status = 'ARCHIVED', archived_at = ?, archive_reason = 'Customer archived' WHERE customer_id = ? AND role = 'CUSTOMER'", [new Date().toISOString(), customerId]);
+      logAudit(req.user?.id, req.user?.fullName, 'CUSTOMER_ARCHIVE', `Archived customer #${customerId} (${existingCust.name}); invoices and ledger history kept, portal login disabled`, 'CUSTOMER', customerId, req);
+      return res.json({ message: 'Customer removed from the list. They have invoice/ledger history, so the account was archived and the history is kept.', archived: true });
+    }
+
+    // No history: delete as before (ledger is empty), and record it
     db.run("DELETE FROM customer_ledger WHERE customer_id = ?", [customerId]);
     db.run("DELETE FROM email_queue WHERE customer_id = ?", [customerId]);
     db.run("DELETE FROM sms_queue WHERE customer_id = ?", [customerId]);
     db.run("DELETE FROM users WHERE customer_id = ?", [customerId]);
     db.run("DELETE FROM customers WHERE id = ?", [customerId]);
+    logAudit(req.user?.id, req.user?.fullName, 'CUSTOMER_DELETE', `Deleted customer #${customerId} (${existingCust.name}); no transaction history`, 'CUSTOMER', customerId, req);
 
     res.json({ message: 'Customer account deleted successfully' });
   }));
@@ -2065,7 +2143,7 @@ async function startServer() {
     db.run(`
       INSERT INTO email_queue (customer_id, email, subject, message, type, status, tenant_id)
       VALUES (?, ?, ?, ?, 'WELCOME', 'PENDING', ?)
-    `, [supplier_id, emailToUse, emailSubject, emailBody, req.user?.tenant_id || 1]);
+    `, [systemCustomerId(), emailToUse, emailSubject, emailBody, req.user?.tenant_id || 1]);
 
 
     logAudit(req.user?.id, req.user?.fullName, 'EMAIL_PO', `Queued Purchase Order #${po_number} email to supplier (${emailToUse})`, 'PURCHASE', undefined, req);
@@ -2124,7 +2202,7 @@ async function startServer() {
     `, [userTenantId]);
 
     const lowStockRes = queryOne<any>(`
-      SELECT COUNT(*) as count FROM products WHERE stock <= min_stock AND (tenant_id = ? OR tenant_id IS NULL)
+      SELECT COUNT(*) as count FROM products WHERE stock <= min_stock AND archived_at IS NULL AND (tenant_id = ? OR tenant_id IS NULL)
     `, [userTenantId]);
 
     const ninetyDaysAhead = new Date();
@@ -2132,11 +2210,11 @@ async function startServer() {
     const expDateStr = ninetyDaysAhead.toISOString().split('T')[0];
 
     const expiringRes = queryOne<any>(`
-      SELECT COUNT(*) as count FROM products WHERE expiry_date <= ? AND stock > 0 AND (tenant_id = ? OR tenant_id IS NULL)
+      SELECT COUNT(*) as count FROM products WHERE expiry_date <= ? AND stock > 0 AND archived_at IS NULL AND (tenant_id = ? OR tenant_id IS NULL)
     `, [expDateStr, userTenantId]);
 
-    const totalProd = queryOne<any>("SELECT COUNT(*) as count FROM products WHERE tenant_id = ? OR tenant_id IS NULL", [userTenantId]);
-    const totalCust = queryOne<any>("SELECT COUNT(*) as count FROM customers WHERE tenant_id = ? OR tenant_id IS NULL", [userTenantId]);
+    const totalProd = queryOne<any>("SELECT COUNT(*) as count FROM products WHERE (tenant_id = ? OR tenant_id IS NULL) AND archived_at IS NULL", [userTenantId]);
+    const totalCust = queryOne<any>("SELECT COUNT(*) as count FROM customers WHERE (tenant_id = ? OR tenant_id IS NULL) AND archived_at IS NULL", [userTenantId]);
 
     res.json({
       todaySalesTotal: todaySalesRes ? todaySalesRes.total : 0,
@@ -2399,8 +2477,8 @@ async function startServer() {
     const userTenantId = req.user?.tenant_id || 1;
     db.run(`
       INSERT INTO email_queue (customer_id, email, subject, message, type, status, tenant_id)
-      VALUES (1, ?, ?, ?, 'WELCOME', 'PENDING', ?)
-    `, [targetEmail, testSubject, testBody, userTenantId]);
+      VALUES (?, ?, ?, ?, 'WELCOME', 'PENDING', ?)
+    `, [systemCustomerId(), targetEmail, testSubject, testBody, userTenantId]);
 
     logAudit(req.user?.id, req.user?.fullName, 'TEST_SMTP_GATEWAY', `Triggered SMTP Gateway Connection Test to ${targetEmail} (Host: ${smtpHost}:${smtpPort})`, 'SETTINGS', undefined, req);
 
@@ -2640,11 +2718,12 @@ async function startServer() {
     let sql = `
       SELECT id, username, role, full_name, full_name as fullName, email, phone, status, allowed_services, tenant_id, customer_id, customer_id as customerId, created_at 
       FROM users 
+      WHERE archived_at IS NULL
     `;
     const params: any[] = [];
     if (req.user?.role !== 'SUPER_ADMIN') {
       const userTenantId = req.user?.tenant_id || 1;
-      sql += ` WHERE (tenant_id = ? OR tenant_id IS NULL) `;
+      sql += ` AND (tenant_id = ? OR tenant_id IS NULL) `;
       params.push(userTenantId);
     }
     sql += ` ORDER BY id DESC `;
@@ -2668,10 +2747,11 @@ async function startServer() {
     }
 
     const cleanUsername = username.trim();
-    const existingUser = queryOne("SELECT id FROM users WHERE username = ? OR (email = ? AND email != '')", [cleanUsername, email || '']);
+    const existingUser = queryOne("SELECT id FROM users WHERE (username = ? OR (email = ? AND email != '')) AND archived_at IS NULL", [cleanUsername, email || '']);
     if (existingUser) {
       return res.status(400).json({ error: 'A user account with this username or email already exists.' });
     }
+    releaseArchivedUnique('users', 'username', cleanUsername);
 
     const passHash = bcrypt.hashSync(password, 10);
     const tenantId = req.user?.role === 'SUPER_ADMIN' ? (req.body.tenant_id || 1) : (req.user?.tenant_id || 1);
@@ -2822,24 +2902,23 @@ async function startServer() {
       return res.status(400).json({ error: 'Cannot delete protected Super Admin user.' });
     }
 
-    try {
-      try {
-        db.run("UPDATE sales_headers SET created_by_user_id = 1 WHERE created_by_user_id = ?", [userId]);
-      } catch (e) {}
-      try {
-        db.run("UPDATE stock_adjustments SET user_id = 1 WHERE user_id = ?", [userId]);
-      } catch (e) {}
-
-      db.run("DELETE FROM users WHERE id = ?", [userId]);
-
-      logAudit(req.user?.id, req.user?.fullName, 'USER_DELETE', `Admin deleted user account ${targetUser.username} (${targetUser.full_name})`, 'USER', userId, req);
-
-      res.json({ message: 'User account deleted successfully' });
-    } catch (err: any) {
-      console.error('Delete user error:', err);
-      db.run("UPDATE users SET status = 'SUSPENDED' WHERE id = ?", [userId]);
-      res.json({ message: 'User account suspended (cannot hard delete due to existing transaction history).' });
+    // FK2: a user who created sales or stock adjustments is archived. The old code re-assigned their
+    // history to user #1, which falsified who made each sale; history now stays attributed correctly.
+    if (hasHistory([
+      ["SELECT 1 x FROM sales_headers WHERE created_by_user_id = ? LIMIT 1", [userId]],
+      ["SELECT 1 x FROM stock_adjustments WHERE user_id = ? LIMIT 1", [userId]],
+    ])) {
+      db.run("UPDATE users SET status = 'ARCHIVED' WHERE id = ?", [userId]);
+      archiveRow('users', userId, req.user?.id, 'Deleted by admin; kept because sales/adjustments reference it');
+      logAudit(req.user?.id, req.user?.fullName, 'USER_ARCHIVE', `Archived user account ${targetUser.username} (${targetUser.full_name}); sign-in disabled, history kept`, 'USER', userId, req);
+      return res.json({ message: 'User removed. They have sales history, so the account was archived (cannot sign in) and the history is kept.', archived: true });
     }
+
+    db.run("DELETE FROM users WHERE id = ?", [userId]);
+
+    logAudit(req.user?.id, req.user?.fullName, 'USER_DELETE', `Admin deleted user account ${targetUser.username} (${targetUser.full_name})`, 'USER', userId, req);
+
+    res.json({ message: 'User account deleted successfully' });
   }));
 
   // 11. Audit Log API (ADMIN ONLY)

@@ -82,8 +82,10 @@ describe('settings', () => {
     const r = await admin.post('/settings/test-smtp', { testEmail: 't@test.local' });
     expect(r.status).toBe(200);
     const db = await openReadOnly(srv.dbFile);
-    // [LEGACY-BUG] the test row is attached to customer_id = 1 regardless of whether it exists
-    expect(one(db, "SELECT customer_id FROM email_queue WHERE email='t@test.local'")).toEqual({ customer_id: 1 });
+    // FK5 fix (was: attached to customer #1 whether or not it existed): attached to the hidden system record
+    const row = one<{ customer_id: number }>(db, "SELECT customer_id FROM email_queue WHERE email='t@test.local'")!;
+    expect(one(db, 'SELECT name, is_placeholder, archived_at IS NOT NULL AS hidden FROM customers WHERE id = ?', [row.customer_id])).toEqual({ name: '[System messages]', is_placeholder: 1, hidden: 1 });
+    expect((await admin.get('/customers')).body.map((c: any) => c.name)).not.toContain('[System messages]');
   });
 });
 

@@ -180,19 +180,35 @@ describe('customers & udhar ledger', () => {
     expect((await admin.del('/customers/1')).status).toBe(400);
   });
 
-  it('[LEGACY-BUG] deleting a zero-balance customer erases their ledger and login, leaves their invoices orphaned, and writes no audit row', async () => {
+  // FK2 fix (was: ledger erased, invoices orphaned, no audit row)
+  it('[FIXED FK2] deleting a zero-balance customer with history archives them: ledger and invoices kept, audited, hidden from the list', async () => {
     const p = await prod(1);
     const s = await admin.post('/sales', salePayload([cartItem(p, 1)], { payment_method: 'CASH', customer_id: 3 }));
     expect(s.status).toBe(200);
     const before = await openReadOnly(srv.dbFile);
     const ledgerBefore = one<{ n: number }>(before, 'SELECT COUNT(*) n FROM customer_ledger WHERE customer_id=3')!.n;
     expect(ledgerBefore).toBeGreaterThan(0);
-    expect((await admin.del('/customers/3')).status).toBe(200);
+    const del = await admin.del('/customers/3');
+    expect(del.status).toBe(200);
+    expect(del.body.archived).toBe(true);
     const db = await openReadOnly(srv.dbFile);
-    expect(one(db, 'SELECT COUNT(*) n FROM customer_ledger WHERE customer_id=3')).toEqual({ n: 0 });
+    expect(one(db, 'SELECT COUNT(*) n FROM customer_ledger WHERE customer_id=3')).toEqual({ n: ledgerBefore });
     expect(one(db, 'SELECT COUNT(*) n FROM sales_headers WHERE customer_id=3')).toEqual({ n: 1 });
-    expect(foreignKeyViolations(db).some((v: any) => v.table === 'sales_headers')).toBe(true);
-    expect(one(db, "SELECT COUNT(*) n FROM audit_logs WHERE description LIKE '%customer%' AND action_type LIKE '%DELETE%'")).toEqual({ n: 0 });
+    expect(foreignKeyViolations(db)).toEqual([]);
+    expect(one(db, "SELECT COUNT(*) n FROM audit_logs WHERE action_type = 'CUSTOMER_ARCHIVE'")).toEqual({ n: 1 });
+    expect((await admin.get('/customers')).body.map((c: any) => c.id)).not.toContain(3);
+    expect((await admin.get(`/sales/${s.body.sale_id}`)).body.customer_name).toBe('Dr. Rashid Ahmad');
+  });
+
+  it('deleting a customer without any history still deletes them (and is now audited)', async () => {
+    const c = await admin.post('/customers', { name: 'No History', phone: '03120000099' });
+    expect(c.status).toBe(200);
+    const id = (await admin.get('/customers')).body.find((x: any) => x.name === 'No History').id;
+    const del = await admin.del(`/customers/${id}`);
+    expect(del.body.archived).toBeUndefined();
+    const db = await openReadOnly(srv.dbFile);
+    expect(one(db, 'SELECT COUNT(*) n FROM customers WHERE id = ?', [id])).toEqual({ n: 0 });
+    expect(one(db, "SELECT COUNT(*) n FROM audit_logs WHERE action_type = 'CUSTOMER_DELETE'")).toEqual({ n: 1 });
   });
 
   it('udhar reminder queues an email and an SMS', async () => {

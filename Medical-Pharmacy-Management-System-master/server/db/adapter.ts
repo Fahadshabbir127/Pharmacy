@@ -125,6 +125,17 @@ export class DbAdapter {
     return this.conn.transaction(fn).immediate();
   }
 
+  /** Rows violating declared foreign keys ([] = clean). */
+  foreignKeyViolations(): { table: string; rowid: number; parent: string; fkid: number }[] {
+    return this.conn.pragma('foreign_key_check') as any[];
+  }
+
+  /** Switch FK enforcement on/off (only outside a transaction; SQLite ignores it inside one). */
+  setForeignKeys(on: boolean): void {
+    if (this.conn.inTransaction) throw new Error('foreign_keys cannot be changed inside a transaction');
+    this.conn.pragma(`foreign_keys = ${on ? 'ON' : 'OFF'}`);
+  }
+
   get inTransaction(): boolean {
     return this.conn.inTransaction;
   }
