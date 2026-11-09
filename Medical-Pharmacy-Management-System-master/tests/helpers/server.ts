@@ -22,6 +22,11 @@ export const ORIGINAL_SERVER = path.join(PROJECT_ROOT, 'tests', 'legacy', 'serve
 const TSX_LOADER = pathToFileURL(createRequire(__filename).resolve('tsx')).href;
 
 export const PORT = 3000;
+
+// Every spawned server is tracked and hard-killed when the test worker exits, so a test that
+// times out can never leave a server holding the port for the next test file.
+const live = new Set<ChildProcess>();
+process.on('exit', () => { for (const p of live) { try { p.kill('SIGKILL'); } catch { /* already gone */ } } });
 export const BASE_URL = `http://127.0.0.1:${PORT}`;
 
 export interface RunningServer {
@@ -45,15 +50,20 @@ function portInUse(port: number): Promise<boolean> {
   });
 }
 
-async function waitForServer(proc: ChildProcess, logs: () => string, timeoutMs = 45000): Promise<void> {
+async function waitForServer(proc: ChildProcess, logs: () => string, timeoutMs = 45000, tlsPin?: string): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
     if (proc.exitCode !== null) {
       throw new Error(`Server exited early with code ${proc.exitCode}\n${logs()}`);
     }
     try {
-      const res = await fetch(`${BASE_URL}/api/auth/me`);
-      if (res.status === 401) return; // routes registered, auth middleware active
+      if (tlsPin) {
+        const { pinnedJson } = await import('../../server/lan/pinnedClient');
+        if ((await pinnedJson(`https://127.0.0.1:${PORT}/api/health`, tlsPin)).status === 200) return;
+      } else {
+        const res = await fetch(`${BASE_URL}/api/auth/me`);
+        if (res.status === 401) return; // routes registered, auth middleware active
+      }
     } catch {
       /* not listening yet */
     }
@@ -68,7 +78,10 @@ async function waitForServer(proc: ChildProcess, logs: () => string, timeoutMs =
  * @param opts.entry     server entry file (defaults to the current server.ts)
  * @param opts.seedDb    path of a database file to COPY into workDir/data before start
  */
-export async function startServer(opts: { workDir?: string; entry?: string; seedDb?: string; env?: Record<string, string> } = {}): Promise<RunningServer> {
+/**
+ * @param opts.tlsPin  the server is started with TLS (cert files in env); readiness is checked over pinned HTTPS
+ */
+export async function startServer(opts: { workDir?: string; entry?: string; seedDb?: string; env?: Record<string, string>; tlsPin?: string } = {}): Promise<RunningServer> {
   if (await portInUse(PORT)) {
     throw new Error(`Port ${PORT} is already in use; stop the other server before running tests.`);
   }
@@ -81,15 +94,18 @@ export async function startServer(opts: { workDir?: string; entry?: string; seed
   let output = '';
   const proc = spawn(process.execPath, ['--import', TSX_LOADER, opts.entry ?? CURRENT_SERVER], {
     cwd: workDir,
-    env: { ...process.env, NODE_ENV: 'production', ...opts.env },
+    // PHARMACY_TEST_LEGACY_SEED: load the original demo seed (known demo logins) - tests only, never in the app
+    env: { ...process.env, NODE_ENV: 'production', PHARMACY_TEST_LEGACY_SEED: '1', ...opts.env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  live.add(proc);
+  proc.once('exit', () => live.delete(proc));
   proc.stdout!.on('data', (d) => { output += d.toString(); });
   proc.stderr!.on('data', (d) => { output += d.toString(); });
   const logs = () => output;
 
   try {
-    await waitForServer(proc, logs);
+    await waitForServer(proc, logs, 45000, opts.tlsPin);
   } catch (e) {
     proc.kill('SIGKILL');
     throw e;

@@ -68,13 +68,26 @@ describe('auth & authorisation', () => {
     expect((await admin.get('/users')).status).toBe(200);
   });
 
-  it('[LEGACY-SECURITY S1] a token forged with the hardcoded secret is accepted, and the role claim is trusted', async () => {
+  // C8/S1 fixed (was: tokens forged with the published secret were accepted and their role claim trusted)
+  it('[FIXED S1/C8] a token forged with the old published secret is rejected', async () => {
     const db = await openReadOnly(srv.dbFile);
     const staffId = one<{ id: number }>(db, "SELECT id FROM users WHERE username='staff'")!.id;
     const forged = jwt.sign({ id: staffId, username: 'staff', role: 'ADMIN', fullName: 'x', tenant_id: 1 }, HARDCODED_SECRET);
     const api = new Api();
     api.token = forged;
-    expect((await api.get('/users')).status).toBe(200); // STAFF escalated to ADMIN
+    expect((await api.get('/users')).status).toBe(403);
+  });
+
+  it('[FIXED S1] even a validly signed token cannot raise its role: the role comes from the database', async () => {
+    const fs = await import('node:fs');
+    const secret = fs.readFileSync(`${srv.workDir}/data/jwt.secret`, 'utf8').trim();
+    expect(secret).toMatch(/^[0-9a-f]{128}$/);
+    const db = await openReadOnly(srv.dbFile);
+    const staffId = one<{ id: number }>(db, "SELECT id FROM users WHERE username='staff'")!.id;
+    const api = new Api();
+    api.token = jwt.sign({ id: staffId, username: 'staff', role: 'SUPER_ADMIN', fullName: 'x', tenant_id: 1 }, secret);
+    expect((await api.get('/users')).status).toBe(403);
+    expect((await api.get('/superadmin/tenants')).status).toBe(403);
   });
 
   it('[LEGACY-SECURITY S9] STAFF can read all settings including SMTP/Twilio secret fields', async () => {

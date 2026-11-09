@@ -47,9 +47,10 @@ describe('inventory', () => {
     expect((await admin.post('/inventory', { unit: 'Pack' })).status).toBe(400);
   });
 
-  it('[LEGACY-BUG C11] a new product without a barcode gets an invented 8901000000NNN barcode', async () => {
+  // C11 fixed (was: an invented 8901000000NNN barcode)
+  it('[FIXED C11] a new product without a barcode keeps an empty barcode (no invented manufacturer code)', async () => {
     const add = await admin.post('/inventory', { name: 'No Barcode Med', sale_price: 10 });
-    expect((await prod(add.body.id)).barcode).toBe(`8901000000${String(add.body.id).padStart(3, '0')}`);
+    expect((await prod(add.body.id)).barcode).toBe('');
   });
 
   it('strips HTML tags from product names (sanitizeInput)', async () => {

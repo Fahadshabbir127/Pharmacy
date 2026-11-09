@@ -25,8 +25,8 @@ describe('cash sale', () => {
     const p = await product(1); // Panadol, stock 120, price 220
     const r = await admin.post('/sales', salePayload([cartItem(p, 3)]));
     expect(r.status).toBe(200);
-    // fresh DB: the seeded INV-1001 has tenant_id NULL (see 00-startup), so the count is 0
-    expect(r.body).toMatchObject({ invoice_number: 'INV-1-1001', grand_total: 660, amount_paid: 660, amount_due: 0 });
+    // the seeded INV-1001 now belongs to store #1 from the first start, so the next number is 1001 + 1
+    expect(r.body).toMatchObject({ invoice_number: 'INV-1-1002', grand_total: 660, amount_paid: 660, amount_due: 0 });
     expect((await product(1)).stock).toBe(117);
 
     const detail = await admin.get(`/sales/${r.body.sale_id}`);
@@ -114,11 +114,11 @@ describe('known defects in the sale path', () => {
 
   it('[LEGACY-BUG R4] after deleting an older invoice, the next sale fails on a duplicate invoice number', async () => {
     const p = await product(1);
-    const s1 = await admin.post('/sales', salePayload([cartItem(p, 1)])); // INV-1-1001
-    const s2 = await admin.post('/sales', salePayload([cartItem(p, 1)])); // INV-1-1002
-    expect(s2.body.invoice_number).toBe('INV-1-1002');
+    const s1 = await admin.post('/sales', salePayload([cartItem(p, 1)])); // INV-1-1002
+    const s2 = await admin.post('/sales', salePayload([cartItem(p, 1)])); // INV-1-1003
+    expect(s2.body.invoice_number).toBe('INV-1-1003');
     expect((await admin.del(`/sales/${s1.body.sale_id}`)).status).toBe(200);
-    const s3 = await admin.post('/sales', salePayload([cartItem(p, 1)])); // computes INV-1-1002 again
+    const s3 = await admin.post('/sales', salePayload([cartItem(p, 1)])); // computes INV-1-1003 again
     expect(s3.status).toBe(500);
     expect(s3.body.error).toMatch(/UNIQUE/i);
   });
@@ -211,8 +211,8 @@ describe('sales history', () => {
     const p = await product(1);
     await admin.post('/sales', salePayload([cartItem(p, 1)], { payment_method: 'UDHAR', customer_id: 2 }));
     const allSales = (await admin.get('/sales/history')).body;
-    // [LEGACY-BUG] the seeded demo sale (tenant_id NULL, creator tenant_id NULL on first boot) is not listed
-    expect(allSales.length).toBe(1);
+    // first-boot fix: the seeded demo sale is listed too
+    expect(allSales.length).toBe(2);
     const forCust = (await admin.get('/sales/history?customer_id=2')).body;
     expect(forCust).toHaveLength(1);
     expect(forCust[0]).toMatchObject({ customer_name: 'Tariq Mahmood', created_by_name: 'Muhammad Asghar (Owner)' });

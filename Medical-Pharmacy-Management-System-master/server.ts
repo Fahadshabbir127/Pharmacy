@@ -10,10 +10,20 @@ import { DbAdapter } from './server/db/adapter';
 import { openDatabase, checkExistingDatabase, DatabaseIntegrityError } from './server/db/open';
 import { MigrationError } from './server/db/migrate';
 import { transactionalRoute } from './server/db/transactionalRoute';
-import { createServer as createViteServer } from 'vite';
+import { seedLegacyTestData, seedDemoCatalog, defaultSettingsForNewStore } from './server/seed';
+import https from 'node:https';
+import os from 'node:os';
+import { z } from 'zod';
+import { API_PROTOCOL, APP_VERSION, serverMode, isLoopback, normalizeAddress, localIPv4Addresses } from './server/config';
+import { lanGuard } from './server/lan/guard';
+import { PairingManager, PairingError, hashToken, safeEqualHex } from './server/lan/pairing';
+import { certificateFingerprint, shortFingerprint } from './server/lan/tls';
+import { loadOrCreateJwtSecret } from './server/security/jwtSecret';
+import { currentVersion } from './server/db/migrate';
 
 const PORT = Number(process.env.PHARMACY_PORT) || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'khushi_medical_hall_secret_key_2026';
+// C8: per-installation secret (set in startServer). The original public fallback secret is gone.
+let JWT_SECRET = '';
 const DATA_DIR = process.env.PHARMACY_DATA_DIR ? path.resolve(process.env.PHARMACY_DATA_DIR) : path.join(process.cwd(), 'data');
 const DB_FILE = path.join(DATA_DIR, 'khushi_pharmacy.sqlite');
 
@@ -41,224 +51,44 @@ async function initDatabase() {
   const opened = await openDatabase(DB_FILE, { backupDir: BACKUP_DIR, log: (m) => console.log(`[DB] ${m}`) });
   db = opened.db;
 
-  // Legacy startup data tasks (unchanged behaviour; scheduled for approved removal in later phases).
+  // Startup data tasks. Idempotent and safe on every start:
+  //  - no accounts are created, re-activated, renamed or have their password changed (C4, R8)
+  //  - no barcodes are invented (C11)
+  //  - optional seeding runs BEFORE the tenant backfill so seeded rows get tenant #1 (first-boot bug)
   db.transaction(() => {
+    const userCount = db.get<{ n: number }>("SELECT COUNT(*) AS n FROM users WHERE is_placeholder = 0")!.n;
+    if (userCount === 0 && process.env.PHARMACY_TEST_LEGACY_SEED === '1') {
+      console.log('[DB] PHARMACY_TEST_LEGACY_SEED=1: loading the original demo seed (tests only)');
+      seedLegacyTestData(db);
+    }
+
+    // Default message templates (only fill keys that are missing; existing pharmacies keep their own text)
+    for (const [k, v] of [
+      ['msg_template_udhar_reminder', 'Dear {name}, your outstanding balance at {store_name} is Rs. {balance}. Kindly clear it at your earliest convenience. Thank you!'],
+      ['msg_template_payment_receipt', 'Dear {name}, we have received your payment. Your remaining balance at {store_name} is Rs. {balance}. Thank you!'],
+      ['msg_template_refill', 'Dear {name}, your regular medicine at {store_name} may be running low. Visit us for a refill.'],
+      ['msg_template_welcome', 'Dear {name}, welcome to {store_name}! Your account is active. Thank you!'],
+    ]) db.run("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", [k, v]);
+
     db.run("UPDATE tenants SET allowed_services = 'POS_BILLING,INVENTORY,UDHAR_KHATTA,PURCHASES,REPORTS,EMAIL_ALERTS,USER_VERIFY,USER_REGISTER,USER_RESET_PASSWORD,AUDIT_LOGS,SETTINGS,CUSTOMER_PORTAL' WHERE allowed_services IS NULL OR allowed_services = ''");
 
-    // Guarantee default flagship store tenant #1
-    const tenantCheck = queryOne<{ count: number }>("SELECT COUNT(*) as count FROM tenants");
-    if (!tenantCheck || tenantCheck.count === 0) {
-      db.run(`
-        INSERT INTO tenants (id, name, owner_name, owner_email, phone, address, city, status, plan)
-        VALUES (1, 'Khushi Medical Hall', 'Muhammad Asghar', 'admin@khushipos.com', '03000000000', 'Main Bazaar, Lahore', 'Lahore', 'ACTIVE', 'PRO')
-      `);
+    // A database from the oldest app versions has users but no stores: create store #1 from its own settings
+    const hasStore = db.get("SELECT 1 AS x FROM tenants WHERE id = 1");
+    if (!hasStore && db.get("SELECT 1 AS x FROM users WHERE is_placeholder = 0 LIMIT 1")) {
+      const setting = (k: string) => db.get<{ value: string }>("SELECT value FROM settings WHERE key = ?", [k])?.value || '';
+      db.run(
+        "INSERT INTO tenants (id, name, owner_name, owner_email, phone, address, status, plan) VALUES (1, ?, ?, ?, ?, ?, 'ACTIVE', 'PRO')",
+        [setting('store_name') || 'My Pharmacy', setting('owner_name') || 'Owner', `store-1-owner@local.invalid`, setting('phone'), setting('address')],
+      );
     }
-    db.run("UPDATE users SET tenant_id = 1 WHERE tenant_id IS NULL AND role != 'SUPER_ADMIN'");
-    db.run("UPDATE products SET tenant_id = 1 WHERE tenant_id IS NULL");
-    db.run("UPDATE sales_headers SET tenant_id = 1 WHERE tenant_id IS NULL");
-    db.run("UPDATE customers SET tenant_id = 1 WHERE tenant_id IS NULL");
-    db.run("UPDATE categories SET tenant_id = 1 WHERE tenant_id IS NULL");
-    db.run("UPDATE suppliers SET tenant_id = 1 WHERE tenant_id IS NULL");
-    db.run("UPDATE purchase_headers SET tenant_id = 1 WHERE tenant_id IS NULL");
-    db.run("UPDATE stock_adjustments SET tenant_id = 1 WHERE tenant_id IS NULL");
-    db.run("UPDATE settings SET tenant_id = 1 WHERE tenant_id IS NULL");
-
-    db.run("UPDATE users SET status = 'APPROVED' WHERE status IS NULL OR status = ''");
-    db.run("UPDATE products SET barcode = '8901000000' || PRINTF('%03d', id) WHERE barcode IS NULL OR barcode = ''");
-    // Always guarantee admin user has ADMIN role and Owner Name: Muhammad Asghar
-    db.run("UPDATE users SET full_name = 'Muhammad Asghar (Owner)', role = 'ADMIN', status = 'APPROVED' WHERE username = 'admin'");
-
-    // Default pre-written message templates in settings
-    db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('owner_name', 'Muhammad Asghar')");
-    db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('msg_template_udhar_reminder', 'محترم {name} صاحب! خوشی میڈیکل ہال پر آپ کا بقیہ ادھار رقم Rs. {balance} ہے۔ برائے مہربانی اپنا ادھار کھاتہ جلد از جلد صاف فرمائیں۔ شکریہ! - Khushi Medical Hall')");
-    db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('msg_template_payment_receipt', 'محترم {name}! خوشی میڈیکل ہال میں آپ کی طرف سے رقم موصول ہو گئی ہے۔ آپ کا بقیہ کھاتہ Rs. {balance} ہے۔ شکریہ! - Khushi Medical Hall')");
-    db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('msg_template_refill', 'Dear {name}, your regular medicine prescription stock at Khushi Medical Hall may be finishing soon. Visit us today for fresh refill & discounts! - Khushi Medical Hall')");
-    db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('msg_template_welcome', 'Dear {name}, welcome to Khushi Medical Hall! Your account is active. Thank you!')");
-
-    // Check if users exist; if not seed default users & sample Pakistani pharmacy data
-    const count = db.get<{ count: number }>("SELECT COUNT(*) as count FROM users")!.count;
-
-    if (count === 0) {
-      console.log("Seeding initial database with sample data for Khushi Medical Hall...");
-      const adminPassHash = bcrypt.hashSync('admin123', 10);
-      const staffPassHash = bcrypt.hashSync('staff123', 10);
-      const customerPassHash = bcrypt.hashSync('customer123', 10);
-
-      // Seed Categories
-      const categories = [
-        'Tablets', 'Capsules', 'Syrups', 'Injections', 'Surgical', 
-        'Medical Devices', 'Baby Products', 'Personal Care', 'Food Items', 'Beverages', 'Tissue'
-      ];
-      categories.forEach(cat => {
-        db.run("INSERT INTO categories (name, description) VALUES (?, ?)", [cat, `${cat} section`]);
-      });
-
-      // Seed Suppliers
-      db.run("INSERT INTO suppliers (name, phone, company, address) VALUES (?, ?, ?, ?)", [
-        'GlaxoSmithKline (GSK) Pakistan', '042-35800100', 'GSK Pharma', 'Gulberg III, Lahore'
-      ]);
-      db.run("INSERT INTO suppliers (name, phone, company, address) VALUES (?, ?, ?, ?)", [
-        'Sami Pharmaceuticals', '021-35061200', 'Sami Pharma', 'Korangi Industrial Area, Karachi'
-      ]);
-      db.run("INSERT INTO suppliers (name, phone, company, address) VALUES (?, ?, ?, ?)", [
-        'Abbott Laboratories Pakistan', '021-35610211', 'Abbott', 'Landhi, Karachi'
-      ]);
-
-      // Seed Customers
-      db.run("INSERT INTO customers (name, phone, address, opening_balance, current_balance, login_id) VALUES (?, ?, ?, ?, ?, ?)", [
-        'Chaudhry Muhammad Ali', '03001234567', 'House #42, Street 5, Main Bazaar, Lahore', 0, 2450.00, '03001234567'
-      ]);
-      db.run("INSERT INTO customers (name, phone, address, opening_balance, current_balance, login_id) VALUES (?, ?, ?, ?, ?, ?)", [
-        'Tariq Mahmood', '03219876543', 'Plaza #12, Commercial Market, Rawalpindi', 0, 1200.00, '03219876543'
-      ]);
-      db.run("INSERT INTO customers (name, phone, address, opening_balance, current_balance, login_id) VALUES (?, ?, ?, ?, ?, ?)", [
-        'Dr. Rashid Ahmad', '03335554433', 'Civil Hospital Road, Multan', 0, 0.00, '03335554433'
-      ]);
-
-      // Seed Users
-      db.run("INSERT INTO users (username, password_hash, role, full_name, phone) VALUES (?, ?, ?, ?, ?)", [
-        'admin', adminPassHash, 'ADMIN', 'Muhammad Asghar (Owner)', '03000000000'
-      ]);
-      db.run("INSERT INTO users (username, password_hash, role, full_name, phone) VALUES (?, ?, ?, ?, ?)", [
-        'staff', staffPassHash, 'STAFF', 'Hamza Khan (Pharmacist)', '03111111111'
-      ]);
-      db.run("INSERT INTO users (username, password_hash, role, full_name, phone, customer_id) VALUES (?, ?, ?, ?, ?, ?)", [
-        '03001234567', customerPassHash, 'CUSTOMER', 'Chaudhry Muhammad Ali', '03001234567', 1
-      ]);
-
-      // Seed Products
-      const sampleProducts = [
-        ['Panadol Extra 500mg', 'Pack', 180, 220, 15, 120, 'B-8910', '2027-10-15', 1, '3004.90', 0, 'Rack A1', 1],
-        ['Augmentin 625mg Tablets', 'Pack', 310, 380, 10, 45, 'AG-442', '2026-11-20', 1, '3004.90', 0, 'Rack A2', 1],
-        ['Brufen 400mg Tablets', 'Pack', 140, 175, 20, 80, 'BF-109', '2027-04-10', 1, '3004.90', 0, 'Rack A1', 2],
-        ['Risek 20mg Capsules', 'Pack', 240, 310, 15, 60, 'RK-221', '2026-12-05', 2, '3004.90', 0, 'Rack B1', 3],
-        ['Hydryllin Syrup 120ml', 'Bottle', 110, 145, 10, 35, 'HY-908', '2026-09-30', 3, '3004.90', 0, 'Rack C1', 2],
-        ['Calamox 625mg Tablets', 'Pack', 290, 360, 10, 8, 'CX-771', '2026-08-15', 1, '3004.90', 0, 'Rack A3', 2], // Low stock!
-        ['Cac 1000 Effervescent', 'Tube', 210, 260, 10, 25, 'CAC-33', '2026-08-01', 3, '3004.90', 0, 'Rack B2', 3], // Expiring soon!
-        ['Dettol Antiseptic Liquid 100ml', 'Bottle', 160, 200, 12, 40, 'DT-001', '2028-01-01', 8, '3401.11', 18, 'Rack E1', 1],
-        ['Pampers Baby Wipes 64s', 'Pack', 350, 430, 8, 22, 'PW-64', '2027-06-30', 7, '3401.11', 18, 'Rack F2', 3],
-        ['Johnson Baby Lotion 200ml', 'Bottle', 420, 520, 10, 18, 'JBL-20', '2027-08-12', 7, '3401.11', 18, 'Rack F1', 3],
-        ['Rose Petal Tissue Box 200s', 'Box', 180, 230, 15, 50, 'RP-200', '2029-01-01', 11, '4818.10', 18, 'Rack G1', 2],
-        ['Nestle Pure Life Water 1.5L', 'Bottle', 80, 110, 24, 60, 'NW-15', '2027-01-01', 10, '2201.10', 18, 'Rack H1', 2]
-      ];
-
-      sampleProducts.forEach(p => {
-        db.run(
-          `INSERT INTO products 
-          (name, unit, purchase_price, sale_price, min_stock, stock, batch_number, expiry_date, category_id, hsn_code, gst_rate, rack_location, supplier_id) 
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          p
-        );
-      });
-
-      // Seed Initial Customer Ledger & Sale
-      const today = new Date().toISOString().split('T')[0];
-      db.run(`INSERT INTO sales_headers 
-        (invoice_number, customer_id, sale_date, total_amount, discount_percent, discount_amount, net_amount, total_gst, grand_total, payment_method, amount_paid, amount_due, payment_status, created_by_user_id) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ['INV-1001', 1, `${today} 10:30:00`, 2650.00, 0, 0, 2650.00, 0, 2650.00, 'PARTIAL', 200.00, 2450.00, 'PARTIAL', 1]
-      );
-
-      db.run(`INSERT INTO sale_items (sale_id, product_id, quantity, unit, sale_price, cost_price, discount_percent, discount_amount, gst_amount, batch_number, expiry_date, subtotal)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [1, 1, 2, 'Pack', 220, 180, 0, 0, 0, 'B-8910', '2027-10-15', 440]
-      );
-      db.run(`INSERT INTO sale_items (sale_id, product_id, quantity, unit, sale_price, cost_price, discount_percent, discount_amount, gst_amount, batch_number, expiry_date, subtotal)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [1, 2, 5, 'Pack', 380, 310, 0, 0, 0, 'AG-442', '2026-11-20', 1900]
-      );
-
-      db.run(`INSERT INTO customer_ledger (customer_id, transaction_date, type, reference, debit, credit, balance_after, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [1, `${today} 10:30:00`, 'SALE', 'Invoice #INV-1001', 2650.00, 200.00, 2450.00, 'Partial cash payment Rs. 200, Udhar Rs. 2450']
-      );
-
-      db.run(`INSERT INTO sms_queue (customer_id, phone, message, type, status) VALUES (?, ?, ?, ?, ?)`,
-        [1, '03001234567', 'Dear Chaudhry Muhammad Ali, thank you for visiting Khushi Medical Hall. Invoice #INV-1001. Amount Paid: Rs. 200. Current Udhar Balance: Rs. 2450.', 'PAYMENT_CONFIRMATION', 'PENDING']
-      );
-
-      // Default Settings
-      const defaultSettings = [
-        ['store_name', 'Khushi Medical Hall'],
-        ['store_urdu_name', 'خوشی میڈیکل ہال'],
-        ['address', 'Main Bazaar, Near Civil Hospital, Lahore'],
-        ['phone', '0300-1234567 / 042-35551234'],
-        ['ntn_number', 'NTN-7894561-2'],
-        ['receipt_footer', 'Get well soon! Check expiry before use. Goods once sold are not returnable without bill.'],
-        ['printer_type', 'THERMAL_80MM'],
-        ['printer_address', 'USB001'],
-        ['smtp_host', 'smtp.gmail.com'],
-        ['smtp_port', '587'],
-        ['smtp_user', 'khushi.pharmacy@gmail.com'],
-        ['smtp_pass', ''],
-        ['smtp_secure', 'tls'],
-        ['smtp_from_email', 'khushi.pharmacy@gmail.com'],
-        ['smtp_from_name', 'Khushi Medical Hall'],
-        ['smtp_enabled', 'true'],
-        ['twilio_account_sid', ''],
-        ['twilio_auth_token', ''],
-        ['twilio_from_phone', ''],
-        ['sms_enabled', 'true'],
-        ['auto_backup_enabled', 'true'],
-        ['backup_interval_hours', '24']
-      ];
-
-      defaultSettings.forEach(([k, v]) => {
-        db.run("INSERT INTO settings (key, value) VALUES (?, ?)", [k, v]);
-      });
-    }
-
-    // Always ensure SUPER_ADMIN accounts exist for platform supervision
-    try {
-      const superAdminPassHash = bcrypt.hashSync('admin123', 10);
-      const umarPassHash = bcrypt.hashSync('Um@r.1080db', 10);
-      
-      const existingSuperAdmin = queryOne("SELECT id FROM users WHERE username = ?", ['superadmin']);
-      if (!existingSuperAdmin) {
-        db.run(
-          "INSERT INTO users (username, password_hash, role, full_name, email, phone, status) VALUES (?, ?, 'SUPER_ADMIN', ?, ?, ?, 'APPROVED')",
-          ['superadmin', superAdminPassHash, 'Super Platform Administrator', 'superadmin@khushipos.com', '03000000000']
-        );
-      } else {
-        db.run("UPDATE users SET role = 'SUPER_ADMIN', status = 'APPROVED' WHERE username = ?", ['superadmin']);
+    if (db.get("SELECT 1 AS x FROM tenants WHERE id = 1")) {
+      db.run("UPDATE users SET tenant_id = 1 WHERE tenant_id IS NULL AND role != 'SUPER_ADMIN' AND is_placeholder = 0");
+      for (const t of ['products', 'sales_headers', 'customers', 'categories', 'suppliers', 'purchase_headers', 'stock_adjustments', 'settings']) {
+        db.run(`UPDATE ${t} SET tenant_id = 1 WHERE tenant_id IS NULL${['products', 'sales_headers', 'customers', 'categories', 'suppliers', 'purchase_headers'].includes(t) ? ' AND is_placeholder = 0' : ''}`);
       }
-
-      const umarTargetEmail = 'umarumair75108@gmail.com';
-      const oldUmarEmail = 'umarumair75108db@gmail.com';
-
-      // Check if target user already exists
-      const existingUmarUser = queryOne<any>("SELECT id FROM users WHERE email = ? OR username = ?", [umarTargetEmail, umarTargetEmail]);
-
-      if (existingUmarUser) {
-        // Update existing record
-        db.run(
-          "UPDATE users SET password_hash = ?, role = 'SUPER_ADMIN', status = 'APPROVED', email = ?, username = ? WHERE id = ?",
-          [umarPassHash, umarTargetEmail, umarTargetEmail, existingUmarUser.id]
-        );
-        // Clean up old email user if it's a separate duplicate row
-        db.run("DELETE FROM users WHERE (email = ? OR username = ?) AND id != ?", [oldUmarEmail, oldUmarEmail, existingUmarUser.id]);
-      } else {
-        // Check if old user exists
-        const oldUmarUser = queryOne<any>("SELECT id FROM users WHERE email = ? OR username = ?", [oldUmarEmail, oldUmarEmail]);
-        if (oldUmarUser) {
-          db.run(
-            "UPDATE users SET username = ?, email = ?, password_hash = ?, role = 'SUPER_ADMIN', status = 'APPROVED' WHERE id = ?",
-            [umarTargetEmail, umarTargetEmail, umarPassHash, oldUmarUser.id]
-          );
-        } else {
-          // Insert new user
-          db.run(
-            "INSERT INTO users (username, password_hash, role, full_name, email, phone, status) VALUES (?, ?, 'SUPER_ADMIN', ?, ?, ?, 'APPROVED')",
-            [umarTargetEmail, umarPassHash, 'Umar Umair (Platform Director)', umarTargetEmail, '03001234567']
-          );
-        }
-      }
-
-      db.run("UPDATE users SET role = 'ADMIN' WHERE role = 'SUPER_ADMIN' AND email != ? AND username != 'superadmin'", [umarTargetEmail]);
-    } catch (err) {
-      console.error("Super Admin user setup warning:", err);
     }
-    
+    db.run("UPDATE users SET status = 'APPROVED' WHERE (status IS NULL OR status = '') AND is_placeholder = 0");
+
   });
 
   console.log("SQLite Database initialized successfully.");
@@ -376,12 +206,12 @@ function authenticateToken(req: AuthRequest, res: express.Response, next: expres
     }
     const payload = decoded as UserTokenPayload;
 
-    const dbUser = queryOne<any>("SELECT id, status, tenant_id FROM users WHERE id = ?", [payload.id]);
+    const dbUser = queryOne<any>("SELECT id, status, tenant_id, role, customer_id FROM users WHERE id = ?", [payload.id]);
     if (!dbUser || dbUser.status !== 'APPROVED') {
       return res.status(403).json({ error: 'User account is no longer active or approved.' });
     }
 
-    if (payload.role !== 'SUPER_ADMIN' && dbUser.tenant_id) {
+    if (dbUser.role !== 'SUPER_ADMIN' && dbUser.tenant_id) {
       const tenant = queryOne<any>("SELECT status FROM tenants WHERE id = ?", [dbUser.tenant_id]);
       if (tenant && (tenant.status === 'SUSPENDED' || tenant.status === 'DELETED')) {
         return res.status(403).json({ error: 'This pharmacy store account is currently SUSPENDED by Platform Super Admin. Please contact support.' });
@@ -390,6 +220,9 @@ function authenticateToken(req: AuthRequest, res: express.Response, next: expres
 
     req.user = {
       ...payload,
+      // the role and customer link always come from the database, never from the token (S1)
+      role: dbUser.role,
+      customerId: dbUser.customer_id ?? undefined,
       tenant_id: dbUser.tenant_id || payload.tenant_id || 1
     };
     next();
@@ -408,12 +241,175 @@ function requireRoles(roles: (string)[]) {
   };
 }
 
+/**
+ * Configuration sent by the Electron main process when running as a utilityProcess
+ * (TLS key never touches the environment or a plain file), or read from files for tests.
+ */
+let startupMessage: { tls?: { cert: string; key: string }; localToken?: string } | null = null;
+async function receiveStartupMessage(): Promise<void> {
+  const port = (process as any).parentPort;
+  if (!port) return;
+  startupMessage = await new Promise((resolve) => {
+    port.once('message', (e: any) => resolve(e?.data ?? e));
+  });
+}
+
+async function loadTlsMaterial(): Promise<{ cert: string; key: string } | null> {
+  if (startupMessage?.tls) return startupMessage.tls;
+  const c = process.env.PHARMACY_TLS_CERT_FILE, k = process.env.PHARMACY_TLS_KEY_FILE;
+  if (c && k) return { cert: fs.readFileSync(c, 'utf8'), key: fs.readFileSync(k, 'utf8') };
+  return null;
+}
+
 async function startServer() {
+  await receiveStartupMessage();
   await initDatabase();
+
+  JWT_SECRET = loadOrCreateJwtSecret(DATA_DIR);
+  const MODE = serverMode();
+  const tlsMaterial = await loadTlsMaterial();
+  const LOCAL_TOKEN = process.env.PHARMACY_LOCAL_TOKEN || startupMessage?.localToken || '';
+  const BIND = process.env.PHARMACY_BIND || (MODE === 'host' ? '0.0.0.0' : '127.0.0.1');
+  if (!isLoopback(BIND) && !tlsMaterial) {
+    throw new Error(`Refusing to listen on ${BIND} without TLS: network access requires HTTPS (set up the certificate first).`);
+  }
+  const pairing = new PairingManager();
+  const fingerprint = tlsMaterial ? certificateFingerprint(tlsMaterial.cert) : null;
 
   const app = express();
   app.use(cors());
   app.use(express.json({ limit: '50mb' }));
+  app.use('/api', lanGuard({ mode: () => MODE, db: () => db }));
+
+  const fromLoopback = (req: express.Request) => isLoopback(normalizeAddress(req.socket.remoteAddress));
+  const requireLocal = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (!fromLoopback(req) || !LOCAL_TOKEN || !safeEqualHex(req.get('x-local-token') || '', LOCAL_TOKEN)) {
+      return res.status(403).json({ error: 'Local administration only.' });
+    }
+    next();
+  };
+  const needsSetup = () => !db.get("SELECT 1 AS x FROM users WHERE role IN ('ADMIN', 'SUPER_ADMIN') AND archived_at IS NULL AND is_placeholder = 0 LIMIT 1");
+
+  // ---- Health (public, no secrets) ----
+  app.get('/api/health', (req, res) => {
+    let dbOk = true;
+    try { db.get('SELECT 1 AS x'); } catch { dbOk = false; }
+    res.status(dbOk ? 200 : 503).json({ status: dbOk ? 'ok' : 'db_error', appVersion: APP_VERSION, apiProtocol: API_PROTOCOL, mode: MODE, db: { ok: dbOk }, serverTime: new Date().toISOString() });
+  });
+
+  // ---- First-run setup ----
+  app.get('/api/setup/status', (req, res) => {
+    const store = db.get<{ value: string }>("SELECT value FROM settings WHERE key = 'store_name'")?.value || null;
+    res.json({ needsSetup: needsSetup(), storeName: store, appVersion: APP_VERSION });
+  });
+
+  const InitialAdmin = z.object({
+    storeName: z.string().trim().min(2).max(100),
+    ownerName: z.string().trim().min(2).max(100),
+    username: z.string().trim().min(3).max(50).regex(/^[A-Za-z0-9._@-]+$/, 'letters, digits and . _ @ - only'),
+    password: z.string().min(8).max(200),
+    email: z.string().trim().email().max(150).optional().or(z.literal('')),
+    phone: z.string().trim().max(40).optional().or(z.literal('')),
+    address: z.string().trim().max(200).optional().or(z.literal('')),
+    loadDemoData: z.boolean().optional(),
+  });
+  app.post('/api/setup/initial-admin', tx((req: express.Request, res: express.Response) => {
+    if (!fromLoopback(req)) return res.status(403).json({ error: 'The first administrator can only be created on the server computer itself.' });
+    if (!needsSetup()) return res.status(409).json({ error: 'An administrator already exists. Sign in instead.' });
+    const parsed = InitialAdmin.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ') });
+    const b = parsed.data;
+    if (!isPasswordStrong(b.password)) return res.status(400).json({ error: 'Password must be at least 8 characters long and contain both letters and numbers/symbols.' });
+    if (db.get("SELECT 1 AS x FROM users WHERE username = ? AND archived_at IS NULL", [b.username])) return res.status(409).json({ error: 'That username is already taken.' });
+    releaseArchivedUnique('users', 'username', b.username);
+
+    if (!db.get("SELECT 1 AS x FROM tenants WHERE id = 1")) {
+      db.run("INSERT INTO tenants (id, name, owner_name, owner_email, phone, address, status, plan) VALUES (1, ?, ?, ?, ?, ?, 'ACTIVE', 'PRO')",
+        [b.storeName, b.ownerName, b.email || 'store-1-owner@local.invalid', b.phone || '', b.address || '']);
+    } else {
+      db.run("UPDATE tenants SET name = ?, owner_name = ? WHERE id = 1", [b.storeName, b.ownerName]);
+    }
+    const adminId = db.run(
+      "INSERT INTO users (username, password_hash, role, full_name, email, phone, status, tenant_id) VALUES (?, ?, 'ADMIN', ?, ?, ?, 'APPROVED', 1)",
+      [b.username, bcrypt.hashSync(b.password, 12), b.ownerName, b.email || null, b.phone || null],
+    ).lastInsertRowid;
+    for (const [k, v] of defaultSettingsForNewStore({ name: b.storeName, address: b.address, phone: b.phone })) {
+      db.run("INSERT OR IGNORE INTO settings (key, value, tenant_id) VALUES (?, ?, 1)", [k, v]);
+    }
+    db.run("INSERT OR REPLACE INTO settings (key, value, tenant_id) VALUES ('store_name', ?, 1)", [b.storeName]);
+    db.run("INSERT OR REPLACE INTO settings (key, value, tenant_id) VALUES ('owner_name', ?, 1)", [b.ownerName]);
+    if (b.loadDemoData && !db.get("SELECT 1 AS x FROM products LIMIT 1")) {
+      seedDemoCatalog(db, adminId);
+      for (const t of ['products', 'sales_headers', 'customers', 'categories', 'suppliers']) db.run(`UPDATE ${t} SET tenant_id = 1 WHERE tenant_id IS NULL AND is_placeholder = 0`);
+    }
+    logAudit(adminId, b.ownerName, 'SETUP_INITIAL_ADMIN', `First-run setup: store "${b.storeName}" and administrator "${b.username}" created${b.loadDemoData ? ' (with demo catalogue)' : ''}`, 'USER', adminId, req, 1);
+    res.json({ ok: true, username: b.username });
+  }));
+
+  // ---- Local administration for the Electron main process (loopback + local token) ----
+  app.get('/api/local/host-status', requireLocal, (req, res) => {
+    let sizeBytes = 0;
+    try { sizeBytes = fs.statSync(DB_FILE).size + (fs.existsSync(`${DB_FILE}-wal`) ? fs.statSync(`${DB_FILE}-wal`).size : 0); } catch {}
+    const backups = fs.existsSync(BACKUP_DIR) ? fs.readdirSync(BACKUP_DIR).filter((f) => f.endsWith('.sqlite')).map((f) => fs.statSync(path.join(BACKUP_DIR, f)).mtime.toISOString()).sort() : [];
+    const clients = db.all<any>("SELECT id, client_id, name, created_at, last_seen_at, last_ip, revoked_at FROM paired_clients ORDER BY id DESC");
+    const onlineSince = Date.now() - 60_000;
+    res.json({
+      mode: MODE, hostName: os.hostname(), addresses: localIPv4Addresses(), port: PORT, appVersion: APP_VERSION, apiProtocol: API_PROTOCOL,
+      fingerprint, fingerprintShort: fingerprint ? shortFingerprint(fingerprint) : null,
+      pairing: MODE === 'host' ? pairing.current() : null,
+      clients, connectedClients: clients.filter((c) => !c.revoked_at && c.last_seen_at && Date.parse(c.last_seen_at) > onlineSince).length,
+      db: { ok: true, file: DB_FILE, sizeBytes, schemaVersion: currentVersion(db), integrity: 'checked at startup' },
+      lastBackup: backups.length ? backups[backups.length - 1] : null,
+      needsSetup: needsSetup(),
+    });
+  });
+  app.post('/api/local/pairing/rotate', requireLocal, (req, res) => { pairing.rotate(); res.json(pairing.current()); });
+  app.post('/api/local/clients/:id/revoke', requireLocal, tx((req: express.Request, res: express.Response) => {
+    const r = db.run("UPDATE paired_clients SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", [new Date().toISOString(), Number(req.params.id)]);
+    if (r.changes) logAudit(null, 'Host computer', 'LAN_CLIENT_REVOKED', `Revoked LAN client #${req.params.id}`, 'LAN_CLIENT', Number(req.params.id), req, 1);
+    res.json({ revoked: r.changes === 1 });
+  }));
+
+  // ---- Pairing (host mode, private network only - enforced by lanGuard) ----
+  const pairAttempts = new Map<string, { n: number; reset: number }>();
+  const pairLimited = (ip: string) => {
+    const now = Date.now();
+    const e = pairAttempts.get(ip) && pairAttempts.get(ip)!.reset > now ? pairAttempts.get(ip)! : { n: 0, reset: now + 10 * 60_000 };
+    e.n++;
+    pairAttempts.set(ip, e);
+    return e.n > 20;
+  };
+  app.post('/api/pair/start', (req, res) => {
+    if (MODE !== 'host' || !fingerprint) return res.status(404).json({ error: 'This computer is not set up as a pharmacy server.' });
+    if (pairLimited(normalizeAddress(req.socket.remoteAddress))) return res.status(429).json({ error: 'Too many pairing attempts. Wait 10 minutes.' });
+    try {
+      const r = pairing.start(String(req.body?.clientNonce || ''), fingerprint);
+      res.json({ ...r, hostName: os.hostname(), appVersion: APP_VERSION, apiProtocol: API_PROTOCOL });
+    } catch (e: any) {
+      res.status(e instanceof PairingError ? e.status : 500).json({ error: e.message });
+    }
+  });
+  app.post('/api/pair/complete', tx((req: express.Request, res: express.Response) => {
+    if (MODE !== 'host' || !fingerprint) return res.status(404).json({ error: 'This computer is not set up as a pharmacy server.' });
+    const ip = normalizeAddress(req.socket.remoteAddress);
+    const name = String(req.body?.clientName || 'Unnamed computer').replace(/[^\w .@()-]/g, '').slice(0, 60) || 'Unnamed computer';
+    let ok = false;
+    try {
+      ok = pairing.complete(String(req.body?.serverNonce || ''), String(req.body?.clientProof || ''));
+    } catch (e: any) {
+      return res.status(e instanceof PairingError ? e.status : 500).json({ error: e.message });
+    }
+    if (!ok) {
+      logAudit(null, name, 'LAN_PAIR_FAILED', `Failed pairing attempt from ${ip} (wrong code)`, 'LAN_CLIENT', undefined, req, 1);
+      return res.status(403).json({ error: 'Wrong pairing code.' });
+    }
+    const clientToken = crypto.randomBytes(32).toString('hex');
+    const clientId = crypto.randomUUID();
+    const id = db.run("INSERT INTO paired_clients (client_id, name, token_hash, created_at, last_ip) VALUES (?, ?, ?, ?, ?)",
+      [clientId, name, hashToken(clientToken), new Date().toISOString(), ip]).lastInsertRowid;
+    logAudit(null, name, 'LAN_PAIR_SUCCESS', `Paired LAN client "${name}" from ${ip}`, 'LAN_CLIENT', id, req, 1);
+    res.json({ clientId, clientToken, hostName: os.hostname() });
+  }));
 
   // API Routes
 
@@ -1223,10 +1219,8 @@ async function startServer() {
         sanitizeInput(barcode) || '', userTenantId
       ]);
 
+      // C11: no invented manufacturer barcodes; a product without one simply has none (manual entry later)
       const newProd = queryOne<any>("SELECT id FROM products WHERE tenant_id = ? ORDER BY id DESC LIMIT 1", [userTenantId]);
-      if (newProd && (!barcode || String(barcode).trim() === '')) {
-        db.run("UPDATE products SET barcode = '8901000000' || PRINTF('%03d', id) WHERE id = ?", [newProd.id]);
-      }
       logAudit(req.user?.id, req.user?.fullName, 'PRODUCT_ADD', `Added product "${cleanName}" (Unit: ${cleanUnit}, Sale Price: Rs. ${sPrice}, Initial Stock: ${stock || 0})`, 'PRODUCT', newProd ? newProd.id : undefined, req);
 
       res.json({ message: 'Product added successfully', id: newProd?.id });
@@ -1804,6 +1798,17 @@ async function startServer() {
       amount_paid
     } = req.body;
 
+    // C3 idempotency: the POS sends one client_txn_id per checkout and re-sends the SAME id on retry.
+    // A retry of a committed sale returns the original result instead of recording the sale twice.
+    const clientTxnId = req.body.client_txn_id === undefined ? null : String(req.body.client_txn_id);
+    if (clientTxnId !== null && !/^[A-Za-z0-9-]{8,64}$/.test(clientTxnId)) {
+      return res.status(400).json({ error: 'Invalid client_txn_id' });
+    }
+    if (clientTxnId) {
+      const prior = queryOne<{ response: string }>("SELECT response FROM idempotency_keys WHERE key = ? AND route = 'POST /api/sales'", [clientTxnId]);
+      if (prior) return res.json({ ...JSON.parse(prior.response), replayed: true });
+    }
+
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: 'Cart must contain at least one item' });
     }
@@ -1930,8 +1935,8 @@ async function startServer() {
 
       logAudit(req.user?.id, req.user?.fullName, 'CREATE_SALE', `Completed sale invoice #${nextInvNum} (Grand Total: Rs. ${grand_total})`, 'SALE', saleId, req);
 
-      // Return created invoice details
-      res.json({
+      // Return created invoice details (stored with the transaction id in the same DB transaction)
+      const saleResult = {
         message: 'Sale completed successfully',
         invoice_number: nextInvNum,
         sale_id: saleId,
@@ -1939,13 +1944,26 @@ async function startServer() {
         amount_paid: paidAmt,
         amount_due: dueAmt,
         previous_balance: prevBal,
-        new_balance: newBal
-      });
+        new_balance: newBal,
+        client_txn_id: clientTxnId,
+      };
+      if (clientTxnId) {
+        db.run("INSERT INTO idempotency_keys (key, route, user_id, response, created_at) VALUES (?, 'POST /api/sales', ?, ?, ?)",
+          [clientTxnId, req.user!.id, JSON.stringify(saleResult), new Date().toISOString()]);
+      }
+      res.json(saleResult);
     } catch (err: any) {
       console.error("Sale transaction failed:", err);
       res.status(500).json({ error: 'Failed to process sale transaction permanently: ' + err.message });
     }
   }));
+
+  // C3: did the sale with this transaction id commit? (used after a lost connection)
+  app.get('/api/sales/by-txn/:key', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+    const row = queryOne<{ response: string }>("SELECT response FROM idempotency_keys WHERE key = ? AND route = 'POST /api/sales'", [String(req.params.key)]);
+    if (!row) return res.status(404).json({ status: 'not_found', message: 'No sale was recorded with this transaction id.' });
+    res.json({ status: 'committed', ...JSON.parse(row.response) });
+  });
 
   app.get('/api/sales/history', authenticateToken, (req: AuthRequest, res) => {
     const { start_date, end_date } = req.query;
@@ -3038,24 +3056,32 @@ async function startServer() {
 
   // Serve Vite in development or static dist in production
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite'); // dev only: never loaded in the desktop app
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa'
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = process.env.PHARMACY_STATIC_DIR || path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
-  const httpServer = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`====================================================`);
-    console.log(`🏥 Khushi Medical Hall POS Server running on port ${PORT}`);
-    console.log(`====================================================`);
+  const httpServer = tlsMaterial
+    ? https.createServer({ cert: tlsMaterial.cert, key: tlsMaterial.key, minVersion: 'TLSv1.2' }, app)
+    : (await import('node:http')).createServer(app);
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once('error', reject);
+    httpServer.listen(PORT, BIND, () => resolve());
   });
+  const actualPort = (httpServer.address() as any)?.port ?? PORT;
+  console.log(`====================================================`);
+  console.log(`BrainTech Pharmacy AI server (${MODE}) listening on ${tlsMaterial ? 'https' : 'http'}://${BIND}:${actualPort}`);
+  console.log(`====================================================`);
+  (process as any).parentPort?.postMessage({ type: 'listening', port: actualPort, fingerprint });
 
   // Graceful shutdown: stop accepting requests, then close the database (checkpoints the WAL).
   let shuttingDown = false;
