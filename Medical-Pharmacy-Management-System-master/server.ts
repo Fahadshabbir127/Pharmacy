@@ -25,7 +25,14 @@ let db: DbAdapter;
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
 
 /** Wrap a synchronous route handler in one DB transaction (response sent only after COMMIT). */
-const tx = <H extends (...args: any[]) => any>(handler: H) => transactionalRoute(() => db, handler as any);
+// Crash-test hook (tests only): PHARMACY_TEST_CRASH="<before-commit|after-commit>:<METHOD> <path>" hard-kills the
+// process at that point of the matching request. Unset in normal use, so it does nothing.
+const crashSpec = (process.env.PHARMACY_TEST_CRASH || '').match(/^(before-commit|after-commit):(\w+) (\S+)$/);
+const crashIf = (point: string) => (req: express.Request) => {
+  if (crashSpec && crashSpec[1] === point && req.method === crashSpec[2] && req.path === crashSpec[3]) process.kill(process.pid, 'SIGKILL');
+};
+const txHooks = crashSpec ? { beforeCommit: crashIf('before-commit'), afterCommit: crashIf('after-commit') } : {};
+const tx = <H extends (...args: any[]) => any>(handler: H) => transactionalRoute(() => db, handler as any, txHooks);
 
 // Database Initialization with Tables and Sample Data
 async function initDatabase() {
