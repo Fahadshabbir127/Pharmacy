@@ -10,3 +10,6 @@ coverage/
 *.sqlite
 # generated test fixtures (synthetic legacy databases)
 tests/.fixtures/
+
+# desktop build output and E2E artifacts
+dist-electron/

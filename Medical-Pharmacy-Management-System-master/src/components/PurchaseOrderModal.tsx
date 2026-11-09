@@ -1,3 +1,4 @@
+import { PRODUCT_NAME, DEFAULT_TEMPLATES, storeNameOf, fileSafe, useStoreSettings } from '../lib/branding';
 import React, { useState } from 'react';
 import { Supplier } from '../types';
 import { api } from '../lib/api';
@@ -29,13 +30,15 @@ export const PurchaseOrderModal: React.FC<PurchaseOrderModalProps> = ({
   purchaseDate,
   onClose
 }) => {
+  const storeSettings = useStoreSettings();
+  const storeName = storeNameOf(storeSettings);
   const [sendingEmail, setSendingEmail] = useState<boolean>(false);
   const [emailSentSuccess, setEmailSentSuccess] = useState<boolean>(false);
   const [supplierEmailInput, setSupplierEmailInput] = useState<string>(
     supplier.phone && supplier.phone.includes('@') ? supplier.phone : `order@${(supplier.company || supplier.name).toLowerCase().replace(/[^a-z0-9]/g, '')}.com`
   );
   const [customEmailSubject, setCustomEmailSubject] = useState<string>(
-    `Official Purchase Order #${poNumber} - Khushi Medical Hall`
+    `Official Purchase Order #${poNumber} - ${storeName}`
   );
 
   const totalPOAmount = items.reduce((sum, item) => sum + (item.quantity * item.purchase_price), 0);
@@ -53,15 +56,15 @@ export const PurchaseOrderModal: React.FC<PurchaseOrderModalProps> = ({
         `${idx + 1}. ${it.product_name} - Qty: ${it.quantity} @ Rs. ${(Number(it.purchase_price) || 0).toFixed(2)} = Rs. ${(Number(it.quantity || 0) * Number(it.purchase_price || 0)).toFixed(2)}`
       ).join('\n');
 
-      const fullMessage = `Dear ${supplier.name} (${supplier.company || 'Distributor'}),\n\nPlease process the following official Purchase Order from Khushi Medical Hall:\n\n` +
+      const fullMessage = `Dear ${supplier.name} (${supplier.company || 'Distributor'}),\n\nPlease process the following official Purchase Order from ${storeName}:\n\n` +
         `PO Number: ${poNumber}\n` +
         `Order Date: ${dateFormatted}\n\n` +
         `ORDERED ITEMS:\n${itemsSummary}\n\n` +
         `TOTAL ORDER AMOUNT: Rs. ${(Number(totalPOAmount) || 0).toFixed(2)}\n` +
         (notes ? `Special Notes: ${notes}\n\n` : '\n') +
         `Kindly dispatch the shipment with delivery challan to our store address:\n` +
-        `Khushi Medical Hall, Main Market, Lahore, Punjab.\n\n` +
-        `Thank you,\nKhushi Medical Hall Admin`;
+        `${storeName}${storeSettings?.address ? `, ${storeSettings.address}` : ''}.\n\n` +
+        `Thank you,\n${storeName}`;
 
       await api.emailPurchaseOrder({
         supplier_id: supplier.id,
@@ -166,17 +169,23 @@ export const PurchaseOrderModal: React.FC<PurchaseOrderModalProps> = ({
             <div className="space-y-1">
               <div className="flex items-center space-x-2">
                 <div className="w-8 h-8 bg-emerald-800 text-white rounded-lg flex items-center justify-center font-black text-lg">
-                  K
+                  {storeName.charAt(0).toUpperCase()}
                 </div>
                 <div>
-                  <h1 className="text-xl font-extrabold text-slate-900 tracking-tight">KHUSHI MEDICAL HALL</h1>
+                  <h1 className="text-xl font-extrabold text-slate-900 tracking-tight">{storeName.toUpperCase()}</h1>
                   <p className="text-[10px] text-slate-500 font-bold uppercase tracking-wider">Licensed Pharmaceutical Retail & Wholesale POS</p>
                 </div>
               </div>
               <div className="text-xs text-slate-600 pt-2 space-y-0.5">
-                <p className="flex items-center gap-1"><MapPin className="w-3 h-3 text-slate-400" /> Main Market, Lahore, Punjab, Pakistan</p>
-                <p className="flex items-center gap-1"><Phone className="w-3 h-3 text-slate-400" /> Tel: 0300-0000000 / 042-35800100</p>
-                <p className="text-[10px] text-slate-400 font-mono">Drug License #: PHARM-LHR-2026-9012 | NTN: 8912345-6</p>
+                {storeSettings?.address && <p className="flex items-center gap-1"><MapPin className="w-3 h-3 text-slate-400" /> {storeSettings.address}</p>}
+                {storeSettings?.phone && <p className="flex items-center gap-1"><Phone className="w-3 h-3 text-slate-400" /> Tel: {storeSettings.phone}</p>}
+                {(storeSettings?.drug_license_number || storeSettings?.ntn_number) && (
+                  <p className="text-[10px] text-slate-400 font-mono">
+                    {storeSettings?.drug_license_number ? `Drug License #: ${storeSettings.drug_license_number}` : ''}
+                    {storeSettings?.drug_license_number && storeSettings?.ntn_number ? ' | ' : ''}
+                    {storeSettings?.ntn_number ? `NTN: ${storeSettings.ntn_number}` : ''}
+                  </p>
+                )}
               </div>
             </div>
 
@@ -208,10 +217,10 @@ export const PurchaseOrderModal: React.FC<PurchaseOrderModalProps> = ({
                 <ShieldCheck className="w-3.5 h-3.5 text-emerald-700" />
                 <span>Ship To Store Address</span>
               </h4>
-              <p className="font-bold text-slate-900">Khushi Medical Hall - Central Store</p>
+              <p className="font-bold text-slate-900">{storeName}</p>
               <p className="text-slate-600">Attn: Receiving Pharmacist / Inventory Manager</p>
-              <p className="text-slate-600">Main Bazaar, Lahore, Punjab, Pakistan</p>
-              <p className="text-slate-600 font-mono">Store Contact: 0300-0000000</p>
+              {storeSettings?.address && <p className="text-slate-600">{storeSettings.address}</p>}
+              {storeSettings?.phone && <p className="text-slate-600 font-mono">Store Contact: {storeSettings.phone}</p>}
             </div>
           </div>
 
@@ -278,12 +287,12 @@ export const PurchaseOrderModal: React.FC<PurchaseOrderModalProps> = ({
             <div>
               <div className="border-b border-slate-400 mb-1 h-12"></div>
               <p className="font-bold text-slate-800">Prepared By (Pharmacist / Staff)</p>
-              <p className="text-[10px] text-slate-500">Khushi Medical Hall</p>
+              <p className="text-[10px] text-slate-500">{storeName}</p>
             </div>
             <div>
               <div className="border-b border-slate-400 mb-1 h-12"></div>
               <p className="font-bold text-slate-800">Authorized Officer / Owner Signature</p>
-              <p className="text-[10px] text-slate-500">Khushi Medical Hall Stamp</p>
+              <p className="text-[10px] text-slate-500">{storeName} Stamp</p>
             </div>
           </div>
 

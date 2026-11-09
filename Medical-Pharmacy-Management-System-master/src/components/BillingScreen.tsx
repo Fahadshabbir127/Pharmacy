@@ -1,7 +1,8 @@
+import { PRODUCT_NAME, storeNameOf } from '../lib/branding';
 import React, { useState, useEffect, useRef } from 'react';
 import { Html5Qrcode } from 'html5-qrcode';
 import { Product, Category, Customer, CartItem, SaleHeader, SystemSettings } from '../types';
-import { api, saveDraftCart, loadDraftCart, clearDraftCart, savePendingOfflineSale } from '../lib/api';
+import { api, ApiError, saveDraftCart, loadDraftCart, clearDraftCart } from '../lib/api';
 import { ThermalReceiptModal } from './ThermalReceiptModal';
 import { 
   Search, 
@@ -504,7 +505,7 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
 
   // Auto download invoice file to device
   const downloadSaleInvoiceFile = (saleDetail: any) => {
-    const storeName = settings?.store_name || settings?.pharmacy_name || 'KHUSHI MEDICAL HALL';
+    const storeName = storeNameOf(settings).toUpperCase();
     const address = settings?.address || 'Main Bazar, Medical Complex Road';
     const phone = settings?.phone || '03247077664';
 
@@ -550,22 +551,66 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
     }
 
     text += `\n${line}\n`;
-    text += `Thank you for shopping at Khushi Medical Hall!\n`;
-    text += `All rights reserved | Software Developer: Muhammad Umar (03247077664)\n`;
+    text += `Thank you for shopping at ${storeNameOf(settings)}!\n`;
+    text += `${PRODUCT_NAME}\n`;
     text += `====================================================\n`;
 
     const blob = new Blob([text], { type: 'text/plain;charset=utf-8' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
-    a.download = `Invoice_${saleDetail.invoice_number || Date.now()}_KhushiMedical.txt`;
+    a.download = `Invoice_${saleDetail.invoice_number || Date.now()}.txt`;
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
     URL.revokeObjectURL(url);
   };
 
-  // Submit Sale Transaction
+  // Submit Sale Transaction (C3).
+  // One transaction id per checkout; a retry re-sends the SAME id, so the server records the sale at most once.
+  // Nothing is queued offline and no receipt is shown until the server has confirmed the sale.
+  const pendingTxnRef = useRef<{ id: string; payload: any } | null>(null);
+  const [unconfirmed, setUnconfirmed] = useState<{ txnId: string; message: string; checking?: boolean; result?: string } | null>(null);
+
+  const newTxnId = () => (typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`);
+
+  const finishConfirmedSale = async (saleId: number) => {
+    pendingTxnRef.current = null;
+    setUnconfirmed(null);
+    const saleDetail: any = await api.getSaleDetail(saleId);
+    // Automatically download sale invoice to local PC/device
+    downloadSaleInvoiceFile(saleDetail);
+    // Clear Cart & Draft
+    setCart([]);
+    clearDraftCart();
+    setShowPaymentModal(false);
+    // Show the confirmed sale in the receipt modal
+    setCompletedSale(saleDetail);
+    fetchInitialData();
+    if (onRefreshData) onRefreshData();
+  };
+
+  const submitPendingSale = async () => {
+    const pending = pendingTxnRef.current;
+    if (!pending) return;
+    try {
+      setSubmittingSale(true);
+      const result = await api.createSale({ ...pending.payload, client_txn_id: pending.id });
+      await finishConfirmedSale(result.sale_id);
+    } catch (err: any) {
+      if (err instanceof ApiError && err.outcome === 'UNKNOWN') {
+        // The server may or may not have saved it. Keep the cart and the SAME transaction id.
+        setUnconfirmed({ txnId: pending.id, message: err.message });
+      } else {
+        // Definite failure: nothing was saved. The next attempt gets a new transaction id.
+        pendingTxnRef.current = null;
+        alert(err.message || 'Error completing sale transaction');
+      }
+    } finally {
+      setSubmittingSale(false);
+    }
+  };
+
   const handleProcessSale = async () => {
     if (cart.length === 0) return;
 
@@ -588,71 +633,29 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
       payment_method: paymentMethod,
       amount_paid: numericAmountPaid
     };
+    pendingTxnRef.current = { id: newTxnId(), payload: salePayload };
+    await submitPendingSale();
+  };
 
+  const checkUnconfirmedSale = async () => {
+    const pending = pendingTxnRef.current;
+    if (!pending) return;
+    setUnconfirmed((u) => (u ? { ...u, checking: true, result: undefined } : u));
     try {
-      setSubmittingSale(true);
-      let saleDetail: any = null;
-
-      if (navigator.onLine) {
-        try {
-          const result = await api.createSale(salePayload);
-          saleDetail = await api.getSaleDetail(result.sale_id);
-        } catch (apiErr: any) {
-          console.warn('Network API sale creation failed, saving offline:', apiErr);
-          savePendingOfflineSale(salePayload);
-          saleDetail = createLocalOfflineSaleDetail(salePayload);
-        }
-      } else {
-        savePendingOfflineSale(salePayload);
-        saleDetail = createLocalOfflineSaleDetail(salePayload);
-      }
-
-      // Automatically download sale invoice to local PC/device
-      downloadSaleInvoiceFile(saleDetail);
-
-      // Clear Cart & Draft
-      setCart([]);
-      clearDraftCart();
-      setShowPaymentModal(false);
-
-      // Show completed sale detail in thermal modal
-      setCompletedSale(saleDetail);
-
-      // Refresh inventory & customers list if online
-      if (navigator.onLine) {
-        fetchInitialData();
-        if (onRefreshData) onRefreshData();
-      }
-
+      const found = await api.getSaleByTxn(pending.id);
+      await finishConfirmedSale(found.sale_id);
     } catch (err: any) {
-      alert(err.message || 'Error completing sale transaction');
-    } finally {
-      setSubmittingSale(false);
+      const result = err instanceof ApiError && err.status === 404
+        ? 'Not saved: the server has no sale with this transaction. It is safe to press "Retry sale".'
+        : `Still cannot reach the server (${err.message}). Do not hand over the receipt yet.`;
+      setUnconfirmed((u) => (u ? { ...u, checking: false, result } : u));
     }
   };
 
-  const createLocalOfflineSaleDetail = (payload: any) => {
-    const paid = payload.amount_paid || 0;
-    return {
-      id: 0,
-      invoice_number: `OFFLINE-${Date.now().toString().slice(-6)}`,
-      sale_date: new Date().toISOString(),
-      customer_name: selectedCustomer?.name || 'Walk-in Customer',
-      customer_phone: selectedCustomer?.phone,
-      payment_method: paymentMethod,
-      total_amount: cartSubtotal,
-      discount_amount: cartItemDiscounts + overallDiscountAmount,
-      net_amount: cartSubtotal - (cartItemDiscounts + overallDiscountAmount),
-      grand_total: grandTotal,
-      amount_paid: paid,
-      amount_due: Math.max(0, grandTotal - paid),
-      items: cart.map(item => ({
-        product_name: item.product.name,
-        quantity: item.quantity,
-        sale_price: item.unit_price,
-        subtotal: item.subtotal
-      }))
-    };
+  const abandonUnconfirmedSale = () => {
+    if (!confirm('Leave this sale unconfirmed? Check the Sales Register later before selling these items again, because the server may already have saved it.')) return;
+    pendingTxnRef.current = null;
+    setUnconfirmed(null);
   };
 
   // Filtered Products
@@ -1407,6 +1410,27 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
       )}
 
       {/* COMPLETED SALE THERMAL RECEIPT MODAL */}
+      {unconfirmed && (
+        <div className="fixed inset-0 z-[90] bg-slate-950/80 flex items-center justify-center p-4" role="alertdialog" aria-labelledby="sale-unconfirmed-title">
+          <div className="w-full max-w-lg bg-white rounded-xl shadow-2xl border-4 border-amber-500 p-5 space-y-3">
+            <h2 id="sale-unconfirmed-title" className="text-lg font-black text-amber-700">SALE NOT CONFIRMED</h2>
+            <p className="text-sm text-slate-800">The connection to the pharmacy server was lost while saving this sale. It may or may not have been saved. <strong>Do not hand over the receipt yet.</strong></p>
+            <p className="text-xs text-slate-500">{unconfirmed.message}</p>
+            <p className="text-xs text-slate-500 font-mono">Transaction: {unconfirmed.txnId}</p>
+            {unconfirmed.result && <p className="text-sm font-semibold text-slate-900 bg-slate-100 rounded p-2">{unconfirmed.result}</p>}
+            <div className="flex flex-wrap gap-2 pt-1">
+              <button type="button" disabled={submittingSale} onClick={() => void submitPendingSale()} className="px-3 py-2 rounded-lg bg-emerald-600 text-white font-bold text-sm disabled:opacity-50">
+                {submittingSale ? 'Retrying...' : 'Retry sale (safe - cannot be recorded twice)'}
+              </button>
+              <button type="button" disabled={unconfirmed.checking} onClick={() => void checkUnconfirmedSale()} className="px-3 py-2 rounded-lg bg-slate-800 text-white font-bold text-sm disabled:opacity-50">
+                {unconfirmed.checking ? 'Checking...' : 'Check status'}
+              </button>
+              <button type="button" onClick={abandonUnconfirmedSale} className="px-3 py-2 rounded-lg border border-slate-300 text-slate-600 text-sm">Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {completedSale && (
         <ThermalReceiptModal
           sale={completedSale}

@@ -25,7 +25,8 @@ const PORT = Number(process.env.PHARMACY_PORT) || 3000;
 // C8: per-installation secret (set in startServer). The original public fallback secret is gone.
 let JWT_SECRET = '';
 const DATA_DIR = process.env.PHARMACY_DATA_DIR ? path.resolve(process.env.PHARMACY_DATA_DIR) : path.join(process.cwd(), 'data');
-const DB_FILE = path.join(DATA_DIR, 'khushi_pharmacy.sqlite');
+// The desktop app uses 'pharmacy.sqlite'; tests and the legacy browser setup keep the original name.
+const DB_FILE = path.join(DATA_DIR, process.env.PHARMACY_DB_FILENAME || 'khushi_pharmacy.sqlite');
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -39,7 +40,15 @@ const BACKUP_DIR = path.join(DATA_DIR, 'backups');
 // process at that point of the matching request. Unset in normal use, so it does nothing.
 const crashSpec = (process.env.PHARMACY_TEST_CRASH || '').match(/^(before-commit|after-commit):(\w+) (\S+)$/);
 const crashIf = (point: string) => (req: express.Request) => {
-  if (crashSpec && crashSpec[1] === point && req.method === crashSpec[2] && req.path === crashSpec[3]) process.kill(process.pid, 'SIGKILL');
+  if (crashSpec && crashSpec[1] === point && req.method === crashSpec[2] && req.path === crashSpec[3]) {
+    // PHARMACY_TEST_CRASH_ONCE_FILE: crash only the first time (a marker file records that it happened)
+    const once = process.env.PHARMACY_TEST_CRASH_ONCE_FILE;
+    if (once) {
+      if (fs.existsSync(once)) return;
+      fs.writeFileSync(once, new Date().toISOString());
+    }
+    process.kill(process.pid, 'SIGKILL');
+  }
 };
 const txHooks = crashSpec ? { beforeCommit: crashIf('before-commit'), afterCommit: crashIf('after-commit') } : {};
 const tx = <H extends (...args: any[]) => any>(handler: H) => transactionalRoute(() => db, handler as any, txHooks);
@@ -121,6 +130,14 @@ function logAudit(userId: number | undefined | null, userName: string | undefine
     console.error('Audit log creation error:', e);
   }
 }
+
+/** The pharmacy's own name (Settings > store name), used in messages instead of a hardcoded brand. */
+function storeLabel(): string {
+  return db.get<{ value: string }>("SELECT value FROM settings WHERE key = 'store_name'")?.value
+    || db.get<{ name: string }>("SELECT name FROM tenants WHERE id = 1")?.name
+    || 'the pharmacy';
+}
+const NO_EMAIL = 'no-email@local.invalid';
 
 // ---- Archiving (FK2/FK3): records with history are archived, never deleted ----
 function hasHistory(checks: [string, any[]][]): boolean {
@@ -513,7 +530,7 @@ async function startServer() {
     logAudit(newUser ? newUser.id : null, cleanName, 'USER_REGISTER', `New user registered (${cleanEmail}, Role: ${userRole}). Awaiting Admin Approval.`, 'USER', newUser ? newUser.id : undefined, req);
 
     res.json({
-      message: 'Registration submitted successfully! Your account is currently PENDING verification by the Admin. You can log in once approved by Khushi Medical Hall Admin.'
+      message: `Registration submitted successfully! Your account is currently PENDING verification by the Admin. You can log in once approved by ${storeLabel()} Admin.`
     });
   }));
 
@@ -839,7 +856,7 @@ async function startServer() {
       const remainingMinutes = Math.ceil((lockInfo.lockedUntil - Date.now()) / (1000 * 60));
       logAudit(null, cleanUsername, 'LOGIN_BLOCKED_BRUTEFORCE', `Login attempt blocked: Account locked due to 5 consecutive failed login attempts (${cleanUsername}). ${remainingMinutes}m remaining.`, 'AUTH', undefined, req);
       return res.status(429).json({
-        error: `Security Alert: Account temporarily locked due to 5 consecutive failed login attempts. Please try again after ${remainingMinutes} minutes or contact Khushi Medical Hall Admin.`
+        error: `Security Alert: Account temporarily locked due to 5 consecutive failed login attempts. Please try again after ${remainingMinutes} minutes or contact the ${storeLabel()} administrator.`
       });
     }
 
@@ -877,7 +894,7 @@ async function startServer() {
     // Check Admin approval status
     if (user.status === 'PENDING') {
       logAudit(user.id, user.full_name, 'LOGIN_BLOCKED', `Login blocked: Account is PENDING verification by Admin (${user.username})`, 'AUTH', user.id, req);
-      return res.status(403).json({ error: 'Your account is pending verification by the Admin. Please contact Khushi Medical Hall Admin for approval.' });
+      return res.status(403).json({ error: `Your account is pending verification by the Admin. Please contact the ${storeLabel()} administrator for approval.` });
     }
 
     if (user.status === 'REJECTED') {
@@ -895,7 +912,7 @@ async function startServer() {
       return res.status(403).json({ error: 'Your account is currently suspended. Please contact Admin.' });
     }
 
-    let tenantName = 'Khushi Medical Hall';
+    let tenantName = storeLabel();
     let tenantStatus = 'ACTIVE';
     let allowedServices = 'POS_BILLING,INVENTORY,UDHAR_KHATTA,PURCHASES,REPORTS,EMAIL_ALERTS,USER_VERIFY,USER_REGISTER,USER_RESET_PASSWORD,AUDIT_LOGS,SETTINGS,CUSTOMER_PORTAL';
 
@@ -1021,7 +1038,7 @@ async function startServer() {
     // Clear used OTP
     db.run("DELETE FROM otp_verifications WHERE email = ?", [cleanEmail]);
 
-    let tenantName = 'Khushi Medical Hall';
+    let tenantName = storeLabel();
     let tenantStatus = 'ACTIVE';
     let allowedServices = 'POS_BILLING,INVENTORY,UDHAR_KHATTA,PURCHASES,REPORTS,EMAIL_ALERTS,USER_VERIFY,USER_REGISTER,USER_RESET_PASSWORD,AUDIT_LOGS,SETTINGS,CUSTOMER_PORTAL';
 
@@ -1073,7 +1090,7 @@ async function startServer() {
     const user = queryOne<any>("SELECT id, username, role, full_name, email, phone, status, allowed_services, tenant_id, customer_id FROM users WHERE id = ?", [req.user!.id]);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    let tenantName = 'Khushi Medical Hall';
+    let tenantName = storeLabel();
     let tenantStatus = 'ACTIVE';
     let allowedServices = 'POS_BILLING,INVENTORY,UDHAR_KHATTA,PURCHASES,REPORTS,EMAIL_ALERTS,USER_VERIFY,USER_REGISTER,USER_RESET_PASSWORD,AUDIT_LOGS,SETTINGS,CUSTOMER_PORTAL';
 
@@ -1725,9 +1742,9 @@ async function startServer() {
     `, [customerId, refStr, payAmt, newBal, notes || '']);
 
     // Queue BOTH Email and WhatsApp/SMS notifications for payment confirmation
-    const emailSubject = `Payment Confirmation - Khushi Medical Hall`;
-    const emailMsg = `Dear ${customer.name},\n\nWe have received your payment of Rs. ${payAmt.toFixed(2)} via ${payment_mode || 'Cash'}.\nYour updated Khushi Medical Hall balance is Rs. ${newBal.toFixed(2)}.\n\nThank you for choosing Khushi Medical Hall!`;
-    const custEmail = (customer as any).email || customer.phone || 'customer@khushimedical.com';
+    const emailSubject = `Payment Confirmation - ${storeLabel()}`;
+    const emailMsg = `Dear ${customer.name},\n\nWe have received your payment of Rs. ${payAmt.toFixed(2)} via ${payment_mode || 'Cash'}.\nYour updated ${storeLabel()} balance is Rs. ${newBal.toFixed(2)}.\n\nThank you for choosing ${storeLabel()}!`;
+    const custEmail = (customer as any).email || customer.phone || NO_EMAIL;
     
     const tId = req.user?.tenant_id || customer.tenant_id || 1;
 
@@ -1738,7 +1755,7 @@ async function startServer() {
     `, [customerId, custEmail, emailSubject, emailMsg, tId]);
 
     // 2. WhatsApp / SMS Notification Queue
-    const smsMsg = `Khushi Medical Hall: Payment Received! Dear ${customer.name}, we received Rs. ${payAmt.toFixed(2)} (${payment_mode || 'Cash'}). Your current Udhar balance is Rs. ${newBal.toFixed(2)}. Thank you!`;
+    const smsMsg = `${storeLabel()}: Payment Received! Dear ${customer.name}, we received Rs. ${payAmt.toFixed(2)} (${payment_mode || 'Cash'}). Your current Udhar balance is Rs. ${newBal.toFixed(2)}. Thank you!`;
     db.run(`
       INSERT INTO sms_queue (customer_id, phone, message, type, status, tenant_id)
       VALUES (?, ?, ?, 'PAYMENT_CONFIRMATION', 'PENDING', ?)
@@ -1759,9 +1776,9 @@ async function startServer() {
       return res.status(403).json({ error: 'Access denied: Customer belongs to another store.' });
     }
 
-    const custEmail = customer.email || customer.phone || 'customer@khushimedical.com';
-    const remSubject = `Udhar Balance Payment Reminder - Khushi Medical Hall`;
-    const defaultEmailBody = message || `Dear ${customer.name},\n\nThis is a friendly reminder regarding your outstanding Udhar balance of Rs. ${customer.current_balance.toFixed(2)} at Khushi Medical Hall.\n\nPlease clear your pending amount at your earliest convenience.\n\nThank you for your cooperation!`;
+    const custEmail = customer.email || customer.phone || NO_EMAIL;
+    const remSubject = `Udhar Balance Payment Reminder - ${storeLabel()}`;
+    const defaultEmailBody = message || `Dear ${customer.name},\n\nThis is a friendly reminder regarding your outstanding Udhar balance of Rs. ${customer.current_balance.toFixed(2)} at ${storeLabel()}.\n\nPlease clear your pending amount at your earliest convenience.\n\nThank you for your cooperation!`;
     const tId = req.user?.tenant_id || customer.tenant_id || 1;
 
     // 1. Queue Email
@@ -1771,7 +1788,7 @@ async function startServer() {
     `, [customerId, custEmail, remSubject, defaultEmailBody, tId]);
 
     // 2. Queue WhatsApp / SMS
-    const defaultSmsMsg = message || `Khushi Medical Hall: Dear ${customer.name}, your total outstanding Udhar debt balance is Rs. ${customer.current_balance.toFixed(2)}. Kindly settle your bill at your earliest convenience. Thank you!`;
+    const defaultSmsMsg = message || `${storeLabel()}: Dear ${customer.name}, your total outstanding Udhar debt balance is Rs. ${customer.current_balance.toFixed(2)}. Kindly settle your bill at your earliest convenience. Thank you!`;
     db.run(`
       INSERT INTO sms_queue (customer_id, phone, message, type, status, tenant_id)
       VALUES (?, ?, ?, 'UDHAR_REMINDER', 'PENDING', ?)
@@ -1912,9 +1929,9 @@ async function startServer() {
 
         // Queue BOTH Email and WhatsApp/SMS if customer owes money
         if (dueAmt > 0) {
-          const emailSub = `Invoice #${nextInvNum} Notice - Khushi Medical Hall`;
-          const emailBody = `Dear ${customerObj.name},\n\nInvoice #${nextInvNum} has been generated.\nTotal Bill: Rs. ${grand_total.toFixed(2)}\nAmount Paid: Rs. ${paidAmt.toFixed(2)}\nAmount Due: Rs. ${dueAmt.toFixed(2)}\nYour remaining total Udhar balance is: Rs. ${newBal.toFixed(2)}.\n\nThank you for choosing Khushi Medical Hall!`;
-          const cEmail = customerObj.email || customerObj.phone || 'customer@khushimedical.com';
+          const emailSub = `Invoice #${nextInvNum} Notice - ${storeLabel()}`;
+          const emailBody = `Dear ${customerObj.name},\n\nInvoice #${nextInvNum} has been generated.\nTotal Bill: Rs. ${grand_total.toFixed(2)}\nAmount Paid: Rs. ${paidAmt.toFixed(2)}\nAmount Due: Rs. ${dueAmt.toFixed(2)}\nYour remaining total Udhar balance is: Rs. ${newBal.toFixed(2)}.\n\nThank you for choosing ${storeLabel()}!`;
+          const cEmail = customerObj.email || customerObj.phone || NO_EMAIL;
 
           const saleTenantId = req.user?.tenant_id || customerObj.tenant_id || userTenantId;
 
@@ -1925,7 +1942,7 @@ async function startServer() {
           `, [customer_id, cEmail, emailSub, emailBody, saleTenantId]);
 
           // 2. WhatsApp / SMS Queue
-          const smsMsg = `Khushi Medical Hall: Invoice #${nextInvNum} created for ${customerObj.name}. Total: Rs. ${grand_total.toFixed(2)}, Paid: Rs. ${paidAmt.toFixed(2)}, Due: Rs. ${dueAmt.toFixed(2)}. Updated Total Udhar Balance: Rs. ${newBal.toFixed(2)}. Thank you!`;
+          const smsMsg = `${storeLabel()}: Invoice #${nextInvNum} created for ${customerObj.name}. Total: Rs. ${grand_total.toFixed(2)}, Paid: Rs. ${paidAmt.toFixed(2)}, Due: Rs. ${dueAmt.toFixed(2)}. Updated Total Udhar Balance: Rs. ${newBal.toFixed(2)}. Thank you!`;
           db.run(`
             INSERT INTO sms_queue (customer_id, phone, message, type, status, tenant_id)
             VALUES (?, ?, ?, 'UDHAR_REMINDER', 'PENDING', ?)
@@ -2155,8 +2172,8 @@ async function startServer() {
     }
 
     const emailToUse = supplier_email || 'supplier@pharmadistributor.com';
-    const emailSubject = subject || `Official Purchase Order #${po_number} - Khushi Medical Hall`;
-    const emailBody = message || `Dear Supplier,\n\nPlease find attached Purchase Order #${po_number} from Khushi Medical Hall.\n\nOrder Summary:\n${items_summary || ''}\n\nKindly dispatch the items at your earliest convenience.\n\nRegards,\nKhushi Medical Hall, Lahore`;
+    const emailSubject = subject || `Official Purchase Order #${po_number} - ${storeLabel()}`;
+    const emailBody = message || `Dear Supplier,\n\nPlease find attached Purchase Order #${po_number} from ${storeLabel()}.\n\nOrder Summary:\n${items_summary || ''}\n\nKindly dispatch the items at your earliest convenience.\n\nRegards,\n${storeLabel()}`;
 
     db.run(`
       INSERT INTO email_queue (customer_id, email, subject, message, type, status, tenant_id)
@@ -2480,17 +2497,18 @@ async function startServer() {
 
     const smtpHost = settingsObj.smtp_host || 'smtp.gmail.com';
     const smtpPort = settingsObj.smtp_port || '587';
-    const smtpUser = settingsObj.smtp_user || 'khushi.pharmacy@gmail.com';
+    const smtpUser = settingsObj.smtp_user || '(not set)';
     const smtpEnabled = settingsObj.smtp_enabled === 'true';
-    const targetEmail = testEmail || settingsObj.smtp_from_email || 'khushi.pharmacy@gmail.com';
+    const targetEmail = testEmail || settingsObj.smtp_from_email || '';
 
     if (!smtpEnabled) {
       return res.status(400).json({ error: 'SMTP Email Gateway is currently disabled in system settings.' });
     }
 
     // Queue a test message to email_queue
-    const testSubject = 'SMTP Gateway Connection Test - Khushi Medical Hall';
-    const testBody = `This is a test notification sent from Khushi Medical Hall POS.\n\nSMTP Configuration Verified:\nHost: ${smtpHost}:${smtpPort}\nSender/Username: ${smtpUser}\nTimestamp: ${new Date().toLocaleString()}\n\nIf you received this message, your SMTP Email Gateway configuration is working correctly!`;
+    if (!targetEmail) return res.status(400).json({ error: 'Enter an email address to send the test message to.' });
+    const testSubject = `SMTP Gateway Connection Test - ${storeLabel()}`;
+    const testBody = `This is a test notification sent from ${storeLabel()} (BrainTech Pharmacy AI).\n\nSMTP Configuration Verified:\nHost: ${smtpHost}:${smtpPort}\nSender/Username: ${smtpUser}\nTimestamp: ${new Date().toLocaleString()}\n\nIf you received this message, your SMTP Email Gateway configuration is working correctly!`;
 
     const userTenantId = req.user?.tenant_id || 1;
     db.run(`
@@ -2543,7 +2561,7 @@ async function startServer() {
     logAudit(req.user?.id, req.user?.fullName, 'BACKUP_EXPORT', 'Exported AES-256 encrypted database backup file', 'BACKUP', undefined, req);
 
     res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename=Khushi_Medical_Backup_${new Date().toISOString().split('T')[0]}.kmhbackup`);
+    res.setHeader('Content-Disposition', `attachment; filename=${storeLabel().replace(/[^A-Za-z0-9-]+/g, '_')}_Backup_${new Date().toISOString().split('T')[0]}.kmhbackup`);
     res.send(JSON.stringify(backupPayload, null, 2));
   }));
 
@@ -2551,7 +2569,7 @@ async function startServer() {
   app.get('/api/backup/mysql-export', authenticateToken, requireRoles(['ADMIN', 'SUPER_ADMIN']), async (req: AuthRequest, res) => {
     try {
       let sqlOutput = `-- ========================================================\n`;
-      sqlOutput += `-- Khushi Medical Hall & Pharmacy Management System\n`;
+      sqlOutput += `-- ${storeLabel()} - BrainTech Pharmacy AI database export\n`;
       sqlOutput += `-- MySQL / MariaDB Full Database Migration Dump\n`;
       sqlOutput += `-- Exported At: ${new Date().toISOString()}\n`;
       sqlOutput += `-- Target RDBMS: MySQL 5.7+ / MySQL 8.0+ / MariaDB 10.3+\n`;
@@ -2619,7 +2637,7 @@ async function startServer() {
       logAudit(req.user?.id, req.user?.fullName, 'MYSQL_EXPORT', 'Exported MySQL SQL Dump file', 'BACKUP', undefined, req);
 
       res.setHeader('Content-Type', 'text/plain');
-      res.setHeader('Content-Disposition', `attachment; filename=Khushi_Medical_MySQL_Dump_${new Date().toISOString().split('T')[0]}.sql`);
+      res.setHeader('Content-Disposition', `attachment; filename=${storeLabel().replace(/[^A-Za-z0-9-]+/g, '_')}_MySQL_Dump_${new Date().toISOString().split('T')[0]}.sql`);
       res.send(sqlOutput);
     } catch (err: any) {
       console.error('MySQL export error:', err);
@@ -3097,6 +3115,8 @@ async function startServer() {
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+  // Electron main process asks the utilityProcess to stop gracefully
+  (process as any).parentPort?.on('message', (e: any) => { if ((e?.data ?? e)?.type === 'shutdown') shutdown('desktop app quit'); });
 }
 
 startServer().catch(err => {

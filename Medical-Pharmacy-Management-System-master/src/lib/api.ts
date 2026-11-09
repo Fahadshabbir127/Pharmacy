@@ -2,6 +2,14 @@ import { User, Product, Category, Customer, LedgerEntry, SaleHeader, CartItem, S
 
 const API_BASE = '/api';
 
+/** Error from the API, with enough detail to tell "failed" from "outcome unknown". */
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number, readonly code?: string, readonly outcome: 'FAILED' | 'UNKNOWN' = 'FAILED') {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 export function getAuthToken(): string | null {
   return localStorage.getItem('khushi_token');
 }
@@ -61,14 +69,22 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     headers['Authorization'] = `Bearer ${token}`;
   }
 
-  const response = await fetch(`${API_BASE}${endpoint}`, {
-    ...options,
-    headers,
-  });
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE}${endpoint}`, {
+      ...options,
+      headers,
+    });
+  } catch (networkError: any) {
+    // The request may or may not have reached the server: the outcome is unknown.
+    throw new ApiError('The pharmacy server could not be reached.', 0, 'NETWORK_ERROR', 'UNKNOWN');
+  }
 
   if (!response.ok) {
     const errorData = await response.json().catch(() => ({ error: 'An unexpected error occurred' }));
-    throw new Error(errorData.error || `HTTP ${response.status}`);
+    // 5xx without a definite answer, 503 from the desktop connection layer, timeouts: outcome unknown.
+    const outcome = errorData.outcome || (response.status === 502 || response.status === 503 || response.status === 504 ? 'UNKNOWN' : 'FAILED');
+    throw new ApiError(errorData.error || `HTTP ${response.status}`, response.status, errorData.code, outcome);
   }
 
   return response.json() as Promise<T>;
@@ -305,6 +321,7 @@ export const api = {
     grand_total: number;
     payment_method: 'CASH' | 'PARTIAL' | 'UDHAR';
     amount_paid: number;
+    client_txn_id?: string;
   }) =>
     request<{
       message: string;
@@ -328,6 +345,9 @@ export const api = {
     query.append('include_items', 'true');
     return request<SaleHeader[]>(`/sales/history?${query.toString()}`);
   },
+  /** Was the sale with this transaction id saved? ('committed' with its invoice, or 404 'not_found') */
+  getSaleByTxn: (txnId: string) =>
+    request<{ status: 'committed'; invoice_number: string; sale_id: number; grand_total: number; amount_paid: number; amount_due: number }>(`/sales/by-txn/${encodeURIComponent(txnId)}`),
   getSalesHistory: (start_date?: string, end_date?: string, customer_id?: number) => {
     const query = new URLSearchParams();
     if (start_date) query.append('start_date', start_date);
@@ -458,6 +478,10 @@ export function getPendingOfflineSales(): OfflinePendingSale[] {
   }
 }
 
+/**
+ * @deprecated C3: sales are never queued offline any more (a failed or unconfirmed sale stays on screen
+ * with a safe retry). Kept only so sales queued by the previous version can be reviewed and submitted.
+ */
 export function savePendingOfflineSale(saleData: any): OfflinePendingSale {
   const pending = getPendingOfflineSales();
   const newItem: OfflinePendingSale = {
@@ -490,7 +514,9 @@ export async function syncPendingOfflineSales(): Promise<{ synced: number; remai
   let synced = 0;
   for (const item of pending) {
     try {
-      await api.createSale(item.saleData);
+      // C3: a stable transaction id per queued sale, so submitting the queue twice can never record it twice
+      const txn = item.id.replace(/[^A-Za-z0-9-]/g, '').slice(0, 64);
+      await api.createSale({ ...item.saleData, client_txn_id: txn.length >= 8 ? txn : undefined });
       removePendingOfflineSale(item.id);
       synced++;
     } catch (err) {

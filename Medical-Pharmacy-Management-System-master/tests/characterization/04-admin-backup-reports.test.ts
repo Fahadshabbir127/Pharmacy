@@ -107,7 +107,7 @@ describe('backup & restore', () => {
   it('encrypted export -> change data -> import restores the earlier state', async () => {
     const exp = await admin.post('/backup/export', { password: 'Backup123!' });
     expect(exp.status).toBe(200);
-    expect(exp.headers.get('content-disposition')).toMatch(/Khushi_Medical_Backup_.*\.kmhbackup/);
+    expect(exp.headers.get("content-disposition")).toMatch(/filename=Khushi_Medical_Hall_Backup_\d{4}-\d{2}-\d{2}\.kmhbackup/); // C7: named after the pharmacy (store_name)
     expect(exp.body).toMatchObject({ version: '1.0' });
     expect(typeof exp.body.iv).toBe('string');
 

@@ -240,7 +240,7 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
       p.rack_location || ''
     ]);
 
-    exportToExcel([headers, ...rows], `Khushi_Store_Inventory_${new Date().toISOString().split('T')[0]}`);
+    exportToExcel([headers, ...rows], `Inventory_${new Date().toISOString().split('T')[0]}`);
   };
 
   return (

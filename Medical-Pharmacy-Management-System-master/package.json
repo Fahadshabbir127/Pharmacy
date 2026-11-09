@@ -1,9 +1,9 @@
 {
-  "name": "khushi-medical-hall-pos",
+  "name": "braintech-pharmacy-ai",
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "main": "electron-main.js",
+  "main": "dist-electron/main.cjs",
   "scripts": {
     "dev": "tsx server.ts",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
@@ -15,7 +15,12 @@
     "test:characterization": "vitest run tests/characterization",
     "fixtures:legacy": "vitest run tests/characterization/06-legacy-fixtures.test.ts",
     "audit:db-callsites": "tsx scripts/audit-db-callsites.ts server.ts",
-    "audit:fk": "tsx scripts/fk-audit.ts"
+    "audit:fk": "tsx scripts/fk-audit.ts",
+    "build:web": "vite build",
+    "build:electron": "node scripts/build-electron.mjs",
+    "build:desktop": "npm run build:web && npm run build:electron",
+    "desktop": "npm run build:desktop && electron .",
+    "test:e2e": "npm run build:desktop && vitest run -c vitest.e2e.config.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
@@ -58,5 +63,7 @@
     "typescript": "~5.8.2",
     "vite": "^6.2.3",
     "vitest": "^3.2.4"
-  }
+  },
+  "productName": "BrainTech Pharmacy AI",
+  "description": "BrainTech Pharmacy AI - offline-first pharmacy management for Windows with LAN host/client support"
 }

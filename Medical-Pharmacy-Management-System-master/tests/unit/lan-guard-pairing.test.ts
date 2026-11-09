@@ -135,3 +135,25 @@ describe('certificate and secrets', () => {
     }
   });
 });
+
+describe('UDP discovery', () => {
+  it('a host answers a discovery request from the local machine; junk and wrong nonces are ignored', async () => {
+    const { startDiscoveryResponder, discoverHosts } = await import('../../server/lan/discovery');
+    const responder = await startDiscoveryResponder(() => ({ hostName: 'pharmacy-host', port: 3747, fingerprintShort: 'ABCD-EF01', appVersion: '1.0.0' }), { port: 0, bind: '127.0.0.1' });
+    try {
+      const dgram = await import('node:dgram');
+      const junk = dgram.createSocket('udp4');
+      await new Promise<void>((r) => junk.send(Buffer.from('not json'), responder.port, '127.0.0.1', () => r()));
+      junk.close();
+      const hosts = await discoverHosts({ targets: ['127.0.0.1'], port: responder.port, timeoutMs: 500 });
+      expect(hosts).toEqual([{ address: '127.0.0.1', port: 3747, hostName: 'pharmacy-host', fingerprintShort: 'ABCD-EF01', appVersion: '1.0.0' }]);
+    } finally {
+      responder.close();
+    }
+  });
+
+  it('no host on the network: resolves with an empty list (manual IP entry remains available)', async () => {
+    const { discoverHosts } = await import('../../server/lan/discovery');
+    expect(await discoverHosts({ targets: ['127.0.0.1'], port: 39999, timeoutMs: 300 })).toEqual([]);
+  });
+});

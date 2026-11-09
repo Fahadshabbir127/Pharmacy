@@ -1,3 +1,5 @@
+import { useConnectionState, ConnectionChip, ConnectionOverlay, isDesktop } from './components/ConnectionStatus';
+import { PRODUCT_NAME } from './lib/branding';
 import React, { useState, useEffect } from 'react';
 import { User, SystemSettings } from './types';
 import { getCurrentUser, getAuthToken, setCurrentUser as setCurrentUserInStorage, removeAuthToken, api, getPendingOfflineSales, syncPendingOfflineSales } from './lib/api';
@@ -27,36 +29,32 @@ export default function App() {
   const [checkingAuth, setCheckingAuth] = useState<boolean>(true);
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState<boolean>(false);
 
-  // Sync & Offline state
+  // Connection state (desktop) and sales queued by the PREVIOUS version (C3: no automatic sync any more)
+  const connection = useConnectionState();
   const [isOnline, setIsOnline] = useState<boolean>(navigator.onLine);
   const [pendingOfflineCount, setPendingOfflineCount] = useState<number>(() => getPendingOfflineSales().length);
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
 
   useEffect(() => {
     checkAuthSession();
-
-    const handleOnline = () => {
-      setIsOnline(true);
-      handleSyncOfflineData();
-    };
+    const handleOnline = () => setIsOnline(true);
     const handleOffline = () => setIsOnline(false);
-
     window.addEventListener('online', handleOnline);
     window.addEventListener('offline', handleOffline);
-
-    const interval = setInterval(() => {
-      setPendingOfflineCount(getPendingOfflineSales().length);
-    }, 2000);
-
     return () => {
       window.removeEventListener('online', handleOnline);
       window.removeEventListener('offline', handleOffline);
-      clearInterval(interval);
     };
   }, []);
 
   const handleSyncOfflineData = async () => {
     if (getPendingOfflineSales().length === 0) return;
+    const ok = window.confirm(
+      `${getPendingOfflineSales().length} sale(s) were saved offline by the previous version and never confirmed by the server.\n\n` +
+      'Before submitting, check the Sales Register: a sale may already be there if the old version lost the connection after saving it. ' +
+      'Each queued sale can be submitted only once.\n\nSubmit them now?'
+    );
+    if (!ok) return;
     try {
       setIsSyncing(true);
       const res = await syncPendingOfflineSales();
@@ -292,8 +290,18 @@ export default function App() {
       {/* High Density Status Footer */}
       <footer className="h-6 bg-slate-800 text-slate-300 flex items-center justify-between px-3 shrink-0 text-[10px] select-none border-t border-slate-700 font-mono">
         <div className="flex items-center space-x-3">
-          {/* Database Synchronization Indicator */}
-          {isOnline ? (
+          {/* Connection / database indicator */}
+          {isDesktop() && <ConnectionChip state={connection} />}
+          {isDesktop() ? (
+            pendingOfflineCount > 0 && (
+              <span className="flex items-center space-x-1.5 text-amber-200 font-bold bg-amber-950/90 border border-amber-500/60 px-2 py-0.5 rounded">
+                <span>{pendingOfflineCount} UNCONFIRMED SALE(S) FROM PREVIOUS VERSION</span>
+                <button onClick={handleSyncOfflineData} disabled={isSyncing} className="bg-amber-600 hover:bg-amber-500 text-white px-1.5 rounded text-[9px] uppercase font-bold ml-1">
+                  {isSyncing ? 'Submitting...' : 'Review & submit'}
+                </button>
+              </span>
+            )
+          ) : isOnline ? (
             pendingOfflineCount === 0 ? (
               <span className="flex items-center space-x-1.5 text-emerald-300 font-bold bg-emerald-950/70 border border-emerald-500/40 px-2 py-0.5 rounded">
                 <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse"></span>
@@ -308,7 +316,7 @@ export default function App() {
                   disabled={isSyncing}
                   className="bg-amber-600 hover:bg-amber-500 text-white px-1.5 py-0.2 rounded text-[9px] uppercase font-bold transition-all ml-1"
                 >
-                  {isSyncing ? 'Syncing...' : 'Sync Now'}
+                  {isSyncing ? 'Submitting...' : 'Review & submit'}
                 </button>
               </span>
             )
@@ -323,7 +331,7 @@ export default function App() {
         {/* Rights Reserved Info & Shortcuts */}
         <div className="flex items-center space-x-3">
           <span className="text-slate-200 font-bold bg-slate-900/90 px-2 py-0.5 rounded border border-slate-700/80">
-            © All Rights Reserved | Muhammad Umar
+            {PRODUCT_NAME}
           </span>
 
           <div className="hidden lg:flex items-center space-x-2 text-slate-400">
@@ -333,6 +341,7 @@ export default function App() {
           </div>
         </div>
       </footer>
+      <ConnectionOverlay state={connection} />
 
     </div>
   );

@@ -90,7 +90,7 @@ export const SalesScreen: React.FC<SalesScreenProps> = ({ currentUser }) => {
       </tr>
     `).join('');
 
-    const storeDisplayName = (settings.store_name || settings.pharmacy_name || currentUser?.tenant_name || 'Khushi Medical Hall & Store').toUpperCase();
+    const storeDisplayName = (settings.store_name || settings.pharmacy_name || currentUser?.tenant_name || 'Pharmacy').toUpperCase();
 
     printWindow.document.write(`
       <!DOCTYPE html>
@@ -139,13 +139,13 @@ export const SalesScreen: React.FC<SalesScreenProps> = ({ currentUser }) => {
             </tbody>
           </table>
 
-          <script>
-            window.onload = function() { window.print(); }
-          </script>
+          <!-- printed by the opener (no inline script: the desktop app's security policy blocks them) -->
         </body>
       </html>
     `);
     printWindow.document.close();
+    printWindow.focus();
+    setTimeout(() => printWindow.print(), 300);
   };
 
   return (

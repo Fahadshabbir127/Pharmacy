@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>BrainTech Pharmacy AI - Setup</title>
+  <link rel="stylesheet" href="setup.css" />
+</head>
+<body>
+  <header>
+    <div class="brand"><span class="logo">B</span><div><strong>BrainTech Pharmacy AI</strong><small id="version"></small></div></div>
+    <button id="backToApp" class="ghost hidden" type="button">Back to pharmacy</button>
+  </header>
+
+  <main>
+    <div id="error" class="alert error hidden" role="alert"></div>
+    <div id="notice" class="alert ok hidden" role="status"></div>
+
+    <!-- Step 1: choose how this computer is used -->
+    <section id="step-mode" class="step hidden">
+      <h1>How will this computer be used?</h1>
+      <p class="lead">You can change this later in <em>File &rsaquo; Connection &amp; Server Settings</em>. No internet connection is needed.</p>
+      <div class="cards">
+        <button class="card" data-mode="standalone" type="button">
+          <h2>Single computer</h2>
+          <p>This is the only computer running the pharmacy software. Everything is stored on this computer.</p>
+        </button>
+        <button class="card" data-mode="host" type="button">
+          <h2>Main pharmacy server</h2>
+          <p>This computer keeps the pharmacy database. Other counters and laptops on the same Wi-Fi/LAN connect to it.</p>
+        </button>
+        <button class="card" data-mode="client" type="button">
+          <h2>Connect to the pharmacy server</h2>
+          <p>Use the database that is already on the main pharmacy computer (billing counter, inventory desk, pharmacist workstation).</p>
+        </button>
+      </div>
+    </section>
+
+    <!-- Step 2a: new or import (standalone / host) -->
+    <section id="step-source" class="step hidden">
+      <h1>Pharmacy data</h1>
+      <p class="lead">Start with a new, empty pharmacy or bring the data from the previous Khushi Medical Hall / Pharmacy POS version.</p>
+      <div class="cards two">
+        <button class="card" id="startFresh" type="button"><h2>Start a new pharmacy</h2><p>Create the administrator account in the next step.</p></button>
+        <button class="card" id="importLegacy" type="button"><h2>Import from the previous version</h2><p>Choose its <code>khushi_pharmacy.sqlite</code> file. The file is copied; the original is never changed. Existing users and passwords keep working.</p></button>
+      </div>
+      <button class="ghost" data-back="step-mode" type="button">&larr; Back</button>
+    </section>
+
+    <!-- Step 3a: create the administrator -->
+    <section id="step-admin" class="step hidden">
+      <h1>Create the administrator</h1>
+      <p class="lead">This account can manage users, settings and backups. Choose a password only you know.</p>
+      <form id="adminForm" autocomplete="off">
+        <div class="grid">
+          <label>Pharmacy name <input name="storeName" required minlength="2" maxlength="100" /></label>
+          <label>Owner / administrator name <input name="ownerName" required minlength="2" maxlength="100" /></label>
+          <label>Username <input name="username" required minlength="3" maxlength="50" pattern="[A-Za-z0-9._@\-]+" /></label>
+          <label>Phone (optional) <input name="phone" maxlength="40" /></label>
+          <label>Password <input name="password" type="password" required minlength="8" /></label>
+          <label>Repeat password <input name="password2" type="password" required minlength="8" /></label>
+          <label class="wide">Address (optional) <input name="address" maxlength="200" /></label>
+        </div>
+        <p class="hint">At least 8 characters, with letters and numbers or symbols.</p>
+        <label class="check"><input type="checkbox" name="loadDemoData" /> Load sample medicines and customers to try the software (no extra login accounts are created)</label>
+        <div class="actions"><button type="submit" class="primary">Create administrator</button></div>
+      </form>
+    </section>
+
+    <!-- Step 3b: pair with the host (client) -->
+    <section id="step-pair" class="step hidden">
+      <h1>Connect to the pharmacy server</h1>
+      <p class="lead">On the main pharmacy computer open <em>File &rsaquo; Connection &amp; Server Settings</em>. It shows its address and an 8-character pairing code.</p>
+      <div class="split">
+        <div>
+          <h3>Servers found on this network</h3>
+          <div id="hosts" class="list"><p class="muted">Searching&hellip;</p></div>
+          <button id="rescan" class="ghost" type="button">Search again</button>
+          <p class="hint">Not listed? Some routers block discovery. Type the address shown on the server instead.</p>
+        </div>
+        <form id="pairForm" autocomplete="off">
+          <label>Server address (IP) <input name="host" required placeholder="e.g. 192.168.1.20" /></label>
+          <label>Port <input name="port" type="number" required value="3747" min="1" max="65535" /></label>
+          <label>Pairing code <input name="code" required minlength="8" maxlength="20" placeholder="8 characters" class="code" /></label>
+          <label>Name of this computer <input name="computerName" required maxlength="60" /></label>
+          <div class="actions"><button type="submit" class="primary">Pair and connect</button></div>
+          <p class="hint">The connection is encrypted. Pairing checks the code on both computers, so another device cannot pretend to be the server.</p>
+        </form>
+      </div>
+      <button class="ghost" data-back="step-mode" type="button">&larr; Back</button>
+    </section>
+
+    <!-- Step 4: done -->
+    <section id="step-done" class="step hidden">
+      <h1>Ready</h1>
+      <div id="doneSummary" class="panel"></div>
+      <div class="actions"><button id="finish" class="primary" type="button">Open the pharmacy</button></div>
+    </section>
+
+    <!-- Manage (File > Connection & Server Settings) -->
+    <section id="step-manage" class="step hidden">
+      <h1>Connection &amp; Server Settings</h1>
+      <div id="manageBody"></div>
+      <div class="actions">
+        <button id="changeMode" class="danger-ghost" type="button">Change how this computer is used&hellip;</button>
+      </div>
+    </section>
+  </main>
+  <script src="setup.js"></script>
+</body>
+</html>

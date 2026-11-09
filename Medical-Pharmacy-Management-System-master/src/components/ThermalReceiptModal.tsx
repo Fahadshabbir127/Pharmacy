@@ -1,3 +1,4 @@
+import { storeNameOf } from '../lib/branding';
 import React from 'react';
 import { SaleHeader, SystemSettings } from '../types';
 import { Printer, X, Download, CheckCircle, Pill } from 'lucide-react';
@@ -21,11 +22,11 @@ export const ThermalReceiptModal: React.FC<ThermalReceiptModalProps> = ({ sale, 
     }
   }, [autoPrint]);
 
-  const storeName = settings?.store_name || 'Khushi Medical Hall';
-  const storeUrduName = settings?.store_urdu_name || 'خوشی میڈیکل ہال';
-  const address = settings?.address || 'Main Bazaar, Near Civil Hospital, Lahore';
-  const phone = settings?.phone || '0300-1234567 / 042-35551234';
-  const ntn = settings?.ntn_number || 'NTN-7894561-2';
+  const storeName = storeNameOf(settings);
+  const storeUrduName = settings?.store_urdu_name || '';
+  const address = settings?.address || '';
+  const phone = settings?.phone || '';
+  const ntn = settings?.ntn_number || '';
   const footerMsg = settings?.receipt_footer || 'Get well soon! Check expiry before use. Goods once sold are not returnable without bill.';
 
   const handlePrint = () => {
@@ -64,9 +65,9 @@ export const ThermalReceiptModal: React.FC<ThermalReceiptModalProps> = ({ sale, 
             <div className="text-sm font-sans text-emerald-800 font-bold tracking-wide">
               {storeUrduName}
             </div>
-            <div className="text-[10px] text-slate-600">{address}</div>
-            <div className="text-[10px] text-slate-600">Tel: {phone}</div>
-            <div className="text-[10px] text-slate-500 font-semibold">{ntn}</div>
+            {address && <div className="text-[10px] text-slate-600">{address}</div>}
+            {phone && <div className="text-[10px] text-slate-600">Tel: {phone}</div>}
+            {ntn && <div className="text-[10px] text-slate-500 font-semibold">{ntn}</div>}
           </div>
 
           {/* Invoice Meta */}

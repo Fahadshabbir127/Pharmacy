@@ -1,6 +1,6 @@
 # Architecture: BrainTech Pharmacy AI (desktop, offline-first, LAN host/client)
 
-Status: **approved design, not yet implemented** (Phase 1 deliverable). The current system is described in `PROJECT_AUDIT.md`.
+Status: approved design (Phase 1). **Implemented through Phase 4**; see §17 for what was built and where it differs from the design. The current system is described in `PROJECT_AUDIT.md`.
 
 | | |
 |---|---|
@@ -294,3 +294,48 @@ sales_returns / sales_return_items (sale_item_id, batch_id, qty, restock flag, r
 | 12 | Remaining docs, release notes | All 14 docs present; testing report honest |
 
 Every phase ends with tests, a build check, a regression check against `FEATURE_PRESERVATION_CHECKLIST.md`, doc updates and a commit pushed to `claude/beautiful-einstein-ps972s`.
+
+
+## 17. As built (after Phase 4) and deviations from the design
+
+| Area | Design said | Built | Why |
+|---|---|---|---|
+| Electron | (version not fixed) | **Electron 45.2.3** | A currently supported release line |
+| SQLite native module | electron-builder rebuild | **better-sqlite3 13.0.3**, whose npm package ships Node-API binaries for all platforms (incl. `win32-x64`) | One binary works in Node (tests) and Electron; no native compiling on build machines; removes a common cause of broken Windows installers |
+| Certificate | ECDSA P-256 | **RSA-2048**, self-signed, 5 years, generated with `node-forge` | node-forge (pure JS, no OpenSSL dependency) signs RSA only. Trust is by pinned SHA-256 fingerprint, so the key type does not change the security model. |
+| Pinned transport | `net.fetch` + `setCertificateVerifyProc` | Node `tls`/`https` in the main process (`server/lan/pinnedClient.ts`): the fingerprint is checked **on the connected socket before any request byte is sent** | Testable under plain Node (impostor and wrong-pin tests). A bug found during testing showed why this matters: Node skips `checkServerIdentity` for self-signed certificates, so the pin must be enforced explicitly. |
+| Private key at rest | DPAPI via `safeStorage` | `safeStorage` async API (`encryptStringAsync`); falls back to an owner-only `key.pem` when encryption is unavailable | The synchronous API is deprecated in Electron 45 |
+| Client identity | pairing + pin | pairing + pin + **per-client token** (only its SHA-256 is stored on the host), required by the LAN guard for every non-loopback request; revocable | Lets the host remove a lost laptop without re-keying everyone |
+| Certificate renewal | signed hand-over with 14-day grace | **Not built yet.** Renewal = new certificate; clients re-pair (documented in `LAN_SETUP_GUIDE.md` §8). | Deferred; listed as remaining work |
+| Discovery | UDP 3748 broadcast | Built (`server/lan/discovery.ts`), answers private-LAN requesters only | Unit-tested over loopback; not testable on a real LAN in this environment |
+| JWT secret | random, DPAPI-protected | random 64 bytes in `data/jwt.secret`, owner-only file permissions; the role is always read from the database | DPAPI wrapping of this file is listed for Phase 10 |
+| FK enforcement | after approved fixes | **ON** (FK1–FK5, see `FK_AUDIT_REPORT.md`) | n/a |
+| Idempotency | `client_txn_id` column on each table | `idempotency_keys` table (key, route, stored result), written in the same transaction as the sale | One mechanism for every route, no table rebuilds; used by sales now, payments/purchases in Phase 7 |
+| Real-time updates | SSE | **Not built yet** (Phase 8). Every screen reads fresh data from the host when it loads. | Phase order |
+
+### Module map
+
+```
+electron/main.ts         lifecycle, single instance, windows, menu, navigation/permission/download policy, IPC handlers
+electron/preload.ts      window.braintech (frozen; requires only 'electron'; sandboxed)
+electron/connection.ts   app:// protocol: bundled UI + /api proxy over pinned HTTPS, CSP, heartbeat/connection states
+electron/backend.ts      utilityProcess supervisor (start, graceful stop, crash restart with backoff, 5-in-2-min stop)
+electron/certs.ts        per-installation certificate (generate, encrypted key)
+electron/store.ts        data folder selection (ProgramData > LocalAppData; never the install dir), config.json, logs
+electron/ipc.ts          channel registry, sender check (app://braintech only), zod argument validation
+electron/ui/             setup wizard + Connection & Server Settings (no inline scripts)
+server/config.ts         modes, address classification, API protocol version
+server/lan/*             tls, pairing, pinnedClient, guard, discovery
+server/db/*              adapter, migrations 0001-0006, open (integrity + migrate + FK check), legacy import, transactional routes
+server/seed.ts           optional demo catalogue (no logins); legacy test seed (tests only)
+server/security/*        per-install JWT secret
+```
+
+### Runtime data layout (as built)
+
+```
+<data root>/config.json          mode, host address + pinned fingerprint, encrypted client token
+<data root>/data/pharmacy.sqlite (+ -wal/-shm), jwt.secret, backups/ (pre-migration, pre-restore)
+<data root>/certs/cert.pem, key.enc (or key.pem)
+<data root>/logs/main.log, backend.log
+```

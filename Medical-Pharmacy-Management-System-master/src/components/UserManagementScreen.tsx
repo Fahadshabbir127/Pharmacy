@@ -355,7 +355,7 @@ export const UserManagementScreen: React.FC<{ currentUser?: User }> = ({ current
                   Verification Required ({pendingCount} New Registrations)
                 </h3>
                 <p className="text-xs text-amber-800 mt-0.5">
-                  {pendingCount} user account(s) are waiting for your approval before they can log in to Khushi Medical Hall.
+                  {pendingCount} user account(s) are waiting for your approval before they can sign in.
                 </p>
               </div>
               <button
@@ -975,7 +975,7 @@ export const UserManagementScreen: React.FC<{ currentUser?: User }> = ({ current
                   <label className="block text-slate-700 font-bold mb-1">Email Address</label>
                   <input
                     type="email"
-                    placeholder="ali@khushimedical.com"
+                    placeholder="name@example.com"
                     value={addEmail}
                     onChange={(e) => setAddEmail(e.target.value)}
                     className="w-full px-3 py-2 border border-slate-300 rounded focus:outline-none focus:ring-1 focus:ring-emerald-500 font-mono"

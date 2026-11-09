@@ -63,7 +63,7 @@ export const ReportsScreen: React.FC = () => {
       r.grand_total,
       r.profit || 0
     ]);
-    exportToExcel([headers, ...rows], `Khushi_Sales_Report_${startDate}_to_${endDate}`);
+    exportToExcel([headers, ...rows], `Sales_Report_${startDate}_to_${endDate}`);
   };
 
   return (

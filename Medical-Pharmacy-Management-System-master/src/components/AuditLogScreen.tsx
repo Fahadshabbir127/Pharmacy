@@ -107,7 +107,7 @@ export const AuditLogScreen: React.FC<AuditLogScreenProps> = ({ currentUser }) =
       l.user_agent || ''
     ]);
 
-    exportToExcel([headers, ...rows], `Khushi_Store_Audit_Logs_${new Date().toISOString().split('T')[0]}`);
+    exportToExcel([headers, ...rows], `Audit_Logs_${new Date().toISOString().split('T')[0]}`);
   };
 
   const getActionBadge = (type: string) => {
