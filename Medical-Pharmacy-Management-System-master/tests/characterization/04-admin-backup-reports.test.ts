@@ -82,8 +82,10 @@ describe('settings', () => {
     const r = await admin.post('/settings/test-smtp', { testEmail: 't@test.local' });
     expect(r.status).toBe(200);
     const db = await openReadOnly(srv.dbFile);
-    // [LEGACY-BUG] the test row is attached to customer_id = 1 regardless of whether it exists
-    expect(one(db, "SELECT customer_id FROM email_queue WHERE email='t@test.local'")).toEqual({ customer_id: 1 });
+    // FK5 fix (was: attached to customer #1 whether or not it existed): attached to the hidden system record
+    const row = one<{ customer_id: number }>(db, "SELECT customer_id FROM email_queue WHERE email='t@test.local'")!;
+    expect(one(db, 'SELECT name, is_placeholder, archived_at IS NOT NULL AS hidden FROM customers WHERE id = ?', [row.customer_id])).toEqual({ name: '[System messages]', is_placeholder: 1, hidden: 1 });
+    expect((await admin.get('/customers')).body.map((c: any) => c.name)).not.toContain('[System messages]');
   });
 });
 
@@ -105,7 +107,7 @@ describe('backup & restore', () => {
   it('encrypted export -> change data -> import restores the earlier state', async () => {
     const exp = await admin.post('/backup/export', { password: 'Backup123!' });
     expect(exp.status).toBe(200);
-    expect(exp.headers.get('content-disposition')).toMatch(/Khushi_Medical_Backup_.*\.kmhbackup/);
+    expect(exp.headers.get("content-disposition")).toMatch(/filename=Khushi_Medical_Hall_Backup_\d{4}-\d{2}-\d{2}\.kmhbackup/); // C7: named after the pharmacy (store_name)
     expect(exp.body).toMatchObject({ version: '1.0' });
     expect(typeof exp.body.iv).toBe('string');
 
@@ -125,7 +127,7 @@ describe('backup & restore', () => {
     await admin.post('/categories', { name: 'Newer Than Backup' });
     expect((await admin.post('/backup/import', { backupPayload: exp0.body, password: 'Backup123!' })).status).toBe(200);
     const files = fs.readdirSync(`${srv.workDir}/data`).filter((f) => !/-(wal|shm)$/.test(f));
-    expect(files.sort()).toEqual(['backups', 'khushi_pharmacy.sqlite']);
+    expect(files.sort()).toEqual(['backups', 'jwt.secret', 'khushi_pharmacy.sqlite']);
     const safety = fs.readdirSync(`${srv.workDir}/data/backups`).filter((f) => f.startsWith('pre-restore-'));
     expect(safety).toHaveLength(1);
     const copy = await openReadOnly(`${srv.workDir}/data/backups/${safety[0]}`);
@@ -215,14 +217,11 @@ describe('users', () => {
 });
 
 describe('audit logs', () => {
-  it('[LEGACY-BUG] on first boot the store admin sees an empty audit log (own rows have tenant_id NULL); SUPER_ADMIN sees them', async () => {
+  // first-boot fix (was: the store admin saw an empty audit log until the next restart)
+  it('[FIXED] the store admin sees their own audit rows from the first start', async () => {
     const list = await admin.get('/audit-logs');
     expect(list.status).toBe(200);
-    expect(list.body).toEqual([]);
-    const sa = new Api();
-    await sa.login('superadmin', 'admin123');
-    const saRows = (await sa.get('/audit-logs')).body;
-    expect(saRows.some((l: any) => l.action_type === 'LOGIN_SUCCESS' && l.user_name === 'Muhammad Asghar (Owner)')).toBe(true);
+    expect(list.body.some((l: any) => l.action_type === 'LOGIN_SUCCESS' && l.user_name === 'Muhammad Asghar (Owner)')).toBe(true);
   });
 
   it('ADMIN can clear the audit log (the clear itself is logged)', async () => {
@@ -263,9 +262,9 @@ describe('super admin (multi-store)', () => {
     const t = ((await sa.get('/superadmin/tenants')).body as any[]).find((x: any) => x.owner_email === 'iso@test.local');
     const owner = new Api();
     owner.token = (await sa.post(`/superadmin/tenants/${t.id}/login-as`, {})).body.token;
-    // [LEGACY-BUG] on first boot store #1 rows have tenant_id NULL, and NULL rows are visible to every store
-    const inv = (await owner.get('/inventory')).body;
-    expect(inv.length).toBe(12);
+    // first-boot fix (was: store #1's products, stored with tenant_id NULL, were visible to every store)
+    expect((await owner.get('/inventory')).body).toEqual([]);
+    expect((await owner.get('/customers')).body).toEqual([]);
   });
 
   it('[LEGACY-SECURITY] an ADMIN of any store can clear the audit log of every store', async () => {

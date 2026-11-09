@@ -1,0 +1,56 @@
+:root { --bg: #0f172a; --panel: #111c33; --line: #24324f; --text: #e2e8f0; --muted: #94a3b8; --accent: #10b981; --accent-dark: #059669; --danger: #f43f5e; }
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.5 "Segoe UI", system-ui, sans-serif; background: var(--bg); color: var(--text); }
+header { display: flex; justify-content: space-between; align-items: center; padding: 14px 28px; border-bottom: 1px solid var(--line); }
+.brand { display: flex; gap: 12px; align-items: center; }
+.brand small { display: block; color: var(--muted); font-size: 11px; }
+.logo { width: 34px; height: 34px; border-radius: 9px; background: var(--accent); color: #022c22; font-weight: 800; display: grid; place-items: center; font-size: 18px; }
+main { max-width: 980px; margin: 0 auto; padding: 28px; }
+h1 { font-size: 24px; margin: 0 0 6px; }
+h2 { font-size: 16px; margin: 0 0 6px; }
+h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 8px; }
+.lead { color: var(--muted); margin: 0 0 22px; }
+.hidden { display: none !important; }
+.cards { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 22px; }
+.cards.two { grid-template-columns: repeat(2, 1fr); }
+.card { text-align: left; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 18px; color: var(--text); cursor: pointer; font: inherit; }
+.card:hover, .card:focus { border-color: var(--accent); outline: none; }
+.card p { color: var(--muted); margin: 0; }
+form label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 12px; }
+input { display: block; width: 100%; margin-top: 4px; padding: 9px 10px; border-radius: 8px; border: 1px solid var(--line); background: #0b1324; color: var(--text); font: inherit; }
+input:focus { border-color: var(--accent); outline: none; }
+input.code { font-family: Consolas, monospace; letter-spacing: .2em; text-transform: uppercase; }
+.grid { display: grid; grid-template-columns: 1fr 1fr; gap: 0 16px; }
+.wide { grid-column: span 2; }
+.check { display: flex; gap: 8px; align-items: center; color: var(--text); font-size: 13px; }
+.check input { width: auto; margin: 0; }
+.hint { color: var(--muted); font-size: 12px; }
+.muted { color: var(--muted); }
+.actions { margin-top: 18px; display: flex; gap: 10px; }
+button { font: inherit; }
+.primary { background: var(--accent); color: #022c22; border: 0; border-radius: 8px; padding: 10px 18px; font-weight: 700; cursor: pointer; }
+.primary:hover { background: var(--accent-dark); color: #fff; }
+.primary:disabled { opacity: .5; cursor: wait; }
+.ghost { background: transparent; color: var(--muted); border: 1px solid var(--line); border-radius: 8px; padding: 8px 14px; cursor: pointer; }
+.ghost:hover { color: var(--text); }
+.danger-ghost { background: transparent; color: var(--danger); border: 1px solid #5b2333; border-radius: 8px; padding: 8px 14px; cursor: pointer; }
+.alert { padding: 10px 14px; border-radius: 8px; margin-bottom: 16px; white-space: pre-wrap; }
+.alert.error { background: #3b0d18; border: 1px solid #7f1d35; color: #fecdd3; }
+.alert.ok { background: #052e22; border: 1px solid #065f46; color: #a7f3d0; }
+.split { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 18px; }
+.list { display: grid; gap: 8px; margin-bottom: 10px; }
+.host { text-align: left; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; color: var(--text); cursor: pointer; }
+.host:hover { border-color: var(--accent); }
+.host small { display: block; color: var(--muted); }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; margin-bottom: 16px; }
+dl { display: grid; grid-template-columns: 200px 1fr; gap: 6px 14px; margin: 0; }
+dt { color: var(--muted); }
+dd { margin: 0; word-break: break-all; }
+.pill { display: inline-block; padding: 1px 8px; border-radius: 99px; font-size: 12px; font-weight: 700; }
+.pill.good { background: #064e3b; color: #6ee7b7; }
+.pill.bad { background: #4c0519; color: #fda4af; }
+.pill.warn { background: #422006; color: #fcd34d; }
+.bigcode { font: 700 28px/1.2 Consolas, monospace; letter-spacing: .25em; color: #6ee7b7; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); }
+th { color: var(--muted); font-weight: 600; }

@@ -166,7 +166,7 @@ export const PurchaseScreen: React.FC = () => {
       supplier: supp,
       poNumber: invoiceNumber || `PO-${Date.now().toString().slice(-6)}`,
       items: purchaseItems,
-      notes: notes || 'Official Purchase Order generated from Khushi Medical Hall POS',
+      notes: notes || 'Official Purchase Order',
       purchaseDate: new Date().toISOString()
     });
   };

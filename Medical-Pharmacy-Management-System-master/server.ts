@@ -10,12 +10,23 @@ import { DbAdapter } from './server/db/adapter';
 import { openDatabase, checkExistingDatabase, DatabaseIntegrityError } from './server/db/open';
 import { MigrationError } from './server/db/migrate';
 import { transactionalRoute } from './server/db/transactionalRoute';
-import { createServer as createViteServer } from 'vite';
+import { seedLegacyTestData, seedDemoCatalog, defaultSettingsForNewStore } from './server/seed';
+import https from 'node:https';
+import os from 'node:os';
+import { z } from 'zod';
+import { API_PROTOCOL, APP_VERSION, serverMode, isLoopback, normalizeAddress, localIPv4Addresses } from './server/config';
+import { lanGuard } from './server/lan/guard';
+import { PairingManager, PairingError, hashToken, safeEqualHex } from './server/lan/pairing';
+import { certificateFingerprint, shortFingerprint } from './server/lan/tls';
+import { loadOrCreateJwtSecret } from './server/security/jwtSecret';
+import { currentVersion } from './server/db/migrate';
 
 const PORT = Number(process.env.PHARMACY_PORT) || 3000;
-const JWT_SECRET = process.env.JWT_SECRET || 'khushi_medical_hall_secret_key_2026';
+// C8: per-installation secret (set in startServer). The original public fallback secret is gone.
+let JWT_SECRET = '';
 const DATA_DIR = process.env.PHARMACY_DATA_DIR ? path.resolve(process.env.PHARMACY_DATA_DIR) : path.join(process.cwd(), 'data');
-const DB_FILE = path.join(DATA_DIR, 'khushi_pharmacy.sqlite');
+// The desktop app uses 'pharmacy.sqlite'; tests and the legacy browser setup keep the original name.
+const DB_FILE = path.join(DATA_DIR, process.env.PHARMACY_DB_FILENAME || 'khushi_pharmacy.sqlite');
 
 if (!fs.existsSync(DATA_DIR)) {
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -25,7 +36,22 @@ let db: DbAdapter;
 const BACKUP_DIR = path.join(DATA_DIR, 'backups');
 
 /** Wrap a synchronous route handler in one DB transaction (response sent only after COMMIT). */
-const tx = <H extends (...args: any[]) => any>(handler: H) => transactionalRoute(() => db, handler as any);
+// Crash-test hook (tests only): PHARMACY_TEST_CRASH="<before-commit|after-commit>:<METHOD> <path>" hard-kills the
+// process at that point of the matching request. Unset in normal use, so it does nothing.
+const crashSpec = (process.env.PHARMACY_TEST_CRASH || '').match(/^(before-commit|after-commit):(\w+) (\S+)$/);
+const crashIf = (point: string) => (req: express.Request) => {
+  if (crashSpec && crashSpec[1] === point && req.method === crashSpec[2] && req.path === crashSpec[3]) {
+    // PHARMACY_TEST_CRASH_ONCE_FILE: crash only the first time (a marker file records that it happened)
+    const once = process.env.PHARMACY_TEST_CRASH_ONCE_FILE;
+    if (once) {
+      if (fs.existsSync(once)) return;
+      fs.writeFileSync(once, new Date().toISOString());
+    }
+    process.kill(process.pid, 'SIGKILL');
+  }
+};
+const txHooks = crashSpec ? { beforeCommit: crashIf('before-commit'), afterCommit: crashIf('after-commit') } : {};
+const tx = <H extends (...args: any[]) => any>(handler: H) => transactionalRoute(() => db, handler as any, txHooks);
 
 // Database Initialization with Tables and Sample Data
 async function initDatabase() {
@@ -34,224 +60,44 @@ async function initDatabase() {
   const opened = await openDatabase(DB_FILE, { backupDir: BACKUP_DIR, log: (m) => console.log(`[DB] ${m}`) });
   db = opened.db;
 
-  // Legacy startup data tasks (unchanged behaviour; scheduled for approved removal in later phases).
+  // Startup data tasks. Idempotent and safe on every start:
+  //  - no accounts are created, re-activated, renamed or have their password changed (C4, R8)
+  //  - no barcodes are invented (C11)
+  //  - optional seeding runs BEFORE the tenant backfill so seeded rows get tenant #1 (first-boot bug)
   db.transaction(() => {
+    const userCount = db.get<{ n: number }>("SELECT COUNT(*) AS n FROM users WHERE is_placeholder = 0")!.n;
+    if (userCount === 0 && process.env.PHARMACY_TEST_LEGACY_SEED === '1') {
+      console.log('[DB] PHARMACY_TEST_LEGACY_SEED=1: loading the original demo seed (tests only)');
+      seedLegacyTestData(db);
+    }
+
+    // Default message templates (only fill keys that are missing; existing pharmacies keep their own text)
+    for (const [k, v] of [
+      ['msg_template_udhar_reminder', 'Dear {name}, your outstanding balance at {store_name} is Rs. {balance}. Kindly clear it at your earliest convenience. Thank you!'],
+      ['msg_template_payment_receipt', 'Dear {name}, we have received your payment. Your remaining balance at {store_name} is Rs. {balance}. Thank you!'],
+      ['msg_template_refill', 'Dear {name}, your regular medicine at {store_name} may be running low. Visit us for a refill.'],
+      ['msg_template_welcome', 'Dear {name}, welcome to {store_name}! Your account is active. Thank you!'],
+    ]) db.run("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", [k, v]);
+
     db.run("UPDATE tenants SET allowed_services = 'POS_BILLING,INVENTORY,UDHAR_KHATTA,PURCHASES,REPORTS,EMAIL_ALERTS,USER_VERIFY,USER_REGISTER,USER_RESET_PASSWORD,AUDIT_LOGS,SETTINGS,CUSTOMER_PORTAL' WHERE allowed_services IS NULL OR allowed_services = ''");
 
-    // Guarantee default flagship store tenant #1
-    const tenantCheck = queryOne<{ count: number }>("SELECT COUNT(*) as count FROM tenants");
-    if (!tenantCheck || tenantCheck.count === 0) {
-      db.run(`
-        INSERT INTO tenants (id, name, owner_name, owner_email, phone, address, city, status, plan)
-        VALUES (1, 'Khushi Medical Hall', 'Muhammad Asghar', 'admin@khushipos.com', '03000000000', 'Main Bazaar, Lahore', 'Lahore', 'ACTIVE', 'PRO')
-      `);
+    // A database from the oldest app versions has users but no stores: create store #1 from its own settings
+    const hasStore = db.get("SELECT 1 AS x FROM tenants WHERE id = 1");
+    if (!hasStore && db.get("SELECT 1 AS x FROM users WHERE is_placeholder = 0 LIMIT 1")) {
+      const setting = (k: string) => db.get<{ value: string }>("SELECT value FROM settings WHERE key = ?", [k])?.value || '';
+      db.run(
+        "INSERT INTO tenants (id, name, owner_name, owner_email, phone, address, status, plan) VALUES (1, ?, ?, ?, ?, ?, 'ACTIVE', 'PRO')",
+        [setting('store_name') || 'My Pharmacy', setting('owner_name') || 'Owner', `store-1-owner@local.invalid`, setting('phone'), setting('address')],
+      );
     }
-    db.run("UPDATE users SET tenant_id = 1 WHERE tenant_id IS NULL AND role != 'SUPER_ADMIN'");
-    db.run("UPDATE products SET tenant_id = 1 WHERE tenant_id IS NULL");
-    db.run("UPDATE sales_headers SET tenant_id = 1 WHERE tenant_id IS NULL");
-    db.run("UPDATE customers SET tenant_id = 1 WHERE tenant_id IS NULL");
-    db.run("UPDATE categories SET tenant_id = 1 WHERE tenant_id IS NULL");
-    db.run("UPDATE suppliers SET tenant_id = 1 WHERE tenant_id IS NULL");
-    db.run("UPDATE purchase_headers SET tenant_id = 1 WHERE tenant_id IS NULL");
-    db.run("UPDATE stock_adjustments SET tenant_id = 1 WHERE tenant_id IS NULL");
-    db.run("UPDATE settings SET tenant_id = 1 WHERE tenant_id IS NULL");
-
-    db.run("UPDATE users SET status = 'APPROVED' WHERE status IS NULL OR status = ''");
-    db.run("UPDATE products SET barcode = '8901000000' || PRINTF('%03d', id) WHERE barcode IS NULL OR barcode = ''");
-    // Always guarantee admin user has ADMIN role and Owner Name: Muhammad Asghar
-    db.run("UPDATE users SET full_name = 'Muhammad Asghar (Owner)', role = 'ADMIN', status = 'APPROVED' WHERE username = 'admin'");
-
-    // Default pre-written message templates in settings
-    db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('owner_name', 'Muhammad Asghar')");
-    db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('msg_template_udhar_reminder', 'محترم {name} صاحب! خوشی میڈیکل ہال پر آپ کا بقیہ ادھار رقم Rs. {balance} ہے۔ برائے مہربانی اپنا ادھار کھاتہ جلد از جلد صاف فرمائیں۔ شکریہ! - Khushi Medical Hall')");
-    db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('msg_template_payment_receipt', 'محترم {name}! خوشی میڈیکل ہال میں آپ کی طرف سے رقم موصول ہو گئی ہے۔ آپ کا بقیہ کھاتہ Rs. {balance} ہے۔ شکریہ! - Khushi Medical Hall')");
-    db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('msg_template_refill', 'Dear {name}, your regular medicine prescription stock at Khushi Medical Hall may be finishing soon. Visit us today for fresh refill & discounts! - Khushi Medical Hall')");
-    db.run("INSERT OR IGNORE INTO settings (key, value) VALUES ('msg_template_welcome', 'Dear {name}, welcome to Khushi Medical Hall! Your account is active. Thank you!')");
-
-    // Check if users exist; if not seed default users & sample Pakistani pharmacy data
-    const count = db.get<{ count: number }>("SELECT COUNT(*) as count FROM users")!.count;
-
-    if (count === 0) {
-      console.log("Seeding initial database with sample data for Khushi Medical Hall...");
-      const adminPassHash = bcrypt.hashSync('admin123', 10);
-      const staffPassHash = bcrypt.hashSync('staff123', 10);
-      const customerPassHash = bcrypt.hashSync('customer123', 10);
-
-      // Seed Categories
-      const categories = [
-        'Tablets', 'Capsules', 'Syrups', 'Injections', 'Surgical', 
-        'Medical Devices', 'Baby Products', 'Personal Care', 'Food Items', 'Beverages', 'Tissue'
-      ];
-      categories.forEach(cat => {
-        db.run("INSERT INTO categories (name, description) VALUES (?, ?)", [cat, `${cat} section`]);
-      });
-
-      // Seed Suppliers
-      db.run("INSERT INTO suppliers (name, phone, company, address) VALUES (?, ?, ?, ?)", [
-        'GlaxoSmithKline (GSK) Pakistan', '042-35800100', 'GSK Pharma', 'Gulberg III, Lahore'
-      ]);
-      db.run("INSERT INTO suppliers (name, phone, company, address) VALUES (?, ?, ?, ?)", [
-        'Sami Pharmaceuticals', '021-35061200', 'Sami Pharma', 'Korangi Industrial Area, Karachi'
-      ]);
-      db.run("INSERT INTO suppliers (name, phone, company, address) VALUES (?, ?, ?, ?)", [
-        'Abbott Laboratories Pakistan', '021-35610211', 'Abbott', 'Landhi, Karachi'
-      ]);
-
-      // Seed Customers
-      db.run("INSERT INTO customers (name, phone, address, opening_balance, current_balance, login_id) VALUES (?, ?, ?, ?, ?, ?)", [
-        'Chaudhry Muhammad Ali', '03001234567', 'House #42, Street 5, Main Bazaar, Lahore', 0, 2450.00, '03001234567'
-      ]);
-      db.run("INSERT INTO customers (name, phone, address, opening_balance, current_balance, login_id) VALUES (?, ?, ?, ?, ?, ?)", [
-        'Tariq Mahmood', '03219876543', 'Plaza #12, Commercial Market, Rawalpindi', 0, 1200.00, '03219876543'
-      ]);
-      db.run("INSERT INTO customers (name, phone, address, opening_balance, current_balance, login_id) VALUES (?, ?, ?, ?, ?, ?)", [
-        'Dr. Rashid Ahmad', '03335554433', 'Civil Hospital Road, Multan', 0, 0.00, '03335554433'
-      ]);
-
-      // Seed Users
-      db.run("INSERT INTO users (username, password_hash, role, full_name, phone) VALUES (?, ?, ?, ?, ?)", [
-        'admin', adminPassHash, 'ADMIN', 'Muhammad Asghar (Owner)', '03000000000'
-      ]);
-      db.run("INSERT INTO users (username, password_hash, role, full_name, phone) VALUES (?, ?, ?, ?, ?)", [
-        'staff', staffPassHash, 'STAFF', 'Hamza Khan (Pharmacist)', '03111111111'
-      ]);
-      db.run("INSERT INTO users (username, password_hash, role, full_name, phone, customer_id) VALUES (?, ?, ?, ?, ?, ?)", [
-        '03001234567', customerPassHash, 'CUSTOMER', 'Chaudhry Muhammad Ali', '03001234567', 1
-      ]);
-
-      // Seed Products
-      const sampleProducts = [
-        ['Panadol Extra 500mg', 'Pack', 180, 220, 15, 120, 'B-8910', '2027-10-15', 1, '3004.90', 0, 'Rack A1', 1],
-        ['Augmentin 625mg Tablets', 'Pack', 310, 380, 10, 45, 'AG-442', '2026-11-20', 1, '3004.90', 0, 'Rack A2', 1],
-        ['Brufen 400mg Tablets', 'Pack', 140, 175, 20, 80, 'BF-109', '2027-04-10', 1, '3004.90', 0, 'Rack A1', 2],
-        ['Risek 20mg Capsules', 'Pack', 240, 310, 15, 60, 'RK-221', '2026-12-05', 2, '3004.90', 0, 'Rack B1', 3],
-        ['Hydryllin Syrup 120ml', 'Bottle', 110, 145, 10, 35, 'HY-908', '2026-09-30', 3, '3004.90', 0, 'Rack C1', 2],
-        ['Calamox 625mg Tablets', 'Pack', 290, 360, 10, 8, 'CX-771', '2026-08-15', 1, '3004.90', 0, 'Rack A3', 2], // Low stock!
-        ['Cac 1000 Effervescent', 'Tube', 210, 260, 10, 25, 'CAC-33', '2026-08-01', 3, '3004.90', 0, 'Rack B2', 3], // Expiring soon!
-        ['Dettol Antiseptic Liquid 100ml', 'Bottle', 160, 200, 12, 40, 'DT-001', '2028-01-01', 8, '3401.11', 18, 'Rack E1', 1],
-        ['Pampers Baby Wipes 64s', 'Pack', 350, 430, 8, 22, 'PW-64', '2027-06-30', 7, '3401.11', 18, 'Rack F2', 3],
-        ['Johnson Baby Lotion 200ml', 'Bottle', 420, 520, 10, 18, 'JBL-20', '2027-08-12', 7, '3401.11', 18, 'Rack F1', 3],
-        ['Rose Petal Tissue Box 200s', 'Box', 180, 230, 15, 50, 'RP-200', '2029-01-01', 11, '4818.10', 18, 'Rack G1', 2],
-        ['Nestle Pure Life Water 1.5L', 'Bottle', 80, 110, 24, 60, 'NW-15', '2027-01-01', 10, '2201.10', 18, 'Rack H1', 2]
-      ];
-
-      sampleProducts.forEach(p => {
-        db.run(
-          `INSERT INTO products 
-          (name, unit, purchase_price, sale_price, min_stock, stock, batch_number, expiry_date, category_id, hsn_code, gst_rate, rack_location, supplier_id) 
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-          p
-        );
-      });
-
-      // Seed Initial Customer Ledger & Sale
-      const today = new Date().toISOString().split('T')[0];
-      db.run(`INSERT INTO sales_headers 
-        (invoice_number, customer_id, sale_date, total_amount, discount_percent, discount_amount, net_amount, total_gst, grand_total, payment_method, amount_paid, amount_due, payment_status, created_by_user_id) 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ['INV-1001', 1, `${today} 10:30:00`, 2650.00, 0, 0, 2650.00, 0, 2650.00, 'PARTIAL', 200.00, 2450.00, 'PARTIAL', 1]
-      );
-
-      db.run(`INSERT INTO sale_items (sale_id, product_id, quantity, unit, sale_price, cost_price, discount_percent, discount_amount, gst_amount, batch_number, expiry_date, subtotal)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [1, 1, 2, 'Pack', 220, 180, 0, 0, 0, 'B-8910', '2027-10-15', 440]
-      );
-      db.run(`INSERT INTO sale_items (sale_id, product_id, quantity, unit, sale_price, cost_price, discount_percent, discount_amount, gst_amount, batch_number, expiry_date, subtotal)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [1, 2, 5, 'Pack', 380, 310, 0, 0, 0, 'AG-442', '2026-11-20', 1900]
-      );
-
-      db.run(`INSERT INTO customer_ledger (customer_id, transaction_date, type, reference, debit, credit, balance_after, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        [1, `${today} 10:30:00`, 'SALE', 'Invoice #INV-1001', 2650.00, 200.00, 2450.00, 'Partial cash payment Rs. 200, Udhar Rs. 2450']
-      );
-
-      db.run(`INSERT INTO sms_queue (customer_id, phone, message, type, status) VALUES (?, ?, ?, ?, ?)`,
-        [1, '03001234567', 'Dear Chaudhry Muhammad Ali, thank you for visiting Khushi Medical Hall. Invoice #INV-1001. Amount Paid: Rs. 200. Current Udhar Balance: Rs. 2450.', 'PAYMENT_CONFIRMATION', 'PENDING']
-      );
-
-      // Default Settings
-      const defaultSettings = [
-        ['store_name', 'Khushi Medical Hall'],
-        ['store_urdu_name', 'خوشی میڈیکل ہال'],
-        ['address', 'Main Bazaar, Near Civil Hospital, Lahore'],
-        ['phone', '0300-1234567 / 042-35551234'],
-        ['ntn_number', 'NTN-7894561-2'],
-        ['receipt_footer', 'Get well soon! Check expiry before use. Goods once sold are not returnable without bill.'],
-        ['printer_type', 'THERMAL_80MM'],
-        ['printer_address', 'USB001'],
-        ['smtp_host', 'smtp.gmail.com'],
-        ['smtp_port', '587'],
-        ['smtp_user', 'khushi.pharmacy@gmail.com'],
-        ['smtp_pass', ''],
-        ['smtp_secure', 'tls'],
-        ['smtp_from_email', 'khushi.pharmacy@gmail.com'],
-        ['smtp_from_name', 'Khushi Medical Hall'],
-        ['smtp_enabled', 'true'],
-        ['twilio_account_sid', ''],
-        ['twilio_auth_token', ''],
-        ['twilio_from_phone', ''],
-        ['sms_enabled', 'true'],
-        ['auto_backup_enabled', 'true'],
-        ['backup_interval_hours', '24']
-      ];
-
-      defaultSettings.forEach(([k, v]) => {
-        db.run("INSERT INTO settings (key, value) VALUES (?, ?)", [k, v]);
-      });
-    }
-
-    // Always ensure SUPER_ADMIN accounts exist for platform supervision
-    try {
-      const superAdminPassHash = bcrypt.hashSync('admin123', 10);
-      const umarPassHash = bcrypt.hashSync('Um@r.1080db', 10);
-      
-      const existingSuperAdmin = queryOne("SELECT id FROM users WHERE username = ?", ['superadmin']);
-      if (!existingSuperAdmin) {
-        db.run(
-          "INSERT INTO users (username, password_hash, role, full_name, email, phone, status) VALUES (?, ?, 'SUPER_ADMIN', ?, ?, ?, 'APPROVED')",
-          ['superadmin', superAdminPassHash, 'Super Platform Administrator', 'superadmin@khushipos.com', '03000000000']
-        );
-      } else {
-        db.run("UPDATE users SET role = 'SUPER_ADMIN', status = 'APPROVED' WHERE username = ?", ['superadmin']);
+    if (db.get("SELECT 1 AS x FROM tenants WHERE id = 1")) {
+      db.run("UPDATE users SET tenant_id = 1 WHERE tenant_id IS NULL AND role != 'SUPER_ADMIN' AND is_placeholder = 0");
+      for (const t of ['products', 'sales_headers', 'customers', 'categories', 'suppliers', 'purchase_headers', 'stock_adjustments', 'settings']) {
+        db.run(`UPDATE ${t} SET tenant_id = 1 WHERE tenant_id IS NULL${['products', 'sales_headers', 'customers', 'categories', 'suppliers', 'purchase_headers'].includes(t) ? ' AND is_placeholder = 0' : ''}`);
       }
-
-      const umarTargetEmail = 'umarumair75108@gmail.com';
-      const oldUmarEmail = 'umarumair75108db@gmail.com';
-
-      // Check if target user already exists
-      const existingUmarUser = queryOne<any>("SELECT id FROM users WHERE email = ? OR username = ?", [umarTargetEmail, umarTargetEmail]);
-
-      if (existingUmarUser) {
-        // Update existing record
-        db.run(
-          "UPDATE users SET password_hash = ?, role = 'SUPER_ADMIN', status = 'APPROVED', email = ?, username = ? WHERE id = ?",
-          [umarPassHash, umarTargetEmail, umarTargetEmail, existingUmarUser.id]
-        );
-        // Clean up old email user if it's a separate duplicate row
-        db.run("DELETE FROM users WHERE (email = ? OR username = ?) AND id != ?", [oldUmarEmail, oldUmarEmail, existingUmarUser.id]);
-      } else {
-        // Check if old user exists
-        const oldUmarUser = queryOne<any>("SELECT id FROM users WHERE email = ? OR username = ?", [oldUmarEmail, oldUmarEmail]);
-        if (oldUmarUser) {
-          db.run(
-            "UPDATE users SET username = ?, email = ?, password_hash = ?, role = 'SUPER_ADMIN', status = 'APPROVED' WHERE id = ?",
-            [umarTargetEmail, umarTargetEmail, umarPassHash, oldUmarUser.id]
-          );
-        } else {
-          // Insert new user
-          db.run(
-            "INSERT INTO users (username, password_hash, role, full_name, email, phone, status) VALUES (?, ?, 'SUPER_ADMIN', ?, ?, ?, 'APPROVED')",
-            [umarTargetEmail, umarPassHash, 'Umar Umair (Platform Director)', umarTargetEmail, '03001234567']
-          );
-        }
-      }
-
-      db.run("UPDATE users SET role = 'ADMIN' WHERE role = 'SUPER_ADMIN' AND email != ? AND username != 'superadmin'", [umarTargetEmail]);
-    } catch (err) {
-      console.error("Super Admin user setup warning:", err);
     }
-    
+    db.run("UPDATE users SET status = 'APPROVED' WHERE (status IS NULL OR status = '') AND is_placeholder = 0");
+
   });
 
   console.log("SQLite Database initialized successfully.");
@@ -283,6 +129,45 @@ function logAudit(userId: number | undefined | null, userName: string | undefine
   } catch (e) {
     console.error('Audit log creation error:', e);
   }
+}
+
+/** The pharmacy's own name (Settings > store name), used in messages instead of a hardcoded brand. */
+function storeLabel(): string {
+  return db.get<{ value: string }>("SELECT value FROM settings WHERE key = 'store_name'")?.value
+    || db.get<{ name: string }>("SELECT name FROM tenants WHERE id = 1")?.name
+    || 'the pharmacy';
+}
+const NO_EMAIL = 'no-email@local.invalid';
+
+// ---- Archiving (FK2/FK3): records with history are archived, never deleted ----
+function hasHistory(checks: [string, any[]][]): boolean {
+  return checks.some(([sql, params]) => !!db.get(sql, params));
+}
+
+function archiveRow(table: string, id: number, userId: number | undefined | null, reason: string) {
+  db.run(`UPDATE "${table}" SET archived_at = ?, archived_by = ?, archive_reason = ? WHERE id = ?`, [new Date().toISOString(), userId ?? null, reason, id]);
+}
+
+/**
+ * An archived row keeps its UNIQUE values (phone, username, owner email) so its history stays readable.
+ * When a NEW active record needs the same value, rename the archived row's value and remember the original
+ * in archived_key. Only archived rows are ever touched.
+ */
+function releaseArchivedUnique(table: string, column: string, value: string) {
+  if (!value) return;
+  const holder = db.get<{ id: number }>(`SELECT id FROM "${table}" WHERE "${column}" = ? AND archived_at IS NOT NULL`, [value]);
+  if (!holder) return;
+  db.run(`UPDATE "${table}" SET archived_key = COALESCE(archived_key, "${column}"), "${column}" = ? WHERE id = ?`, [`${value}~archived-${holder.id}`, holder.id]);
+}
+
+/** Hidden record that non-customer emails (supplier POs, SMTP tests, platform messages) are attached to. */
+function systemCustomerId(): number {
+  const row = db.get<{ id: number }>("SELECT id FROM customers WHERE phone = '__system_messages__'");
+  if (row) return row.id;
+  return db.run(
+    "INSERT INTO customers (name, phone, opening_balance, current_balance, archived_at, archive_reason, is_placeholder) VALUES ('[System messages]', '__system_messages__', 0, 0, ?, 'System record for non-customer messages', 1)",
+    [new Date().toISOString()],
+  ).lastInsertRowid;
 }
 
 // Password Strength Checker
@@ -338,20 +223,23 @@ function authenticateToken(req: AuthRequest, res: express.Response, next: expres
     }
     const payload = decoded as UserTokenPayload;
 
-    const dbUser = queryOne<any>("SELECT id, status, tenant_id FROM users WHERE id = ?", [payload.id]);
+    const dbUser = queryOne<any>("SELECT id, status, tenant_id, role, customer_id FROM users WHERE id = ?", [payload.id]);
     if (!dbUser || dbUser.status !== 'APPROVED') {
       return res.status(403).json({ error: 'User account is no longer active or approved.' });
     }
 
-    if (payload.role !== 'SUPER_ADMIN' && dbUser.tenant_id) {
+    if (dbUser.role !== 'SUPER_ADMIN' && dbUser.tenant_id) {
       const tenant = queryOne<any>("SELECT status FROM tenants WHERE id = ?", [dbUser.tenant_id]);
-      if (tenant && tenant.status === 'SUSPENDED') {
+      if (tenant && (tenant.status === 'SUSPENDED' || tenant.status === 'DELETED')) {
         return res.status(403).json({ error: 'This pharmacy store account is currently SUSPENDED by Platform Super Admin. Please contact support.' });
       }
     }
 
     req.user = {
       ...payload,
+      // the role and customer link always come from the database, never from the token (S1)
+      role: dbUser.role,
+      customerId: dbUser.customer_id ?? undefined,
       tenant_id: dbUser.tenant_id || payload.tenant_id || 1
     };
     next();
@@ -370,12 +258,175 @@ function requireRoles(roles: (string)[]) {
   };
 }
 
+/**
+ * Configuration sent by the Electron main process when running as a utilityProcess
+ * (TLS key never touches the environment or a plain file), or read from files for tests.
+ */
+let startupMessage: { tls?: { cert: string; key: string }; localToken?: string } | null = null;
+async function receiveStartupMessage(): Promise<void> {
+  const port = (process as any).parentPort;
+  if (!port) return;
+  startupMessage = await new Promise((resolve) => {
+    port.once('message', (e: any) => resolve(e?.data ?? e));
+  });
+}
+
+async function loadTlsMaterial(): Promise<{ cert: string; key: string } | null> {
+  if (startupMessage?.tls) return startupMessage.tls;
+  const c = process.env.PHARMACY_TLS_CERT_FILE, k = process.env.PHARMACY_TLS_KEY_FILE;
+  if (c && k) return { cert: fs.readFileSync(c, 'utf8'), key: fs.readFileSync(k, 'utf8') };
+  return null;
+}
+
 async function startServer() {
+  await receiveStartupMessage();
   await initDatabase();
+
+  JWT_SECRET = loadOrCreateJwtSecret(DATA_DIR);
+  const MODE = serverMode();
+  const tlsMaterial = await loadTlsMaterial();
+  const LOCAL_TOKEN = process.env.PHARMACY_LOCAL_TOKEN || startupMessage?.localToken || '';
+  const BIND = process.env.PHARMACY_BIND || (MODE === 'host' ? '0.0.0.0' : '127.0.0.1');
+  if (!isLoopback(BIND) && !tlsMaterial) {
+    throw new Error(`Refusing to listen on ${BIND} without TLS: network access requires HTTPS (set up the certificate first).`);
+  }
+  const pairing = new PairingManager();
+  const fingerprint = tlsMaterial ? certificateFingerprint(tlsMaterial.cert) : null;
 
   const app = express();
   app.use(cors());
   app.use(express.json({ limit: '50mb' }));
+  app.use('/api', lanGuard({ mode: () => MODE, db: () => db }));
+
+  const fromLoopback = (req: express.Request) => isLoopback(normalizeAddress(req.socket.remoteAddress));
+  const requireLocal = (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (!fromLoopback(req) || !LOCAL_TOKEN || !safeEqualHex(req.get('x-local-token') || '', LOCAL_TOKEN)) {
+      return res.status(403).json({ error: 'Local administration only.' });
+    }
+    next();
+  };
+  const needsSetup = () => !db.get("SELECT 1 AS x FROM users WHERE role IN ('ADMIN', 'SUPER_ADMIN') AND archived_at IS NULL AND is_placeholder = 0 LIMIT 1");
+
+  // ---- Health (public, no secrets) ----
+  app.get('/api/health', (req, res) => {
+    let dbOk = true;
+    try { db.get('SELECT 1 AS x'); } catch { dbOk = false; }
+    res.status(dbOk ? 200 : 503).json({ status: dbOk ? 'ok' : 'db_error', appVersion: APP_VERSION, apiProtocol: API_PROTOCOL, mode: MODE, db: { ok: dbOk }, serverTime: new Date().toISOString() });
+  });
+
+  // ---- First-run setup ----
+  app.get('/api/setup/status', (req, res) => {
+    const store = db.get<{ value: string }>("SELECT value FROM settings WHERE key = 'store_name'")?.value || null;
+    res.json({ needsSetup: needsSetup(), storeName: store, appVersion: APP_VERSION });
+  });
+
+  const InitialAdmin = z.object({
+    storeName: z.string().trim().min(2).max(100),
+    ownerName: z.string().trim().min(2).max(100),
+    username: z.string().trim().min(3).max(50).regex(/^[A-Za-z0-9._@-]+$/, 'letters, digits and . _ @ - only'),
+    password: z.string().min(8).max(200),
+    email: z.string().trim().email().max(150).optional().or(z.literal('')),
+    phone: z.string().trim().max(40).optional().or(z.literal('')),
+    address: z.string().trim().max(200).optional().or(z.literal('')),
+    loadDemoData: z.boolean().optional(),
+  });
+  app.post('/api/setup/initial-admin', tx((req: express.Request, res: express.Response) => {
+    if (!fromLoopback(req)) return res.status(403).json({ error: 'The first administrator can only be created on the server computer itself.' });
+    if (!needsSetup()) return res.status(409).json({ error: 'An administrator already exists. Sign in instead.' });
+    const parsed = InitialAdmin.safeParse(req.body);
+    if (!parsed.success) return res.status(400).json({ error: parsed.error.issues.map((i) => `${i.path.join('.')}: ${i.message}`).join('; ') });
+    const b = parsed.data;
+    if (!isPasswordStrong(b.password)) return res.status(400).json({ error: 'Password must be at least 8 characters long and contain both letters and numbers/symbols.' });
+    if (db.get("SELECT 1 AS x FROM users WHERE username = ? AND archived_at IS NULL", [b.username])) return res.status(409).json({ error: 'That username is already taken.' });
+    releaseArchivedUnique('users', 'username', b.username);
+
+    if (!db.get("SELECT 1 AS x FROM tenants WHERE id = 1")) {
+      db.run("INSERT INTO tenants (id, name, owner_name, owner_email, phone, address, status, plan) VALUES (1, ?, ?, ?, ?, ?, 'ACTIVE', 'PRO')",
+        [b.storeName, b.ownerName, b.email || 'store-1-owner@local.invalid', b.phone || '', b.address || '']);
+    } else {
+      db.run("UPDATE tenants SET name = ?, owner_name = ? WHERE id = 1", [b.storeName, b.ownerName]);
+    }
+    const adminId = db.run(
+      "INSERT INTO users (username, password_hash, role, full_name, email, phone, status, tenant_id) VALUES (?, ?, 'ADMIN', ?, ?, ?, 'APPROVED', 1)",
+      [b.username, bcrypt.hashSync(b.password, 12), b.ownerName, b.email || null, b.phone || null],
+    ).lastInsertRowid;
+    for (const [k, v] of defaultSettingsForNewStore({ name: b.storeName, address: b.address, phone: b.phone })) {
+      db.run("INSERT OR IGNORE INTO settings (key, value, tenant_id) VALUES (?, ?, 1)", [k, v]);
+    }
+    db.run("INSERT OR REPLACE INTO settings (key, value, tenant_id) VALUES ('store_name', ?, 1)", [b.storeName]);
+    db.run("INSERT OR REPLACE INTO settings (key, value, tenant_id) VALUES ('owner_name', ?, 1)", [b.ownerName]);
+    if (b.loadDemoData && !db.get("SELECT 1 AS x FROM products LIMIT 1")) {
+      seedDemoCatalog(db, adminId);
+      for (const t of ['products', 'sales_headers', 'customers', 'categories', 'suppliers']) db.run(`UPDATE ${t} SET tenant_id = 1 WHERE tenant_id IS NULL AND is_placeholder = 0`);
+    }
+    logAudit(adminId, b.ownerName, 'SETUP_INITIAL_ADMIN', `First-run setup: store "${b.storeName}" and administrator "${b.username}" created${b.loadDemoData ? ' (with demo catalogue)' : ''}`, 'USER', adminId, req, 1);
+    res.json({ ok: true, username: b.username });
+  }));
+
+  // ---- Local administration for the Electron main process (loopback + local token) ----
+  app.get('/api/local/host-status', requireLocal, (req, res) => {
+    let sizeBytes = 0;
+    try { sizeBytes = fs.statSync(DB_FILE).size + (fs.existsSync(`${DB_FILE}-wal`) ? fs.statSync(`${DB_FILE}-wal`).size : 0); } catch {}
+    const backups = fs.existsSync(BACKUP_DIR) ? fs.readdirSync(BACKUP_DIR).filter((f) => f.endsWith('.sqlite')).map((f) => fs.statSync(path.join(BACKUP_DIR, f)).mtime.toISOString()).sort() : [];
+    const clients = db.all<any>("SELECT id, client_id, name, created_at, last_seen_at, last_ip, revoked_at FROM paired_clients ORDER BY id DESC");
+    const onlineSince = Date.now() - 60_000;
+    res.json({
+      mode: MODE, hostName: os.hostname(), addresses: localIPv4Addresses(), port: PORT, appVersion: APP_VERSION, apiProtocol: API_PROTOCOL,
+      fingerprint, fingerprintShort: fingerprint ? shortFingerprint(fingerprint) : null,
+      pairing: MODE === 'host' ? pairing.current() : null,
+      clients, connectedClients: clients.filter((c) => !c.revoked_at && c.last_seen_at && Date.parse(c.last_seen_at) > onlineSince).length,
+      db: { ok: true, file: DB_FILE, sizeBytes, schemaVersion: currentVersion(db), integrity: 'checked at startup' },
+      lastBackup: backups.length ? backups[backups.length - 1] : null,
+      needsSetup: needsSetup(),
+    });
+  });
+  app.post('/api/local/pairing/rotate', requireLocal, (req, res) => { pairing.rotate(); res.json(pairing.current()); });
+  app.post('/api/local/clients/:id/revoke', requireLocal, tx((req: express.Request, res: express.Response) => {
+    const r = db.run("UPDATE paired_clients SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", [new Date().toISOString(), Number(req.params.id)]);
+    if (r.changes) logAudit(null, 'Host computer', 'LAN_CLIENT_REVOKED', `Revoked LAN client #${req.params.id}`, 'LAN_CLIENT', Number(req.params.id), req, 1);
+    res.json({ revoked: r.changes === 1 });
+  }));
+
+  // ---- Pairing (host mode, private network only - enforced by lanGuard) ----
+  const pairAttempts = new Map<string, { n: number; reset: number }>();
+  const pairLimited = (ip: string) => {
+    const now = Date.now();
+    const e = pairAttempts.get(ip) && pairAttempts.get(ip)!.reset > now ? pairAttempts.get(ip)! : { n: 0, reset: now + 10 * 60_000 };
+    e.n++;
+    pairAttempts.set(ip, e);
+    return e.n > 20;
+  };
+  app.post('/api/pair/start', (req, res) => {
+    if (MODE !== 'host' || !fingerprint) return res.status(404).json({ error: 'This computer is not set up as a pharmacy server.' });
+    if (pairLimited(normalizeAddress(req.socket.remoteAddress))) return res.status(429).json({ error: 'Too many pairing attempts. Wait 10 minutes.' });
+    try {
+      const r = pairing.start(String(req.body?.clientNonce || ''), fingerprint);
+      res.json({ ...r, hostName: os.hostname(), appVersion: APP_VERSION, apiProtocol: API_PROTOCOL });
+    } catch (e: any) {
+      res.status(e instanceof PairingError ? e.status : 500).json({ error: e.message });
+    }
+  });
+  app.post('/api/pair/complete', tx((req: express.Request, res: express.Response) => {
+    if (MODE !== 'host' || !fingerprint) return res.status(404).json({ error: 'This computer is not set up as a pharmacy server.' });
+    const ip = normalizeAddress(req.socket.remoteAddress);
+    const name = String(req.body?.clientName || 'Unnamed computer').replace(/[^\w .@()-]/g, '').slice(0, 60) || 'Unnamed computer';
+    let ok = false;
+    try {
+      ok = pairing.complete(String(req.body?.serverNonce || ''), String(req.body?.clientProof || ''));
+    } catch (e: any) {
+      return res.status(e instanceof PairingError ? e.status : 500).json({ error: e.message });
+    }
+    if (!ok) {
+      logAudit(null, name, 'LAN_PAIR_FAILED', `Failed pairing attempt from ${ip} (wrong code)`, 'LAN_CLIENT', undefined, req, 1);
+      return res.status(403).json({ error: 'Wrong pairing code.' });
+    }
+    const clientToken = crypto.randomBytes(32).toString('hex');
+    const clientId = crypto.randomUUID();
+    const id = db.run("INSERT INTO paired_clients (client_id, name, token_hash, created_at, last_ip) VALUES (?, ?, ?, ?, ?)",
+      [clientId, name, hashToken(clientToken), new Date().toISOString(), ip]).lastInsertRowid;
+    logAudit(null, name, 'LAN_PAIR_SUCCESS', `Paired LAN client "${name}" from ${ip}`, 'LAN_CLIENT', id, req, 1);
+    res.json({ clientId, clientToken, hostName: os.hostname() });
+  }));
 
   // API Routes
 
@@ -479,7 +530,7 @@ async function startServer() {
     logAudit(newUser ? newUser.id : null, cleanName, 'USER_REGISTER', `New user registered (${cleanEmail}, Role: ${userRole}). Awaiting Admin Approval.`, 'USER', newUser ? newUser.id : undefined, req);
 
     res.json({
-      message: 'Registration submitted successfully! Your account is currently PENDING verification by the Admin. You can log in once approved by Khushi Medical Hall Admin.'
+      message: `Registration submitted successfully! Your account is currently PENDING verification by the Admin. You can log in once approved by ${storeLabel()} Admin.`
     });
   }));
 
@@ -548,10 +599,10 @@ async function startServer() {
 
   // Super Admin Management APIs
   app.get('/api/superadmin/metrics', authenticateToken, requireRoles(['SUPER_ADMIN']), (req, res) => {
-    const totalTenantsRes = queryOne<any>("SELECT COUNT(*) as count FROM tenants");
+    const totalTenantsRes = queryOne<any>("SELECT COUNT(*) as count FROM tenants WHERE archived_at IS NULL");
     const activeTenantsRes = queryOne<any>("SELECT COUNT(*) as count FROM tenants WHERE status = 'ACTIVE'");
     const totalSalesRes = queryOne<any>("SELECT COUNT(*) as count, COALESCE(SUM(grand_total), 0) as revenue FROM sales_headers");
-    const totalUsersRes = queryOne<any>("SELECT COUNT(*) as count FROM users");
+    const totalUsersRes = queryOne<any>("SELECT COUNT(*) as count FROM users WHERE archived_at IS NULL");
 
     res.json({
       totalTenants: totalTenantsRes?.count || 0,
@@ -563,10 +614,10 @@ async function startServer() {
   });
 
   app.get('/api/superadmin/tenants', authenticateToken, requireRoles(['SUPER_ADMIN']), (req, res) => {
-    const tenants = queryAll<any>("SELECT * FROM tenants ORDER BY id DESC");
+    const tenants = queryAll<any>("SELECT * FROM tenants WHERE archived_at IS NULL ORDER BY id DESC");
     const enriched = tenants.map(t => {
-      const userCount = queryOne<any>("SELECT COUNT(*) as count FROM users WHERE tenant_id = ?", [t.id])?.count || 0;
-      const productCount = queryOne<any>("SELECT COUNT(*) as count FROM products WHERE tenant_id = ?", [t.id])?.count || 0;
+      const userCount = queryOne<any>("SELECT COUNT(*) as count FROM users WHERE tenant_id = ? AND archived_at IS NULL", [t.id])?.count || 0;
+      const productCount = queryOne<any>("SELECT COUNT(*) as count FROM products WHERE tenant_id = ? AND archived_at IS NULL", [t.id])?.count || 0;
       const salesTotal = queryOne<any>("SELECT COALESCE(SUM(grand_total), 0) as total FROM sales_headers WHERE tenant_id = ?", [t.id])?.total || 0;
 
       return {
@@ -586,10 +637,10 @@ async function startServer() {
       return res.status(404).json({ error: 'Pharmacy store tenant not found.' });
     }
 
-    const users = queryAll<any>("SELECT id, username, role, full_name, email, phone, status, tenant_id, created_at FROM users WHERE tenant_id = ? ORDER BY id DESC", [tenantId]);
+    const users = queryAll<any>("SELECT id, username, role, full_name, email, phone, status, tenant_id, created_at FROM users WHERE tenant_id = ? AND archived_at IS NULL ORDER BY id DESC", [tenantId]);
     const sales = queryAll<any>("SELECT * FROM sales_headers WHERE tenant_id = ? ORDER BY id DESC LIMIT 100", [tenantId]);
-    const products = queryAll<any>("SELECT * FROM products WHERE tenant_id = ? ORDER BY id DESC LIMIT 100", [tenantId]);
-    const customers = queryAll<any>("SELECT * FROM customers WHERE tenant_id = ? ORDER BY id DESC LIMIT 100", [tenantId]);
+    const products = queryAll<any>("SELECT * FROM products WHERE tenant_id = ? AND archived_at IS NULL ORDER BY id DESC LIMIT 100", [tenantId]);
+    const customers = queryAll<any>("SELECT * FROM customers WHERE tenant_id = ? AND archived_at IS NULL ORDER BY id DESC LIMIT 100", [tenantId]);
     const auditLogs = queryAll<any>(`
       SELECT a.* FROM audit_logs a 
       LEFT JOIN users u ON a.user_id = u.id 
@@ -626,7 +677,8 @@ async function startServer() {
     }
 
     const cleanEmail = owner_email.trim().toLowerCase();
-    const existing = queryOne<any>("SELECT id FROM tenants WHERE owner_email = ?", [cleanEmail]);
+    const existing = queryOne<any>("SELECT id FROM tenants WHERE owner_email = ? AND archived_at IS NULL", [cleanEmail]);
+    if (!existing) releaseArchivedUnique('tenants', 'owner_email', cleanEmail);
     if (existing) {
       return res.status(400).json({ error: 'A store with this owner email address already exists.' });
     }
@@ -685,14 +737,15 @@ async function startServer() {
       return res.status(400).json({ error: 'Cannot delete primary flagship store tenant #1.' });
     }
 
-    db.run("DELETE FROM tenants WHERE id = ?", [tenantId]);
-    db.run("DELETE FROM users WHERE tenant_id = ?", [tenantId]);
-    db.run("DELETE FROM products WHERE tenant_id = ?", [tenantId]);
-    db.run("DELETE FROM sales_headers WHERE tenant_id = ?", [tenantId]);
-    db.run("DELETE FROM customers WHERE tenant_id = ?", [tenantId]);
+    const tenantRow = queryOne<any>("SELECT id, name FROM tenants WHERE id = ? AND archived_at IS NULL", [tenantId]);
+    if (!tenantRow) return res.status(404).json({ error: 'Pharmacy store tenant not found.' });
 
-    logAudit(req.user?.id, req.user?.fullName, 'SUPERADMIN_TENANT_DELETE', `Super Admin deleted store #${tenantId}`, 'TENANT', tenantId, req);
-    res.json({ message: `Store #${tenantId} deleted successfully.` });
+    // FK3: the store is archived (status DELETED, sign-in blocked for its users); none of its data is deleted
+    db.run("UPDATE tenants SET status = 'DELETED' WHERE id = ?", [tenantId]);
+    archiveRow('tenants', tenantId, req.user?.id, 'Deleted by Super Admin; data kept');
+
+    logAudit(req.user?.id, req.user?.fullName, 'SUPERADMIN_TENANT_ARCHIVE', `Super Admin removed store #${tenantId} (${tenantRow.name}); store archived, sign-in disabled, all data kept`, 'TENANT', tenantId, req);
+    res.json({ message: `Store #${tenantId} removed. Its data has been archived and kept; its users can no longer sign in.`, archived: true });
   }));
 
   // Super Admin direct login-as / jump to store account endpoint
@@ -703,7 +756,7 @@ async function startServer() {
       return res.status(404).json({ error: 'Store not found.' });
     }
 
-    if (tenant.status === 'SUSPENDED') {
+    if (tenant.status === 'SUSPENDED' || tenant.status === 'DELETED') {
       return res.status(400).json({ error: 'Cannot access a suspended store. Please activate it first.' });
     }
 
@@ -779,7 +832,7 @@ async function startServer() {
       db.run(`
         INSERT INTO email_queue (customer_id, email, subject, message, type, status, tenant_id)
         VALUES (?, ?, ?, ?, 'WELCOME', 'PENDING', ?)
-      `, [1, r.email, subject, messageBody, r.tenant_id || 1]);
+      `, [systemCustomerId(), r.email, subject, messageBody, r.tenant_id || 1]);
       queuedCount++;
     }
 
@@ -803,7 +856,7 @@ async function startServer() {
       const remainingMinutes = Math.ceil((lockInfo.lockedUntil - Date.now()) / (1000 * 60));
       logAudit(null, cleanUsername, 'LOGIN_BLOCKED_BRUTEFORCE', `Login attempt blocked: Account locked due to 5 consecutive failed login attempts (${cleanUsername}). ${remainingMinutes}m remaining.`, 'AUTH', undefined, req);
       return res.status(429).json({
-        error: `Security Alert: Account temporarily locked due to 5 consecutive failed login attempts. Please try again after ${remainingMinutes} minutes or contact Khushi Medical Hall Admin.`
+        error: `Security Alert: Account temporarily locked due to 5 consecutive failed login attempts. Please try again after ${remainingMinutes} minutes or contact the ${storeLabel()} administrator.`
       });
     }
 
@@ -841,7 +894,7 @@ async function startServer() {
     // Check Admin approval status
     if (user.status === 'PENDING') {
       logAudit(user.id, user.full_name, 'LOGIN_BLOCKED', `Login blocked: Account is PENDING verification by Admin (${user.username})`, 'AUTH', user.id, req);
-      return res.status(403).json({ error: 'Your account is pending verification by the Admin. Please contact Khushi Medical Hall Admin for approval.' });
+      return res.status(403).json({ error: `Your account is pending verification by the Admin. Please contact the ${storeLabel()} administrator for approval.` });
     }
 
     if (user.status === 'REJECTED') {
@@ -849,12 +902,17 @@ async function startServer() {
       return res.status(403).json({ error: 'Your account registration was rejected by the Admin.' });
     }
 
+    if (user.status === 'ARCHIVED' || user.archived_at) {
+      logAudit(user.id, user.full_name, 'LOGIN_BLOCKED', `Login blocked: Account is ARCHIVED (${user.username})`, 'AUTH', user.id, req);
+      return res.status(403).json({ error: 'This account has been archived and can no longer sign in.' });
+    }
+
     if (user.status === 'SUSPENDED') {
       logAudit(user.id, user.full_name, 'LOGIN_BLOCKED', `Login blocked: Account SUSPENDED by Admin (${user.username})`, 'AUTH', user.id, req);
       return res.status(403).json({ error: 'Your account is currently suspended. Please contact Admin.' });
     }
 
-    let tenantName = 'Khushi Medical Hall';
+    let tenantName = storeLabel();
     let tenantStatus = 'ACTIVE';
     let allowedServices = 'POS_BILLING,INVENTORY,UDHAR_KHATTA,PURCHASES,REPORTS,EMAIL_ALERTS,USER_VERIFY,USER_REGISTER,USER_RESET_PASSWORD,AUDIT_LOGS,SETTINGS,CUSTOMER_PORTAL';
 
@@ -871,7 +929,7 @@ async function startServer() {
       allowedServices = user.allowed_services;
     }
 
-    if (user.role !== 'SUPER_ADMIN' && tenantStatus === 'SUSPENDED') {
+    if (user.role !== 'SUPER_ADMIN' && (tenantStatus === 'SUSPENDED' || tenantStatus === 'DELETED')) {
       logAudit(user.id, user.full_name, 'LOGIN_BLOCKED_TENANT_SUSPENDED', `Login blocked: Store tenant "${tenantName}" is SUSPENDED (${user.username})`, 'AUTH', user.id, req);
       return res.status(403).json({ error: 'This pharmacy store account is currently SUSPENDED by Platform Super Admin. Please contact support.' });
     }
@@ -923,7 +981,7 @@ async function startServer() {
       return res.status(404).json({ error: 'No registered user account found for this email address.' });
     }
 
-    if (user.status === 'SUSPENDED' || user.status === 'REJECTED') {
+    if (user.status === 'SUSPENDED' || user.status === 'REJECTED' || user.status === 'ARCHIVED' || user.archived_at) {
       return res.status(403).json({ error: `Account is ${user.status.toLowerCase()}. Please contact Admin.` });
     }
 
@@ -973,11 +1031,14 @@ async function startServer() {
     if (user.status === 'SUSPENDED') {
       return res.status(403).json({ error: 'Your account access has been suspended.' });
     }
+    if (user.status === 'ARCHIVED' || user.archived_at) {
+      return res.status(403).json({ error: 'This account has been archived and can no longer sign in.' });
+    }
 
     // Clear used OTP
     db.run("DELETE FROM otp_verifications WHERE email = ?", [cleanEmail]);
 
-    let tenantName = 'Khushi Medical Hall';
+    let tenantName = storeLabel();
     let tenantStatus = 'ACTIVE';
     let allowedServices = 'POS_BILLING,INVENTORY,UDHAR_KHATTA,PURCHASES,REPORTS,EMAIL_ALERTS,USER_VERIFY,USER_REGISTER,USER_RESET_PASSWORD,AUDIT_LOGS,SETTINGS,CUSTOMER_PORTAL';
 
@@ -1029,7 +1090,7 @@ async function startServer() {
     const user = queryOne<any>("SELECT id, username, role, full_name, email, phone, status, allowed_services, tenant_id, customer_id FROM users WHERE id = ?", [req.user!.id]);
     if (!user) return res.status(404).json({ error: 'User not found' });
 
-    let tenantName = 'Khushi Medical Hall';
+    let tenantName = storeLabel();
     let tenantStatus = 'ACTIVE';
     let allowedServices = 'POS_BILLING,INVENTORY,UDHAR_KHATTA,PURCHASES,REPORTS,EMAIL_ALERTS,USER_VERIFY,USER_REGISTER,USER_RESET_PASSWORD,AUDIT_LOGS,SETTINGS,CUSTOMER_PORTAL';
 
@@ -1072,7 +1133,7 @@ async function startServer() {
       FROM products p
       LEFT JOIN categories c ON p.category_id = c.id
       LEFT JOIN suppliers s ON p.supplier_id = s.id
-      WHERE 1=1
+      WHERE p.archived_at IS NULL
     `;
     const params: any[] = [];
 
@@ -1175,10 +1236,8 @@ async function startServer() {
         sanitizeInput(barcode) || '', userTenantId
       ]);
 
+      // C11: no invented manufacturer barcodes; a product without one simply has none (manual entry later)
       const newProd = queryOne<any>("SELECT id FROM products WHERE tenant_id = ? ORDER BY id DESC LIMIT 1", [userTenantId]);
-      if (newProd && (!barcode || String(barcode).trim() === '')) {
-        db.run("UPDATE products SET barcode = '8901000000' || PRINTF('%03d', id) WHERE id = ?", [newProd.id]);
-      }
       logAudit(req.user?.id, req.user?.fullName, 'PRODUCT_ADD', `Added product "${cleanName}" (Unit: ${cleanUnit}, Sale Price: Rs. ${sPrice}, Initial Stock: ${stock || 0})`, 'PRODUCT', newProd ? newProd.id : undefined, req);
 
       res.json({ message: 'Product added successfully', id: newProd?.id });
@@ -1246,6 +1305,17 @@ async function startServer() {
       return res.status(403).json({ error: 'Access denied: Product belongs to another store.' });
     }
 
+    // FK2: a product with sales/purchase/adjustment history is archived (kept for invoices and reports)
+    if (hasHistory([
+      ["SELECT 1 x FROM sale_items WHERE product_id = ? LIMIT 1", [id]],
+      ["SELECT 1 x FROM purchase_items WHERE product_id = ? LIMIT 1", [id]],
+      ["SELECT 1 x FROM stock_adjustments WHERE product_id = ? LIMIT 1", [id]],
+    ])) {
+      archiveRow('products', id, req.user?.id, 'Deleted by user; kept because it has transaction history');
+      logAudit(req.user?.id, req.user?.fullName, 'PRODUCT_ARCHIVE', `Archived product #${id} (${prod.name}); it has transaction history, which is kept`, 'PRODUCT', id, req);
+      return res.json({ message: 'Product removed from the list. It has sales/purchase history, so it was archived and its history is kept.', archived: true });
+    }
+
     db.run("DELETE FROM products WHERE id = ?", [id]);
 
     logAudit(req.user?.id, req.user?.fullName, 'PRODUCT_DELETE', `Deleted product #${id} (${prod.name})`, 'PRODUCT', id, req);
@@ -1293,9 +1363,9 @@ async function startServer() {
     const userTenantId = req.user?.role === 'SUPER_ADMIN' && req.query.tenant_id ? Number(req.query.tenant_id) : (req.user?.tenant_id || 1);
     let cats: any[];
     if (req.user?.role === 'SUPER_ADMIN') {
-      cats = queryAll("SELECT * FROM categories ORDER BY name ASC");
+      cats = queryAll("SELECT * FROM categories WHERE archived_at IS NULL ORDER BY name ASC");
     } else {
-      cats = queryAll("SELECT * FROM categories WHERE tenant_id = ? OR tenant_id IS NULL ORDER BY name ASC", [userTenantId]);
+      cats = queryAll("SELECT * FROM categories WHERE (tenant_id = ? OR tenant_id IS NULL) AND archived_at IS NULL ORDER BY name ASC", [userTenantId]);
     }
     res.json(cats);
   });
@@ -1325,9 +1395,9 @@ async function startServer() {
     const userTenantId = req.user?.role === 'SUPER_ADMIN' && req.query.tenant_id ? Number(req.query.tenant_id) : (req.user?.tenant_id || 1);
     let supps: any[];
     if (req.user?.role === 'SUPER_ADMIN') {
-      supps = queryAll("SELECT * FROM suppliers ORDER BY name ASC");
+      supps = queryAll("SELECT * FROM suppliers WHERE archived_at IS NULL ORDER BY name ASC");
     } else {
-      supps = queryAll("SELECT * FROM suppliers WHERE tenant_id = ? OR tenant_id IS NULL ORDER BY name ASC", [userTenantId]);
+      supps = queryAll("SELECT * FROM suppliers WHERE (tenant_id = ? OR tenant_id IS NULL) AND archived_at IS NULL ORDER BY name ASC", [userTenantId]);
     }
     res.json(supps);
   });
@@ -1392,6 +1462,15 @@ async function startServer() {
       return res.status(403).json({ error: 'Access denied: Supplier belongs to another store.' });
     }
 
+    if (hasHistory([
+      ["SELECT 1 x FROM purchase_headers WHERE supplier_id = ? LIMIT 1", [id]],
+      ["SELECT 1 x FROM products WHERE supplier_id = ? LIMIT 1", [id]],
+    ])) {
+      archiveRow('suppliers', id, req.user?.id, 'Deleted by user; kept because purchases or products reference it');
+      logAudit(req.user?.id, req.user?.fullName, 'ARCHIVE_SUPPLIER', `Archived supplier #${id} (${supp.name}); purchase history is kept`, 'SUPPLIER', id, req);
+      return res.json({ message: 'Supplier removed from the list. It has purchase history, so it was archived and its history is kept.', archived: true });
+    }
+
     db.run("DELETE FROM suppliers WHERE id = ?", [id]);
 
     logAudit(req.user?.id, req.user?.fullName, 'DELETE_SUPPLIER', `Deleted pharmaceutical supplier #${id}`, 'SUPPLIER', id, req);
@@ -1409,7 +1488,7 @@ async function startServer() {
 
     const userTenantId = req.user?.role === 'SUPER_ADMIN' && req.query.tenant_id ? Number(req.query.tenant_id) : (req.user?.tenant_id || 1);
     const { search } = req.query;
-    let sql = "SELECT * FROM customers WHERE 1=1";
+    let sql = "SELECT * FROM customers WHERE archived_at IS NULL";
     const params: any[] = [];
 
     if (req.user?.role !== 'SUPER_ADMIN') {
@@ -1442,7 +1521,7 @@ async function startServer() {
     const existingByPhone = queryOne<any>(`
       SELECT id, name FROM customers 
       WHERE (REPLACE(REPLACE(phone, '-', ''), ' ', '') = ? OR REPLACE(REPLACE(login_id, '-', ''), ' ', '') = ?) 
-        AND (tenant_id = ? OR tenant_id IS NULL)
+        AND (tenant_id = ? OR tenant_id IS NULL) AND archived_at IS NULL
     `, [cleanPhone, cleanPhone, userTenantId]);
 
     if (existingByPhone) {
@@ -1450,6 +1529,11 @@ async function startServer() {
         error: `Customer '${existingByPhone.name}' is already registered with phone number '${phone}'. Duplication is not allowed.` 
       });
     }
+
+    // An archived customer may still hold this phone / login (kept for their history): free it for the new record
+    releaseArchivedUnique('customers', 'phone', phone.trim());
+    releaseArchivedUnique('customers', 'login_id', cleanPhone);
+    releaseArchivedUnique('users', 'username', cleanPhone);
 
     // Default customer portal password is 'customer123'
     const defaultPasswordHash = bcrypt.hashSync('customer123', 10);
@@ -1550,12 +1634,24 @@ async function startServer() {
       });
     }
 
-    // Delete customer ledger, user login, email queue, and customer record
+    // FK2: a customer with invoices or ledger entries is archived; the ledger and invoices are kept intact
+    if (hasHistory([
+      ["SELECT 1 x FROM sales_headers WHERE customer_id = ? LIMIT 1", [customerId]],
+      ["SELECT 1 x FROM customer_ledger WHERE customer_id = ? LIMIT 1", [customerId]],
+    ])) {
+      archiveRow('customers', customerId, req.user?.id, 'Deleted by user; kept because it has invoices or ledger history');
+      db.run("UPDATE users SET status = 'ARCHIVED', archived_at = ?, archive_reason = 'Customer archived' WHERE customer_id = ? AND role = 'CUSTOMER'", [new Date().toISOString(), customerId]);
+      logAudit(req.user?.id, req.user?.fullName, 'CUSTOMER_ARCHIVE', `Archived customer #${customerId} (${existingCust.name}); invoices and ledger history kept, portal login disabled`, 'CUSTOMER', customerId, req);
+      return res.json({ message: 'Customer removed from the list. They have invoice/ledger history, so the account was archived and the history is kept.', archived: true });
+    }
+
+    // No history: delete as before (ledger is empty), and record it
     db.run("DELETE FROM customer_ledger WHERE customer_id = ?", [customerId]);
     db.run("DELETE FROM email_queue WHERE customer_id = ?", [customerId]);
     db.run("DELETE FROM sms_queue WHERE customer_id = ?", [customerId]);
     db.run("DELETE FROM users WHERE customer_id = ?", [customerId]);
     db.run("DELETE FROM customers WHERE id = ?", [customerId]);
+    logAudit(req.user?.id, req.user?.fullName, 'CUSTOMER_DELETE', `Deleted customer #${customerId} (${existingCust.name}); no transaction history`, 'CUSTOMER', customerId, req);
 
     res.json({ message: 'Customer account deleted successfully' });
   }));
@@ -1646,9 +1742,9 @@ async function startServer() {
     `, [customerId, refStr, payAmt, newBal, notes || '']);
 
     // Queue BOTH Email and WhatsApp/SMS notifications for payment confirmation
-    const emailSubject = `Payment Confirmation - Khushi Medical Hall`;
-    const emailMsg = `Dear ${customer.name},\n\nWe have received your payment of Rs. ${payAmt.toFixed(2)} via ${payment_mode || 'Cash'}.\nYour updated Khushi Medical Hall balance is Rs. ${newBal.toFixed(2)}.\n\nThank you for choosing Khushi Medical Hall!`;
-    const custEmail = (customer as any).email || customer.phone || 'customer@khushimedical.com';
+    const emailSubject = `Payment Confirmation - ${storeLabel()}`;
+    const emailMsg = `Dear ${customer.name},\n\nWe have received your payment of Rs. ${payAmt.toFixed(2)} via ${payment_mode || 'Cash'}.\nYour updated ${storeLabel()} balance is Rs. ${newBal.toFixed(2)}.\n\nThank you for choosing ${storeLabel()}!`;
+    const custEmail = (customer as any).email || customer.phone || NO_EMAIL;
     
     const tId = req.user?.tenant_id || customer.tenant_id || 1;
 
@@ -1659,7 +1755,7 @@ async function startServer() {
     `, [customerId, custEmail, emailSubject, emailMsg, tId]);
 
     // 2. WhatsApp / SMS Notification Queue
-    const smsMsg = `Khushi Medical Hall: Payment Received! Dear ${customer.name}, we received Rs. ${payAmt.toFixed(2)} (${payment_mode || 'Cash'}). Your current Udhar balance is Rs. ${newBal.toFixed(2)}. Thank you!`;
+    const smsMsg = `${storeLabel()}: Payment Received! Dear ${customer.name}, we received Rs. ${payAmt.toFixed(2)} (${payment_mode || 'Cash'}). Your current Udhar balance is Rs. ${newBal.toFixed(2)}. Thank you!`;
     db.run(`
       INSERT INTO sms_queue (customer_id, phone, message, type, status, tenant_id)
       VALUES (?, ?, ?, 'PAYMENT_CONFIRMATION', 'PENDING', ?)
@@ -1680,9 +1776,9 @@ async function startServer() {
       return res.status(403).json({ error: 'Access denied: Customer belongs to another store.' });
     }
 
-    const custEmail = customer.email || customer.phone || 'customer@khushimedical.com';
-    const remSubject = `Udhar Balance Payment Reminder - Khushi Medical Hall`;
-    const defaultEmailBody = message || `Dear ${customer.name},\n\nThis is a friendly reminder regarding your outstanding Udhar balance of Rs. ${customer.current_balance.toFixed(2)} at Khushi Medical Hall.\n\nPlease clear your pending amount at your earliest convenience.\n\nThank you for your cooperation!`;
+    const custEmail = customer.email || customer.phone || NO_EMAIL;
+    const remSubject = `Udhar Balance Payment Reminder - ${storeLabel()}`;
+    const defaultEmailBody = message || `Dear ${customer.name},\n\nThis is a friendly reminder regarding your outstanding Udhar balance of Rs. ${customer.current_balance.toFixed(2)} at ${storeLabel()}.\n\nPlease clear your pending amount at your earliest convenience.\n\nThank you for your cooperation!`;
     const tId = req.user?.tenant_id || customer.tenant_id || 1;
 
     // 1. Queue Email
@@ -1692,7 +1788,7 @@ async function startServer() {
     `, [customerId, custEmail, remSubject, defaultEmailBody, tId]);
 
     // 2. Queue WhatsApp / SMS
-    const defaultSmsMsg = message || `Khushi Medical Hall: Dear ${customer.name}, your total outstanding Udhar debt balance is Rs. ${customer.current_balance.toFixed(2)}. Kindly settle your bill at your earliest convenience. Thank you!`;
+    const defaultSmsMsg = message || `${storeLabel()}: Dear ${customer.name}, your total outstanding Udhar debt balance is Rs. ${customer.current_balance.toFixed(2)}. Kindly settle your bill at your earliest convenience. Thank you!`;
     db.run(`
       INSERT INTO sms_queue (customer_id, phone, message, type, status, tenant_id)
       VALUES (?, ?, ?, 'UDHAR_REMINDER', 'PENDING', ?)
@@ -1718,6 +1814,17 @@ async function startServer() {
       payment_method, // 'CASH', 'PARTIAL', 'UDHAR'
       amount_paid
     } = req.body;
+
+    // C3 idempotency: the POS sends one client_txn_id per checkout and re-sends the SAME id on retry.
+    // A retry of a committed sale returns the original result instead of recording the sale twice.
+    const clientTxnId = req.body.client_txn_id === undefined ? null : String(req.body.client_txn_id);
+    if (clientTxnId !== null && !/^[A-Za-z0-9-]{8,64}$/.test(clientTxnId)) {
+      return res.status(400).json({ error: 'Invalid client_txn_id' });
+    }
+    if (clientTxnId) {
+      const prior = queryOne<{ response: string }>("SELECT response FROM idempotency_keys WHERE key = ? AND route = 'POST /api/sales'", [clientTxnId]);
+      if (prior) return res.json({ ...JSON.parse(prior.response), replayed: true });
+    }
 
     if (!items || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: 'Cart must contain at least one item' });
@@ -1822,9 +1929,9 @@ async function startServer() {
 
         // Queue BOTH Email and WhatsApp/SMS if customer owes money
         if (dueAmt > 0) {
-          const emailSub = `Invoice #${nextInvNum} Notice - Khushi Medical Hall`;
-          const emailBody = `Dear ${customerObj.name},\n\nInvoice #${nextInvNum} has been generated.\nTotal Bill: Rs. ${grand_total.toFixed(2)}\nAmount Paid: Rs. ${paidAmt.toFixed(2)}\nAmount Due: Rs. ${dueAmt.toFixed(2)}\nYour remaining total Udhar balance is: Rs. ${newBal.toFixed(2)}.\n\nThank you for choosing Khushi Medical Hall!`;
-          const cEmail = customerObj.email || customerObj.phone || 'customer@khushimedical.com';
+          const emailSub = `Invoice #${nextInvNum} Notice - ${storeLabel()}`;
+          const emailBody = `Dear ${customerObj.name},\n\nInvoice #${nextInvNum} has been generated.\nTotal Bill: Rs. ${grand_total.toFixed(2)}\nAmount Paid: Rs. ${paidAmt.toFixed(2)}\nAmount Due: Rs. ${dueAmt.toFixed(2)}\nYour remaining total Udhar balance is: Rs. ${newBal.toFixed(2)}.\n\nThank you for choosing ${storeLabel()}!`;
+          const cEmail = customerObj.email || customerObj.phone || NO_EMAIL;
 
           const saleTenantId = req.user?.tenant_id || customerObj.tenant_id || userTenantId;
 
@@ -1835,7 +1942,7 @@ async function startServer() {
           `, [customer_id, cEmail, emailSub, emailBody, saleTenantId]);
 
           // 2. WhatsApp / SMS Queue
-          const smsMsg = `Khushi Medical Hall: Invoice #${nextInvNum} created for ${customerObj.name}. Total: Rs. ${grand_total.toFixed(2)}, Paid: Rs. ${paidAmt.toFixed(2)}, Due: Rs. ${dueAmt.toFixed(2)}. Updated Total Udhar Balance: Rs. ${newBal.toFixed(2)}. Thank you!`;
+          const smsMsg = `${storeLabel()}: Invoice #${nextInvNum} created for ${customerObj.name}. Total: Rs. ${grand_total.toFixed(2)}, Paid: Rs. ${paidAmt.toFixed(2)}, Due: Rs. ${dueAmt.toFixed(2)}. Updated Total Udhar Balance: Rs. ${newBal.toFixed(2)}. Thank you!`;
           db.run(`
             INSERT INTO sms_queue (customer_id, phone, message, type, status, tenant_id)
             VALUES (?, ?, ?, 'UDHAR_REMINDER', 'PENDING', ?)
@@ -1845,8 +1952,8 @@ async function startServer() {
 
       logAudit(req.user?.id, req.user?.fullName, 'CREATE_SALE', `Completed sale invoice #${nextInvNum} (Grand Total: Rs. ${grand_total})`, 'SALE', saleId, req);
 
-      // Return created invoice details
-      res.json({
+      // Return created invoice details (stored with the transaction id in the same DB transaction)
+      const saleResult = {
         message: 'Sale completed successfully',
         invoice_number: nextInvNum,
         sale_id: saleId,
@@ -1854,13 +1961,26 @@ async function startServer() {
         amount_paid: paidAmt,
         amount_due: dueAmt,
         previous_balance: prevBal,
-        new_balance: newBal
-      });
+        new_balance: newBal,
+        client_txn_id: clientTxnId,
+      };
+      if (clientTxnId) {
+        db.run("INSERT INTO idempotency_keys (key, route, user_id, response, created_at) VALUES (?, 'POST /api/sales', ?, ?, ?)",
+          [clientTxnId, req.user!.id, JSON.stringify(saleResult), new Date().toISOString()]);
+      }
+      res.json(saleResult);
     } catch (err: any) {
       console.error("Sale transaction failed:", err);
       res.status(500).json({ error: 'Failed to process sale transaction permanently: ' + err.message });
     }
   }));
+
+  // C3: did the sale with this transaction id commit? (used after a lost connection)
+  app.get('/api/sales/by-txn/:key', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+    const row = queryOne<{ response: string }>("SELECT response FROM idempotency_keys WHERE key = ? AND route = 'POST /api/sales'", [String(req.params.key)]);
+    if (!row) return res.status(404).json({ status: 'not_found', message: 'No sale was recorded with this transaction id.' });
+    res.json({ status: 'committed', ...JSON.parse(row.response) });
+  });
 
   app.get('/api/sales/history', authenticateToken, (req: AuthRequest, res) => {
     const { start_date, end_date } = req.query;
@@ -2052,13 +2172,13 @@ async function startServer() {
     }
 
     const emailToUse = supplier_email || 'supplier@pharmadistributor.com';
-    const emailSubject = subject || `Official Purchase Order #${po_number} - Khushi Medical Hall`;
-    const emailBody = message || `Dear Supplier,\n\nPlease find attached Purchase Order #${po_number} from Khushi Medical Hall.\n\nOrder Summary:\n${items_summary || ''}\n\nKindly dispatch the items at your earliest convenience.\n\nRegards,\nKhushi Medical Hall, Lahore`;
+    const emailSubject = subject || `Official Purchase Order #${po_number} - ${storeLabel()}`;
+    const emailBody = message || `Dear Supplier,\n\nPlease find attached Purchase Order #${po_number} from ${storeLabel()}.\n\nOrder Summary:\n${items_summary || ''}\n\nKindly dispatch the items at your earliest convenience.\n\nRegards,\n${storeLabel()}`;
 
     db.run(`
       INSERT INTO email_queue (customer_id, email, subject, message, type, status, tenant_id)
       VALUES (?, ?, ?, ?, 'WELCOME', 'PENDING', ?)
-    `, [supplier_id, emailToUse, emailSubject, emailBody, req.user?.tenant_id || 1]);
+    `, [systemCustomerId(), emailToUse, emailSubject, emailBody, req.user?.tenant_id || 1]);
 
 
     logAudit(req.user?.id, req.user?.fullName, 'EMAIL_PO', `Queued Purchase Order #${po_number} email to supplier (${emailToUse})`, 'PURCHASE', undefined, req);
@@ -2117,7 +2237,7 @@ async function startServer() {
     `, [userTenantId]);
 
     const lowStockRes = queryOne<any>(`
-      SELECT COUNT(*) as count FROM products WHERE stock <= min_stock AND (tenant_id = ? OR tenant_id IS NULL)
+      SELECT COUNT(*) as count FROM products WHERE stock <= min_stock AND archived_at IS NULL AND (tenant_id = ? OR tenant_id IS NULL)
     `, [userTenantId]);
 
     const ninetyDaysAhead = new Date();
@@ -2125,11 +2245,11 @@ async function startServer() {
     const expDateStr = ninetyDaysAhead.toISOString().split('T')[0];
 
     const expiringRes = queryOne<any>(`
-      SELECT COUNT(*) as count FROM products WHERE expiry_date <= ? AND stock > 0 AND (tenant_id = ? OR tenant_id IS NULL)
+      SELECT COUNT(*) as count FROM products WHERE expiry_date <= ? AND stock > 0 AND archived_at IS NULL AND (tenant_id = ? OR tenant_id IS NULL)
     `, [expDateStr, userTenantId]);
 
-    const totalProd = queryOne<any>("SELECT COUNT(*) as count FROM products WHERE tenant_id = ? OR tenant_id IS NULL", [userTenantId]);
-    const totalCust = queryOne<any>("SELECT COUNT(*) as count FROM customers WHERE tenant_id = ? OR tenant_id IS NULL", [userTenantId]);
+    const totalProd = queryOne<any>("SELECT COUNT(*) as count FROM products WHERE (tenant_id = ? OR tenant_id IS NULL) AND archived_at IS NULL", [userTenantId]);
+    const totalCust = queryOne<any>("SELECT COUNT(*) as count FROM customers WHERE (tenant_id = ? OR tenant_id IS NULL) AND archived_at IS NULL", [userTenantId]);
 
     res.json({
       todaySalesTotal: todaySalesRes ? todaySalesRes.total : 0,
@@ -2377,23 +2497,24 @@ async function startServer() {
 
     const smtpHost = settingsObj.smtp_host || 'smtp.gmail.com';
     const smtpPort = settingsObj.smtp_port || '587';
-    const smtpUser = settingsObj.smtp_user || 'khushi.pharmacy@gmail.com';
+    const smtpUser = settingsObj.smtp_user || '(not set)';
     const smtpEnabled = settingsObj.smtp_enabled === 'true';
-    const targetEmail = testEmail || settingsObj.smtp_from_email || 'khushi.pharmacy@gmail.com';
+    const targetEmail = testEmail || settingsObj.smtp_from_email || '';
 
     if (!smtpEnabled) {
       return res.status(400).json({ error: 'SMTP Email Gateway is currently disabled in system settings.' });
     }
 
     // Queue a test message to email_queue
-    const testSubject = 'SMTP Gateway Connection Test - Khushi Medical Hall';
-    const testBody = `This is a test notification sent from Khushi Medical Hall POS.\n\nSMTP Configuration Verified:\nHost: ${smtpHost}:${smtpPort}\nSender/Username: ${smtpUser}\nTimestamp: ${new Date().toLocaleString()}\n\nIf you received this message, your SMTP Email Gateway configuration is working correctly!`;
+    if (!targetEmail) return res.status(400).json({ error: 'Enter an email address to send the test message to.' });
+    const testSubject = `SMTP Gateway Connection Test - ${storeLabel()}`;
+    const testBody = `This is a test notification sent from ${storeLabel()} (BrainTech Pharmacy AI).\n\nSMTP Configuration Verified:\nHost: ${smtpHost}:${smtpPort}\nSender/Username: ${smtpUser}\nTimestamp: ${new Date().toLocaleString()}\n\nIf you received this message, your SMTP Email Gateway configuration is working correctly!`;
 
     const userTenantId = req.user?.tenant_id || 1;
     db.run(`
       INSERT INTO email_queue (customer_id, email, subject, message, type, status, tenant_id)
-      VALUES (1, ?, ?, ?, 'WELCOME', 'PENDING', ?)
-    `, [targetEmail, testSubject, testBody, userTenantId]);
+      VALUES (?, ?, ?, ?, 'WELCOME', 'PENDING', ?)
+    `, [systemCustomerId(), targetEmail, testSubject, testBody, userTenantId]);
 
     logAudit(req.user?.id, req.user?.fullName, 'TEST_SMTP_GATEWAY', `Triggered SMTP Gateway Connection Test to ${targetEmail} (Host: ${smtpHost}:${smtpPort})`, 'SETTINGS', undefined, req);
 
@@ -2440,7 +2561,7 @@ async function startServer() {
     logAudit(req.user?.id, req.user?.fullName, 'BACKUP_EXPORT', 'Exported AES-256 encrypted database backup file', 'BACKUP', undefined, req);
 
     res.setHeader('Content-Type', 'application/json');
-    res.setHeader('Content-Disposition', `attachment; filename=Khushi_Medical_Backup_${new Date().toISOString().split('T')[0]}.kmhbackup`);
+    res.setHeader('Content-Disposition', `attachment; filename=${storeLabel().replace(/[^A-Za-z0-9-]+/g, '_')}_Backup_${new Date().toISOString().split('T')[0]}.kmhbackup`);
     res.send(JSON.stringify(backupPayload, null, 2));
   }));
 
@@ -2448,7 +2569,7 @@ async function startServer() {
   app.get('/api/backup/mysql-export', authenticateToken, requireRoles(['ADMIN', 'SUPER_ADMIN']), async (req: AuthRequest, res) => {
     try {
       let sqlOutput = `-- ========================================================\n`;
-      sqlOutput += `-- Khushi Medical Hall & Pharmacy Management System\n`;
+      sqlOutput += `-- ${storeLabel()} - BrainTech Pharmacy AI database export\n`;
       sqlOutput += `-- MySQL / MariaDB Full Database Migration Dump\n`;
       sqlOutput += `-- Exported At: ${new Date().toISOString()}\n`;
       sqlOutput += `-- Target RDBMS: MySQL 5.7+ / MySQL 8.0+ / MariaDB 10.3+\n`;
@@ -2516,7 +2637,7 @@ async function startServer() {
       logAudit(req.user?.id, req.user?.fullName, 'MYSQL_EXPORT', 'Exported MySQL SQL Dump file', 'BACKUP', undefined, req);
 
       res.setHeader('Content-Type', 'text/plain');
-      res.setHeader('Content-Disposition', `attachment; filename=Khushi_Medical_MySQL_Dump_${new Date().toISOString().split('T')[0]}.sql`);
+      res.setHeader('Content-Disposition', `attachment; filename=${storeLabel().replace(/[^A-Za-z0-9-]+/g, '_')}_MySQL_Dump_${new Date().toISOString().split('T')[0]}.sql`);
       res.send(sqlOutput);
     } catch (err: any) {
       console.error('MySQL export error:', err);
@@ -2633,11 +2754,12 @@ async function startServer() {
     let sql = `
       SELECT id, username, role, full_name, full_name as fullName, email, phone, status, allowed_services, tenant_id, customer_id, customer_id as customerId, created_at 
       FROM users 
+      WHERE archived_at IS NULL
     `;
     const params: any[] = [];
     if (req.user?.role !== 'SUPER_ADMIN') {
       const userTenantId = req.user?.tenant_id || 1;
-      sql += ` WHERE (tenant_id = ? OR tenant_id IS NULL) `;
+      sql += ` AND (tenant_id = ? OR tenant_id IS NULL) `;
       params.push(userTenantId);
     }
     sql += ` ORDER BY id DESC `;
@@ -2661,10 +2783,11 @@ async function startServer() {
     }
 
     const cleanUsername = username.trim();
-    const existingUser = queryOne("SELECT id FROM users WHERE username = ? OR (email = ? AND email != '')", [cleanUsername, email || '']);
+    const existingUser = queryOne("SELECT id FROM users WHERE (username = ? OR (email = ? AND email != '')) AND archived_at IS NULL", [cleanUsername, email || '']);
     if (existingUser) {
       return res.status(400).json({ error: 'A user account with this username or email already exists.' });
     }
+    releaseArchivedUnique('users', 'username', cleanUsername);
 
     const passHash = bcrypt.hashSync(password, 10);
     const tenantId = req.user?.role === 'SUPER_ADMIN' ? (req.body.tenant_id || 1) : (req.user?.tenant_id || 1);
@@ -2815,24 +2938,23 @@ async function startServer() {
       return res.status(400).json({ error: 'Cannot delete protected Super Admin user.' });
     }
 
-    try {
-      try {
-        db.run("UPDATE sales_headers SET created_by_user_id = 1 WHERE created_by_user_id = ?", [userId]);
-      } catch (e) {}
-      try {
-        db.run("UPDATE stock_adjustments SET user_id = 1 WHERE user_id = ?", [userId]);
-      } catch (e) {}
-
-      db.run("DELETE FROM users WHERE id = ?", [userId]);
-
-      logAudit(req.user?.id, req.user?.fullName, 'USER_DELETE', `Admin deleted user account ${targetUser.username} (${targetUser.full_name})`, 'USER', userId, req);
-
-      res.json({ message: 'User account deleted successfully' });
-    } catch (err: any) {
-      console.error('Delete user error:', err);
-      db.run("UPDATE users SET status = 'SUSPENDED' WHERE id = ?", [userId]);
-      res.json({ message: 'User account suspended (cannot hard delete due to existing transaction history).' });
+    // FK2: a user who created sales or stock adjustments is archived. The old code re-assigned their
+    // history to user #1, which falsified who made each sale; history now stays attributed correctly.
+    if (hasHistory([
+      ["SELECT 1 x FROM sales_headers WHERE created_by_user_id = ? LIMIT 1", [userId]],
+      ["SELECT 1 x FROM stock_adjustments WHERE user_id = ? LIMIT 1", [userId]],
+    ])) {
+      db.run("UPDATE users SET status = 'ARCHIVED' WHERE id = ?", [userId]);
+      archiveRow('users', userId, req.user?.id, 'Deleted by admin; kept because sales/adjustments reference it');
+      logAudit(req.user?.id, req.user?.fullName, 'USER_ARCHIVE', `Archived user account ${targetUser.username} (${targetUser.full_name}); sign-in disabled, history kept`, 'USER', userId, req);
+      return res.json({ message: 'User removed. They have sales history, so the account was archived (cannot sign in) and the history is kept.', archived: true });
     }
+
+    db.run("DELETE FROM users WHERE id = ?", [userId]);
+
+    logAudit(req.user?.id, req.user?.fullName, 'USER_DELETE', `Admin deleted user account ${targetUser.username} (${targetUser.full_name})`, 'USER', userId, req);
+
+    res.json({ message: 'User account deleted successfully' });
   }));
 
   // 11. Audit Log API (ADMIN ONLY)
@@ -2952,24 +3074,32 @@ async function startServer() {
 
   // Serve Vite in development or static dist in production
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite'); // dev only: never loaded in the desktop app
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa'
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), 'dist');
+    const distPath = process.env.PHARMACY_STATIC_DIR || path.join(process.cwd(), 'dist');
     app.use(express.static(distPath));
     app.get('*', (req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }
 
-  const httpServer = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`====================================================`);
-    console.log(`🏥 Khushi Medical Hall POS Server running on port ${PORT}`);
-    console.log(`====================================================`);
+  const httpServer = tlsMaterial
+    ? https.createServer({ cert: tlsMaterial.cert, key: tlsMaterial.key, minVersion: 'TLSv1.2' }, app)
+    : (await import('node:http')).createServer(app);
+  await new Promise<void>((resolve, reject) => {
+    httpServer.once('error', reject);
+    httpServer.listen(PORT, BIND, () => resolve());
   });
+  const actualPort = (httpServer.address() as any)?.port ?? PORT;
+  console.log(`====================================================`);
+  console.log(`BrainTech Pharmacy AI server (${MODE}) listening on ${tlsMaterial ? 'https' : 'http'}://${BIND}:${actualPort}`);
+  console.log(`====================================================`);
+  (process as any).parentPort?.postMessage({ type: 'listening', port: actualPort, fingerprint });
 
   // Graceful shutdown: stop accepting requests, then close the database (checkpoints the WAL).
   let shuttingDown = false;
@@ -2985,6 +3115,8 @@ async function startServer() {
   };
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
+  // Electron main process asks the utilityProcess to stop gracefully
+  (process as any).parentPort?.on('message', (e: any) => { if ((e?.data ?? e)?.type === 'shutdown') shutdown('desktop app quit'); });
 }
 
 startServer().catch(err => {

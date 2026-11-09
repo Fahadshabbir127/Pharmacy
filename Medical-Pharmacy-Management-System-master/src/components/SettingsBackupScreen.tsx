@@ -1,3 +1,4 @@
+import { PRODUCT_NAME, DEFAULT_TEMPLATES, storeNameOf, fileSafe, useStoreSettings } from '../lib/branding';
 import React, { useState, useEffect } from 'react';
 import { api, getAuthToken } from '../lib/api';
 import { User } from '../types';
@@ -52,7 +53,7 @@ export const SettingsBackupScreen: React.FC<SettingsBackupScreenProps> = ({ curr
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `Khushi_Medical_MySQL_Dump_${new Date().toISOString().split('T')[0]}.sql`;
+      a.download = `${fileSafe(storeNameOf(settings))}_MySQL_Dump_${new Date().toISOString().split('T')[0]}.sql`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -140,7 +141,7 @@ export const SettingsBackupScreen: React.FC<SettingsBackupScreenProps> = ({ curr
     setSmtpTestResult(null);
     try {
       setTestingSmtp(true);
-      const target = testEmail || settings.smtp_from_email || settings.smtp_user || 'khushi.store@gmail.com';
+      const target = testEmail || settings.smtp_from_email || settings.smtp_user || '';
       const res = await api.testSmtp(target);
       setSmtpTestResult({ type: 'success', message: res.message });
     } catch (err: any) {
@@ -169,7 +170,7 @@ export const SettingsBackupScreen: React.FC<SettingsBackupScreenProps> = ({ curr
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `Khushi_Medical_Backup_${new Date().toISOString().split('T')[0]}.kmhbackup`;
+      a.download = `${fileSafe(storeNameOf(settings))}_Backup_${new Date().toISOString().split('T')[0]}.kmhbackup`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -414,7 +415,7 @@ export const SettingsBackupScreen: React.FC<SettingsBackupScreenProps> = ({ curr
                   <label className="block text-slate-300 font-semibold mb-1">1. Udhar Due Reminder Message (ادھار یاد دہانی پیغام):</label>
                   <textarea
                     rows={3}
-                    value={settings.msg_template_udhar_reminder || `محترم {name} صاحب! خوشی میڈیکل ہال پر آپ کا بقیہ ادھار رقم Rs. {balance} ہے۔ برائے مہربانی اپنا ادھار کھاتہ جلد از جلد صاف فرمائیں۔ شکریہ! - Khushi Medical Hall`}
+                    value={settings.msg_template_udhar_reminder || DEFAULT_TEMPLATES.udhar_reminder}
                     onChange={(e) => setSettings({ ...settings, msg_template_udhar_reminder: e.target.value })}
                     className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500 font-sans"
                   />
@@ -424,7 +425,7 @@ export const SettingsBackupScreen: React.FC<SettingsBackupScreenProps> = ({ curr
                   <label className="block text-slate-300 font-semibold mb-1">2. Payment Receipt Message (رقم وصولی کا پیغام):</label>
                   <textarea
                     rows={3}
-                    value={settings.msg_template_payment_receipt || `محترم {name}! خوشی میڈیکل ہال میں آپ کی طرف سے رقم موصول ہو گئی ہے۔ آپ کا بقیہ کھاتہ Rs. {balance} ہے۔ شکریہ! - Khushi Medical Hall`}
+                    value={settings.msg_template_payment_receipt || DEFAULT_TEMPLATES.payment_receipt}
                     onChange={(e) => setSettings({ ...settings, msg_template_payment_receipt: e.target.value })}
                     className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500 font-sans"
                   />
@@ -434,7 +435,7 @@ export const SettingsBackupScreen: React.FC<SettingsBackupScreenProps> = ({ curr
                   <label className="block text-slate-300 font-semibold mb-1">3. Prescription Refill Reminder (دوائی ختم ہونے کا نوٹس):</label>
                   <textarea
                     rows={3}
-                    value={settings.msg_template_refill || `Dear {name}, your regular medicine prescription stock at Khushi Medical Hall may be finishing soon. Visit us today for fresh refill & discounts! - Khushi Medical Hall`}
+                    value={settings.msg_template_refill || DEFAULT_TEMPLATES.refill}
                     onChange={(e) => setSettings({ ...settings, msg_template_refill: e.target.value })}
                     className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500 font-sans"
                   />
@@ -517,7 +518,7 @@ export const SettingsBackupScreen: React.FC<SettingsBackupScreenProps> = ({ curr
                     <label className="block text-slate-300 font-semibold mb-1">SMTP Username / Email:</label>
                     <input
                       type="text"
-                      placeholder="khushi.store@gmail.com"
+                      placeholder="pharmacy@example.com"
                       value={settings.smtp_user || ''}
                       onChange={(e) => setSettings({ ...settings, smtp_user: e.target.value })}
                       className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500 font-mono"
@@ -539,7 +540,7 @@ export const SettingsBackupScreen: React.FC<SettingsBackupScreenProps> = ({ curr
                     <label className="block text-slate-300 font-semibold mb-1">Sender Email Address:</label>
                     <input
                       type="email"
-                      placeholder="khushi.store@gmail.com"
+                      placeholder="pharmacy@example.com"
                       value={settings.smtp_from_email || ''}
                       onChange={(e) => setSettings({ ...settings, smtp_from_email: e.target.value })}
                       className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500 font-mono"
@@ -550,7 +551,7 @@ export const SettingsBackupScreen: React.FC<SettingsBackupScreenProps> = ({ curr
                     <label className="block text-slate-300 font-semibold mb-1">Sender Display Name:</label>
                     <input
                       type="text"
-                      placeholder="Khushi Medical Hall"
+                      placeholder="Your pharmacy name"
                       value={settings.smtp_from_name || ''}
                       onChange={(e) => setSettings({ ...settings, smtp_from_name: e.target.value })}
                       className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500"

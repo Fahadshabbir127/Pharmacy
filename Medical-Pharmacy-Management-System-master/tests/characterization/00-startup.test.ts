@@ -18,11 +18,11 @@ describe('startup on an empty data directory', () => {
     expect(fs.existsSync(srv.dbFile)).toBe(true);
   });
 
-  it('creates all 17 legacy tables plus schema_migrations (Phase 3) and uses WAL', async () => {
+  it('creates all 17 legacy tables plus schema_migrations, paired_clients, idempotency_keys and uses WAL', async () => {
     const db = await openReadOnly(srv.dbFile);
     expect(tableNames(db)).toEqual([
-      'audit_logs', 'categories', 'customer_ledger', 'customers', 'email_queue', 'otp_verifications',
-      'products', 'purchase_headers', 'purchase_items', 'sale_items', 'sales_headers', 'schema_migrations', 'settings',
+      'audit_logs', 'categories', 'customer_ledger', 'customers', 'email_queue', 'idempotency_keys', 'otp_verifications',
+      'paired_clients', 'products', 'purchase_headers', 'purchase_items', 'sale_items', 'sales_headers', 'schema_migrations', 'settings',
       'sms_queue', 'stock_adjustments', 'suppliers', 'tenants', 'users',
     ]);
     expect(integrityCheck(db)).toEqual([]);
@@ -47,11 +47,11 @@ describe('startup on an empty data directory', () => {
     expect((await new Api().login('03001234567', 'customer123')).role).toBe('CUSTOMER');
   });
 
-  it('[LEGACY-SECURITY S2] force-creates SUPER_ADMIN accounts with hardcoded passwords', async () => {
+  // C4 (was: 'superadmin'/admin123 and a personal-email SUPER_ADMIN force-created on every start)
+  it('[FIXED C4] the personal SUPER_ADMIN account is never created; only the test seed\'s superadmin exists', async () => {
     const db = await openReadOnly(srv.dbFile);
     const supers = all<{ username: string }>(db, "SELECT username FROM users WHERE role='SUPER_ADMIN' ORDER BY username");
-    expect(supers.map((s) => s.username)).toEqual(['superadmin', 'umarumair75108@gmail.com']);
-    expect((await new Api().login('superadmin', 'admin123')).role).toBe('SUPER_ADMIN');
+    expect(supers.map((s) => s.username)).toEqual(['superadmin']);
   });
 
   it('seeded products have no barcode on the very first start (backfill runs before seeding)', async () => {
@@ -60,11 +60,13 @@ describe('startup on an empty data directory', () => {
     expect(p!.barcode).toBeNull();
   });
 
-  it('[LEGACY-BUG] on first boot every seeded row has tenant_id NULL (backfill runs before seeding)', async () => {
+  // first-boot bug fixed (was: every seeded row had tenant_id NULL until the next start)
+  it('[FIXED] on first boot every seeded row already belongs to store #1 (only SUPER_ADMIN has no store)', async () => {
     const db = await openReadOnly(srv.dbFile);
-    for (const t of ['users', 'products', 'sales_headers', 'customers', 'categories', 'suppliers', 'settings']) {
-      expect(one<{ n: number }>(db, `SELECT COUNT(*) n FROM ${t} WHERE tenant_id IS NOT NULL`)!.n, t).toBe(0);
+    for (const t of ['products', 'sales_headers', 'customers', 'categories', 'suppliers', 'settings']) {
+      expect(one<{ n: number }>(db, `SELECT COUNT(*) n FROM ${t} WHERE tenant_id IS NULL AND ${t === 'settings' ? '1' : 'is_placeholder = 0'}`)!.n, t).toBe(0);
     }
+    expect(one<{ n: number }>(db, "SELECT COUNT(*) n FROM users WHERE tenant_id IS NULL AND role != 'SUPER_ADMIN'")!.n).toBe(0);
   });
 
   it('serves the API with open CORS (Access-Control-Allow-Origin: *) [LEGACY-SECURITY S5]', async () => {
@@ -94,14 +96,15 @@ describe('persistence across restart', () => {
       // the second start backfills tenant_id = 1 (SUPER_ADMIN users stay NULL)
       expect(one<{ n: number }>(db, "SELECT COUNT(*) n FROM products WHERE tenant_id IS NULL")!.n).toBe(0);
       expect(one<{ n: number }>(db, "SELECT COUNT(*) n FROM users WHERE tenant_id IS NULL AND role != 'SUPER_ADMIN'")!.n).toBe(0);
-      // [LEGACY-BUG C11] second start invents 8901000000NNN barcodes for products without one
-      expect(one<{ barcode: string }>(db, 'SELECT barcode FROM products WHERE id=1')!.barcode).toBe('8901000000001');
+      // C11 fixed (was: the second start invented 8901000000NNN barcodes)
+      expect(one<{ barcode: string | null }>(db, 'SELECT barcode FROM products WHERE id=1')!.barcode).toBeNull();
     } finally {
       await srv.stop();
     }
   });
 
-  it("[LEGACY-BUG R8] rewrites the 'admin' user's full name on every start", async () => {
+  // R8 fixed (was: the name was reset to 'Muhammad Asghar (Owner)' on every start)
+  it("[FIXED R8] the 'admin' user's name is kept across restarts", async () => {
     let srv = await startServer();
     const api = new Api();
     await api.login('admin', 'admin123');
@@ -114,7 +117,7 @@ describe('persistence across restart', () => {
     srv = await startServer({ workDir });
     try {
       const db = await openReadOnly(srv.dbFile);
-      expect(one<{ full_name: string }>(db, "SELECT full_name FROM users WHERE username='admin'")!.full_name).toBe('Muhammad Asghar (Owner)');
+      expect(one<{ full_name: string }>(db, "SELECT full_name FROM users WHERE username='admin'")!.full_name).toBe('Pharmacy Owner Renamed');
     } finally {
       await srv.stop();
     }

@@ -1,3 +1,4 @@
+import { PRODUCT_NAME, DEFAULT_TEMPLATES, storeNameOf, fileSafe, useStoreSettings } from '../lib/branding';
 import React, { useState, useEffect } from 'react';
 import { Customer, LedgerEntry } from '../types';
 import { api } from '../lib/api';
@@ -174,15 +175,15 @@ export const CustomerManagementScreen: React.FC<{ currentUser?: User }> = ({ cur
     if (!selectedCustomer) return '';
     const nameStr = selectedCustomer.name;
     const balStr = (Number(selectedCustomer.current_balance) || 0).toFixed(2);
-    const storeStr = settings.store_name || 'Khushi Medical Hall';
+    const storeStr = storeNameOf(settings);
 
     let tmpl = '';
     if (selectedTemplate === 'UDHAR_REMINDER') {
-      tmpl = settings.msg_template_udhar_reminder || `محترم {name} صاحب! خوشی میڈیکل ہال پر آپ کا بقیہ ادھار رقم Rs. {balance} ہے۔ برائے مہربانی اپنا ادھار کھاتہ جلد از جلد صاف فرمائیں۔ شکریہ! - Khushi Medical Hall`;
+      tmpl = settings.msg_template_udhar_reminder || DEFAULT_TEMPLATES.udhar_reminder;
     } else if (selectedTemplate === 'PAYMENT_RECEIPT') {
-      tmpl = settings.msg_template_payment_receipt || `محترم {name}! خوشی میڈیکل ہال میں آپ کی طرف سے رقم موصول ہو گئی ہے۔ آپ کا بقیہ کھاتہ Rs. {balance} ہے۔ شکریہ! - Khushi Medical Hall`;
+      tmpl = settings.msg_template_payment_receipt || DEFAULT_TEMPLATES.payment_receipt;
     } else if (selectedTemplate === 'REFILL') {
-      tmpl = settings.msg_template_refill || `Dear {name}, your regular medicine prescription stock at Khushi Medical Hall may be finishing soon. Visit us today for fresh refill & discounts! - Khushi Medical Hall`;
+      tmpl = settings.msg_template_refill || DEFAULT_TEMPLATES.refill;
     } else {
       return customText || `Dear ${nameStr}, greeting from ${storeStr}!`;
     }
@@ -275,7 +276,7 @@ export const CustomerManagementScreen: React.FC<{ currentUser?: User }> = ({ cur
       `;
     }).join('');
 
-    const storeDisplayName = (settings.store_name || settings.pharmacy_name || currentUser?.tenant_name || 'Khushi Medical Hall & Store').toUpperCase();
+    const storeDisplayName = (settings.store_name || settings.pharmacy_name || currentUser?.tenant_name || 'Pharmacy').toUpperCase();
 
     const fullHtml = `
       <!DOCTYPE html>

@@ -1,4 +1,5 @@
-import React, { useState } from 'react';
+import { PRODUCT_NAME } from '../lib/branding';
+import React, { useEffect, useState } from 'react';
 import { api } from '../lib/api';
 import { User } from '../types';
 import { Pill, Shield, KeyRound, User as UserIcon, RefreshCw, Eye, EyeOff, Mail, CheckCircle2, ArrowRight } from 'lucide-react';
@@ -8,6 +9,10 @@ interface LoginModalProps {
 }
 
 export const LoginModal: React.FC<LoginModalProps> = ({ onLoginSuccess }) => {
+  const [storeName, setStoreName] = useState<string | null>(null);
+  useEffect(() => {
+    fetch('/api/setup/status').then((r) => r.json()).then((s) => setStoreName(s?.storeName || null)).catch(() => {});
+  }, []);
   const [loginMode, setLoginMode] = useState<'PASSWORD' | 'OTP'>('PASSWORD');
 
   // Password Login state
@@ -86,8 +91,8 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onLoginSuccess }) => {
             <Pill className="w-7 h-7 text-white -rotate-3" />
           </div>
           <div>
-            <h2 className="text-2xl font-black text-white tracking-tight">Khushi Medical Hall</h2>
-            <p className="text-emerald-400 font-medium text-xs mt-0.5 tracking-wide">Multi-Tenant Store POS v3.0</p>
+            <h2 className="text-2xl font-black text-white tracking-tight">{storeName || PRODUCT_NAME}</h2>
+            <p className="text-emerald-400 font-medium text-xs mt-0.5 tracking-wide">{storeName ? PRODUCT_NAME : 'Pharmacy management'}</p>
           </div>
         </div>
 

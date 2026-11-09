@@ -1,3 +1,4 @@
+import { PRODUCT_NAME, DEFAULT_TEMPLATES, storeNameOf, fileSafe, useStoreSettings } from '../lib/branding';
 import React, { useState, useEffect } from 'react';
 import { 
   Building2, Users, ShoppingBag, DollarSign, ShieldAlert, CheckCircle2, 
@@ -98,13 +99,13 @@ export const SuperAdminScreen: React.FC<SuperAdminScreenProps> = ({ currentUser 
   const applyTemplateToMessage = (tmplKey: string) => {
     if (tmplKey === 'UDHAR_REMINDER') {
       setMsgSubject('Udhar Account Payment Reminder (ادھار یاد دہانی نوٹس)');
-      setMsgBody(globalSettings.msg_template_udhar_reminder || 'محترم {name} صاحب! خوشی میڈیکل ہال پر آپ کا بقیہ ادھار رقم Rs. {balance} ہے۔ برائے مہربانی اپنا ادھار کھاتہ جلد از جلد صاف فرمائیں۔ شکریہ! - Khushi Medical Hall');
+      setMsgBody(globalSettings.msg_template_udhar_reminder || DEFAULT_TEMPLATES.udhar_reminder);
     } else if (tmplKey === 'PAYMENT_RECEIPT') {
       setMsgSubject('Payment Received Confirmation (رقم وصولی کی تصدیق)');
-      setMsgBody(globalSettings.msg_template_payment_receipt || 'محترم {name}! خوشی میڈیکل ہال میں آپ کی طرف سے رقم موصول ہو گئی ہے۔ آپ کا بقیہ کھاتہ Rs. {balance} ہے۔ شکریہ! - Khushi Medical Hall');
+      setMsgBody(globalSettings.msg_template_payment_receipt || DEFAULT_TEMPLATES.payment_receipt);
     } else if (tmplKey === 'REFILL') {
       setMsgSubject('Prescription Medicine Refill Reminder (دوائی ختم ہونے کا نوٹس)');
-      setMsgBody(globalSettings.msg_template_refill || 'Dear {name}, your regular medicine prescription stock at Khushi Medical Hall may be finishing soon. Visit us today for fresh refill & discounts! - Khushi Medical Hall');
+      setMsgBody(globalSettings.msg_template_refill || DEFAULT_TEMPLATES.refill);
     } else if (tmplKey === 'ANNOUNCEMENT') {
       setMsgSubject('Platform Software Update & Store Announcement');
       setMsgBody('Dear Shopkeeper, please be informed that platform maintenance and feature updates have been applied to your store system portal.');
@@ -589,7 +590,7 @@ export const SuperAdminScreen: React.FC<SuperAdminScreenProps> = ({ currentUser 
               <label className="block text-slate-300 font-semibold mb-1">1. Udhar Due Reminder Message (ادھار یاد دہانی پیغام):</label>
               <textarea
                 rows={3}
-                value={globalSettings.msg_template_udhar_reminder || `محترم {name} صاحب! خوشی میڈیکل ہال پر آپ کا بقیہ ادھار رقم Rs. {balance} ہے۔ برائے مہربانی اپنا ادھار کھاتہ جلد از جلد صاف فرمائیں۔ شکریہ! - Khushi Medical Hall`}
+                value={globalSettings.msg_template_udhar_reminder || DEFAULT_TEMPLATES.udhar_reminder}
                 onChange={(e) => setGlobalSettings({ ...globalSettings, msg_template_udhar_reminder: e.target.value })}
                 className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500 font-sans"
               />
@@ -599,7 +600,7 @@ export const SuperAdminScreen: React.FC<SuperAdminScreenProps> = ({ currentUser 
               <label className="block text-slate-300 font-semibold mb-1">2. Payment Receipt Message (رقم وصولی کا پیغام):</label>
               <textarea
                 rows={3}
-                value={globalSettings.msg_template_payment_receipt || `محترم {name}! خوشی میڈیکل ہال میں آپ کی طرف سے رقم موصول ہو گئی ہے۔ آپ کا بقیہ کھاتہ Rs. {balance} ہے۔ شکریہ! - Khushi Medical Hall`}
+                value={globalSettings.msg_template_payment_receipt || DEFAULT_TEMPLATES.payment_receipt}
                 onChange={(e) => setGlobalSettings({ ...globalSettings, msg_template_payment_receipt: e.target.value })}
                 className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500 font-sans"
               />
@@ -609,7 +610,7 @@ export const SuperAdminScreen: React.FC<SuperAdminScreenProps> = ({ currentUser 
               <label className="block text-slate-300 font-semibold mb-1">3. Prescription Refill Reminder (دوائی ختم ہونے کا نوٹس):</label>
               <textarea
                 rows={3}
-                value={globalSettings.msg_template_refill || `Dear {name}, your regular medicine prescription stock at Khushi Medical Hall may be finishing soon. Visit us today for fresh refill & discounts! - Khushi Medical Hall`}
+                value={globalSettings.msg_template_refill || DEFAULT_TEMPLATES.refill}
                 onChange={(e) => setGlobalSettings({ ...globalSettings, msg_template_refill: e.target.value })}
                 className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500 font-sans"
               />
@@ -695,7 +696,7 @@ export const SuperAdminScreen: React.FC<SuperAdminScreenProps> = ({ currentUser 
                 <label className="block text-slate-300 font-semibold mb-1">SMTP Username / Email:</label>
                 <input
                   type="text"
-                  placeholder="khushi.pharmacy@gmail.com"
+                  placeholder="pharmacy@example.com"
                   value={globalSettings.smtp_user || ''}
                   onChange={(e) => setGlobalSettings({ ...globalSettings, smtp_user: e.target.value })}
                   className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500 font-mono"
@@ -717,7 +718,7 @@ export const SuperAdminScreen: React.FC<SuperAdminScreenProps> = ({ currentUser 
                 <label className="block text-slate-300 font-semibold mb-1">Sender Email Address:</label>
                 <input
                   type="email"
-                  placeholder="khushi.pharmacy@gmail.com"
+                  placeholder="pharmacy@example.com"
                   value={globalSettings.smtp_from_email || ''}
                   onChange={(e) => setGlobalSettings({ ...globalSettings, smtp_from_email: e.target.value })}
                   className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500 font-mono"
@@ -728,7 +729,7 @@ export const SuperAdminScreen: React.FC<SuperAdminScreenProps> = ({ currentUser 
                 <label className="block text-slate-300 font-semibold mb-1">Sender Display Name:</label>
                 <input
                   type="text"
-                  placeholder="Khushi Medical Hall Admin"
+                  placeholder="Your pharmacy name"
                   value={globalSettings.smtp_from_name || ''}
                   onChange={(e) => setGlobalSettings({ ...globalSettings, smtp_from_name: e.target.value })}
                   className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500"

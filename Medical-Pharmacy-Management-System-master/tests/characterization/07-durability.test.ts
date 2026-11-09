@@ -8,54 +8,128 @@ import { startServer, Api, cartItem, salePayload } from '../helpers/server';
 import { openReadOnly, one, all, integrityCheck } from '../helpers/db';
 
 describe('crash durability (SIGKILL, no graceful shutdown)', () => {
-  it('every acknowledged sale survives a hard kill; no partial sales; DB intact', async () => {
+  /**
+   * Each request carries a unique marker (unit price 1000+i; the server still stores client prices
+   * - legacy C9 - which makes every stored sale traceable to the request that created it).
+   * Odd requests are UDHAR sales to customer #2, so one sale touches four tables:
+   * sales_headers, sale_items, customers.current_balance and customer_ledger.
+   */
+  it('every acknowledged sale survives a hard kill; every interrupted sale is either fully committed or fully absent', async () => {
     let srv = await startServer();
     const workDir = srv.workDir;
     const admin = new Api();
     await admin.login('admin', 'admin123');
     const p = (await admin.get('/inventory')).body.find((x: any) => x.id === 3); // stock 80
+    const startBalance = (await admin.get('/customers')).body.find((c: any) => c.id === 2).current_balance;
 
-    const acknowledged: string[] = [];
+    const N = 55;
+    const outcome: ('ack' | 'error' | 'interrupted')[] = [];
+    const send = (i: number) =>
+      admin.post('/sales', salePayload([cartItem(p, 1, { unit_price: 1000 + i })], i % 2 ? { payment_method: 'UDHAR', customer_id: 2 } : {}));
     for (let i = 0; i < 15; i++) {
-      const r = await admin.post('/sales', salePayload([cartItem(p, 1)]));
+      const r = await send(i);
       expect(r.status).toBe(200);
-      acknowledged.push(r.body.invoice_number);
+      outcome[i] = 'ack';
     }
     // burst of 40 concurrent sales; hard-kill as soon as 25 sales in total are acknowledged
     let killed: Promise<void> | null = null;
-    let unknownOutcome = 0;
     const inflight: Promise<void>[] = [];
-    for (let i = 0; i < 40; i++) {
-      inflight.push(
-        admin.post('/sales', salePayload([cartItem(p, 1)])).then(
-          (r) => {
-            if (r.status === 200) acknowledged.push(r.body.invoice_number);
-            if (acknowledged.length >= 25 && !killed) killed = srv.kill();
-          },
-          () => { unknownOutcome++; }, // connection dropped by the kill
-        ),
-      );
+    for (let i = 15; i < N; i++) {
+      inflight.push(send(i).then(
+        (r) => {
+          outcome[i] = r.status === 200 ? 'ack' : 'error';
+          if (outcome.filter((o) => o === 'ack').length >= 25 && !killed) killed = srv.kill();
+        },
+        () => { outcome[i] = 'interrupted'; }, // connection dropped by the kill: outcome unknown to the client
+      ));
     }
     await Promise.all(inflight);
     await (killed ?? srv.kill());
-    expect(acknowledged.length).toBeGreaterThanOrEqual(25);
-    expect(unknownOutcome).toBeGreaterThan(0); // the kill really interrupted in-flight sales
-    console.log(`durability: ${acknowledged.length} acknowledged, ${unknownOutcome} interrupted by the kill`);
+    const interrupted = outcome.map((o, i) => (o === 'interrupted' ? i : -1)).filter((i) => i >= 0);
+    expect(outcome.filter((o) => o === 'error')).toEqual([]);
+    expect(interrupted.length).toBeGreaterThan(0);
 
     srv = await startServer({ workDir });
     try {
       const db = await openReadOnly(srv.dbFile);
       expect(integrityCheck(db)).toEqual([]);
-      const stored = all<{ invoice_number: string }>(db, "SELECT invoice_number FROM sales_headers WHERE invoice_number LIKE 'INV-1-%'").map((r) => r.invoice_number);
-      for (const inv of acknowledged) expect(stored, `acknowledged ${inv} lost`).toContain(inv);
-      // no partial sales: every header has its item, and stock matches the number of stored sales
-      expect(one(db, 'SELECT COUNT(*) n FROM sales_headers h WHERE NOT EXISTS (SELECT 1 FROM sale_items i WHERE i.sale_id = h.id)')).toEqual({ n: 0 });
-      expect(one<{ stock: number }>(db, 'SELECT stock FROM products WHERE id = 3')!.stock).toBe(80 - stored.length);
+      const rows = all<{ id: number; marker: number; items: number; grand_total: number; amount_due: number; method: string; ledger: number }>(db, `
+        SELECT h.id, MIN(i.sale_price) - 1000 AS marker, COUNT(i.id) AS items, h.grand_total, h.amount_due, h.payment_method AS method,
+               (SELECT COUNT(*) FROM customer_ledger l WHERE l.sale_id = h.id) AS ledger
+        FROM sales_headers h LEFT JOIN sale_items i ON i.sale_id = h.id
+        WHERE h.invoice_number LIKE 'INV-1-%' GROUP BY h.id`);
+      const byMarker = new Map<number, typeof rows>();
+      for (const r of rows) byMarker.set(r.marker, [...(byMarker.get(r.marker) ?? []), r]);
+
+      // no partial rows anywhere
+      expect(one(db, 'SELECT COUNT(*) n FROM sale_items i WHERE NOT EXISTS (SELECT 1 FROM sales_headers h WHERE h.id = i.sale_id)')).toEqual({ n: 0 });
+      for (const r of rows) {
+        expect(r.items, `sale ${r.id} items`).toBe(1);
+        expect(r.grand_total, `sale ${r.id} total`).toBe(1000 + r.marker);
+        expect(r.ledger, `sale ${r.id} ledger rows`).toBe(r.method === 'UDHAR' ? 1 : 0);
+      }
+      // no duplicates: every request produced at most one sale
+      for (const [m, list] of byMarker) expect(list.length, `request ${m} stored ${list.length} times`).toBe(1);
+
+      // acknowledged requests are all present; interrupted ones are present-and-complete or absent
+      const committedInterrupted: number[] = [];
+      const rolledBack: number[] = [];
+      for (let i = 0; i < N; i++) {
+        const present = byMarker.has(i);
+        if (outcome[i] === 'ack') expect(present, `acknowledged request ${i} lost`).toBe(true);
+        else if (outcome[i] === 'interrupted') (present ? committedInterrupted : rolledBack).push(i);
+      }
+      expect(committedInterrupted.length + rolledBack.length).toBe(interrupted.length);
+
+      // money and stock agree exactly with what was stored
+      const udharDue = rows.filter((r) => r.method === 'UDHAR').reduce((s, r) => s + r.amount_due, 0);
+      expect(one<{ b: number }>(db, 'SELECT current_balance b FROM customers WHERE id = 2')!.b).toBe(startBalance + udharDue);
+      expect(one<{ stock: number }>(db, 'SELECT stock FROM products WHERE id = 3')!.stock).toBe(80 - rows.length);
+      console.log(`durability: ${outcome.filter((o) => o === 'ack').length} acknowledged (all present); ${interrupted.length} interrupted -> ${committedInterrupted.length} fully committed, ${rolledBack.length} fully rolled back; 0 partial, 0 duplicates`);
       db.close();
     } finally {
       await srv.stop();
     }
   });
+
+  // Deterministic crash points (PHARMACY_TEST_CRASH): the process is SIGKILLed at an exact moment of one sale.
+  for (const point of ['before-commit', 'after-commit'] as const) {
+    it(`crash ${point === 'before-commit' ? 'INSIDE the transaction (before COMMIT): the sale is fully absent' : 'AFTER COMMIT, before the reply: the sale is fully present although the client got no answer'}`, async () => {
+      const seedSrv = await startServer();
+      const workDir = seedSrv.workDir;
+      await seedSrv.stop();
+      const srv = await startServer({ workDir, env: { PHARMACY_TEST_CRASH: `${point}:POST /api/sales` } });
+      const admin = new Api();
+      await admin.login('admin', 'admin123');
+      const p = (await admin.get('/inventory')).body.find((x: any) => x.id === 3);
+      const before = (await admin.get('/customers')).body.find((c: any) => c.id === 2).current_balance;
+      let answered = false;
+      await admin.post('/sales', salePayload([cartItem(p, 4, { unit_price: 777 })], { payment_method: 'UDHAR', customer_id: 2 }))
+        .then(() => { answered = true; }, () => { /* connection dropped */ });
+      await srv.kill();
+      expect(answered).toBe(false);
+
+      const again = await startServer({ workDir });
+      try {
+        const db = await openReadOnly(again.dbFile);
+        const sales = all<{ id: number }>(db, 'SELECT h.id FROM sales_headers h JOIN sale_items i ON i.sale_id = h.id WHERE i.sale_price = 777');
+        const ledger = one<{ n: number }>(db, 'SELECT COUNT(*) n FROM customer_ledger WHERE debit = 3108')!.n;
+        const balance = one<{ b: number }>(db, 'SELECT current_balance b FROM customers WHERE id = 2')!.b;
+        const stock = one<{ s: number }>(db, 'SELECT stock s FROM products WHERE id = 3')!.s;
+        const audit = one<{ n: number }>(db, "SELECT COUNT(*) n FROM audit_logs WHERE action_type = 'CREATE_SALE'")!.n;
+        if (point === 'before-commit') {
+          expect({ sales: sales.length, ledger, balance, stock, audit }).toEqual({ sales: 0, ledger: 0, balance: before, stock: 80, audit: 0 });
+        } else {
+          expect({ sales: sales.length, ledger, balance, stock, audit }).toEqual({ sales: 1, ledger: 1, balance: before + 3108, stock: 76, audit: 1 });
+        }
+        expect(one(db, 'SELECT COUNT(*) n FROM sale_items i WHERE NOT EXISTS (SELECT 1 FROM sales_headers h WHERE h.id = i.sale_id)')).toEqual({ n: 0 });
+        expect(integrityCheck(db)).toEqual([]);
+        db.close();
+      } finally {
+        await again.stop();
+      }
+    });
+  }
 
   it('data written just before a hard kill is present after restart (no in-memory-only state)', async () => {
     let srv = await startServer();

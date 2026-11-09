@@ -56,7 +56,16 @@ describe('migrating every legacy fixture (copies only)', () => {
         expect(migration.applied.map((m) => m.version)).toEqual(MIGRATIONS.map((m) => m.version));
         expect(currentVersion(db)).toBe(LATEST);
         const counts = db.rowCounts();
-        for (const [t, n] of Object.entries(manifest[name].rowCounts)) expect(counts[t], `${name}.${t}`).toBe(n);
+        // every original row is still there; the only additions are FK1 placeholders (flagged, archived)
+        for (const [t, n] of Object.entries(manifest[name].rowCounts)) {
+          const cols = db.all<{ name: string }>(`PRAGMA table_info("${t}")`).map((c) => c.name);
+          const placeholders = cols.includes('is_placeholder') ? db.get<{ n: number }>(`SELECT COUNT(*) n FROM "${t}" WHERE is_placeholder = 1`)!.n : 0;
+          expect(counts[t] - placeholders, `${name}.${t}`).toBe(n);
+          if (placeholders) expect(db.get<{ n: number }>(`SELECT COUNT(*) n FROM "${t}" WHERE is_placeholder = 1 AND archived_at IS NULL`)!.n, `${name}.${t} placeholders archived`).toBe(0);
+        }
+        // FK5: clean references and enforcement on
+        expect(db.foreignKeyViolations()).toEqual([]);
+        expect(db.pragma('foreign_keys')).toBe(1);
         expect(invariants(db)).toEqual(manifest[name].invariants);
         expect(db.integrityCheck()).toEqual([]);
         expect(migration.backupFile).toBeTruthy();

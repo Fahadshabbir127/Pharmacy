@@ -1,3 +1,4 @@
+import { PRODUCT_NAME } from '../lib/branding';
 import React, { useState, useEffect } from 'react';
 import { User } from '../types';
 import { Pill, Shield, LogOut, Wifi, WifiOff, Printer, User as UserIcon, Clock, Menu, X, ShieldAlert, ArrowLeft } from 'lucide-react';
@@ -41,7 +42,7 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   const storeDisplayName = user?.role === 'SUPER_ADMIN' 
     ? 'SUPER VISOR PLATFORM CONTROL' 
-    : (user?.tenant_name || 'KHUSHI MEDICAL HALL POS');
+    : (user?.tenant_name || PRODUCT_NAME);
 
   const storeInitial = (storeDisplayName || 'K').trim().charAt(0).toUpperCase();
 
@@ -123,13 +124,13 @@ export const Navbar: React.FC<NavbarProps> = ({
       <div className="hidden lg:flex items-center space-x-5 text-[10px]">
         <div className="border-r border-emerald-700 pr-4 text-right">
           <span className="block opacity-70 text-[9px] uppercase font-bold">DB Status</span>
-          <span className="text-emerald-200 font-mono font-semibold">SQLite: Encrypted (WAL)</span>
+          <span className="text-emerald-200 font-mono font-semibold">SQLite (WAL, local)</span>
         </div>
 
         <div className="border-r border-emerald-700 pr-4 text-right">
-          <span className="block opacity-70 text-[9px] uppercase font-bold">SMS Queue</span>
+          <span className="block opacity-70 text-[9px] uppercase font-bold">Internet</span>
           <span className={`font-semibold ${isOnline ? 'text-emerald-300' : 'text-amber-300'}`}>
-            {isOnline ? 'Connected (Online)' : 'Offline (Queued)'}
+            {isOnline ? 'Online' : 'Offline (pharmacy still works)'}
           </span>
         </div>
 

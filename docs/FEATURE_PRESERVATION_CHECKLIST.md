@@ -187,3 +187,28 @@ All rows start as `pending`.
 ## 14. New capabilities required by the owner (not regressions; tracked here so they are verified)
 
 Batch inventory and FEFO · supplier returns · customer returns/refunds · configurable and split payments · tax configuration · shifts and cash reconciliation · branch invoice sequences · invoice templates · native printer selection · standalone, host and client modes · HTTPS pairing · real-time updates · verified encrypted backups with retention and an external drive. See `ARCHITECTURE.md`.
+
+## Status of the approved changes (after Phase 4)
+
+| Change | Status |
+|---|---|
+| C1 soft-void invoices | Not yet (Phase 7). Delete-invoice still works as before; FK enforcement is compatible with it. |
+| C2 reject oversell | Not yet (Phase 6, with batches/FEFO) |
+| C3 no silent offline queue; idempotent retry | **Done.** `client_txn_id`, SALE NOT CONFIRMED + Retry / Check status; legacy queue manual-review only; tested end to end including a host crash after COMMIT. |
+| C4 no forced/backdoor accounts, first-run admin | **Done** |
+| C5 OTP not returned; SMTP or admin approval | Not yet (Phase 10) |
+| C6 purchases keep batches | Not yet (Phase 6) |
+| C7 BrainTech branding, pharmacy's own name/logo | **Done** for names, receipts, purchase orders, messages and file names. Logo upload is not built yet. |
+| C8 per-install token secret, re-login | **Done** (plus: the role is read from the database, not the token) |
+| C9 server-side totals | Not yet (Phase 7) |
+| C10 "Mark as sent (manual dispatch)" label | Not yet (Phase 10) |
+| C11 no invented barcodes | **Done** (existing barcodes untouched) |
+| FK1–FK5 | **Done** (see `FK_AUDIT_REPORT.md` §5) |
+
+Features verified in the **desktop app** by automated end-to-end tests on Linux (not yet on Windows):
+- login (A1);
+- POS search by batch, cart, cash sale, receipt, invoice download (P1, P4, P8, P10, P16, P17);
+- persistence across restart;
+- data shared between host and client.
+
+All other rows remain `pending` until they are checked on Windows.

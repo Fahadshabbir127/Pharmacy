@@ -1,9 +1,9 @@
 {
-  "name": "khushi-medical-hall-pos",
+  "name": "braintech-pharmacy-ai",
   "private": true,
   "version": "1.0.0",
   "type": "module",
-  "main": "electron-main.js",
+  "main": "dist-electron/main.cjs",
   "scripts": {
     "dev": "tsx server.ts",
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
@@ -15,14 +15,19 @@
     "test:characterization": "vitest run tests/characterization",
     "fixtures:legacy": "vitest run tests/characterization/06-legacy-fixtures.test.ts",
     "audit:db-callsites": "tsx scripts/audit-db-callsites.ts server.ts",
-    "audit:fk": "tsx scripts/fk-audit.ts"
+    "audit:fk": "tsx scripts/fk-audit.ts",
+    "build:web": "vite build",
+    "build:electron": "node scripts/build-electron.mjs",
+    "build:desktop": "npm run build:web && npm run build:electron",
+    "desktop": "npm run build:desktop && electron .",
+    "test:e2e": "npm run build:desktop && vitest run -c vitest.e2e.config.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
     "@tailwindcss/vite": "^4.1.14",
     "@vitejs/plugin-react": "^5.0.4",
     "bcryptjs": "^3.0.3",
-    "better-sqlite3": "^12.4.1",
+    "better-sqlite3": "^13.0.3",
     "cors": "^2.8.6",
     "dotenv": "^17.2.3",
     "express": "^4.21.2",
@@ -32,10 +37,12 @@
     "motion": "^12.23.24",
     "mysql2": "^3.23.1",
     "node-cron": "^4.6.0",
+    "node-forge": "^1.3.1",
     "react": "^19.0.1",
     "react-dom": "^19.0.1",
     "vite": "^6.2.3",
-    "xlsx": "^0.18.5"
+    "xlsx": "^0.18.5",
+    "zod": "^3.25.76"
   },
   "devDependencies": {
     "@types/bcryptjs": "^3.0.0",
@@ -45,8 +52,10 @@
     "@types/jsonwebtoken": "^9.0.10",
     "@types/node": "^22.14.0",
     "@types/node-cron": "^3.0.11",
+    "@types/node-forge": "^1.3.14",
     "@types/sql.js": "^1.4.11",
     "autoprefixer": "^10.4.21",
+    "electron": "^45.2.3",
     "esbuild": "^0.25.0",
     "sql.js": "^1.14.1",
     "tailwindcss": "^4.1.14",
@@ -54,5 +63,7 @@
     "typescript": "~5.8.2",
     "vite": "^6.2.3",
     "vitest": "^3.2.4"
-  }
+  },
+  "productName": "BrainTech Pharmacy AI",
+  "description": "BrainTech Pharmacy AI - offline-first pharmacy management for Windows with LAN host/client support"
 }

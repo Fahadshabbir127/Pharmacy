@@ -68,7 +68,7 @@ export const CustomerPortalScreen: React.FC = () => {
             <div className="text-xs text-slate-400 flex items-center space-x-3 mt-1">
               <span className="flex items-center"><Phone className="w-3.5 h-3.5 mr-1" />{customer.phone}</span>
               <span>•</span>
-              <span className="flex items-center"><MapPin className="w-3.5 h-3.5 mr-1" />{customer.address || 'Khushi Medical Customer'}</span>
+              <span className="flex items-center"><MapPin className="w-3.5 h-3.5 mr-1" />{customer.address || 'Registered customer'}</span>
             </div>
           </div>
         </div>

@@ -20,7 +20,14 @@ class RollbackAfterErrorResponse extends Error {}
 
 type HeldCall = { method: 'json' | 'send' | 'end' | 'sendFile'; args: unknown[] };
 
-export function transactionalRoute<Req extends Request>(getDb: () => DbAdapter, handler: Handler<Req>) {
+export interface TransactionHooks {
+  /** Called inside the transaction after the handler, just before COMMIT. */
+  beforeCommit?(req: Request): void;
+  /** Called after COMMIT, before the held response is sent. */
+  afterCommit?(req: Request): void;
+}
+
+export function transactionalRoute<Req extends Request>(getDb: () => DbAdapter, handler: Handler<Req>, hooks: TransactionHooks = {}) {
   if (handler.constructor.name === 'AsyncFunction') {
     throw new TypeError('transactionalRoute cannot wrap an async handler');
   }
@@ -45,6 +52,7 @@ export function transactionalRoute<Req extends Request>(getDb: () => DbAdapter, 
           throw new TypeError('transactionalRoute handler returned a Promise');
         }
         if (res.statusCode >= 500) throw new RollbackAfterErrorResponse();
+        hooks.beforeCommit?.(req);
       });
     } catch (e) {
       restore();
@@ -55,6 +63,7 @@ export function transactionalRoute<Req extends Request>(getDb: () => DbAdapter, 
       }
     }
     restore();
+    hooks.afterCommit?.(req);
     for (const call of held) (res as any)[call.method](...call.args);
   };
 }

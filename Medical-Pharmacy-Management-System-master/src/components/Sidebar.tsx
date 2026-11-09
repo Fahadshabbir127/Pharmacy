@@ -1,3 +1,4 @@
+import { PRODUCT_NAME } from '../lib/branding';
 import React from 'react';
 import { UserRole } from '../types';
 import { 
@@ -273,7 +274,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           )}
 
           <div className="p-2 bg-slate-800/60 rounded border border-slate-800 text-[10px] text-slate-400 text-center leading-tight">
-            <p className="font-bold text-slate-300">Khushi Medical Hall</p>
+            <p className="font-bold text-slate-300">{PRODUCT_NAME}</p>
             <p className="text-[9px] text-emerald-400 font-mono mt-0.5">LOCAL DB ACTIVE</p>
           </div>
         </div>

@@ -56,56 +56,75 @@ describe('fk-audit script', () => {
   });
 });
 
-describe('impact of enabling foreign_keys=ON today (why it stays OFF until approved fixes)', () => {
-  async function migratedCopy(name: string): Promise<DbAdapter> {
+describe('FK1/FK5: placeholders make every legacy database consistent, then enforcement is on', () => {
+  async function migrated(name: string): Promise<{ db: DbAdapter; file: string }> {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fk-on-'));
     const file = path.join(dir, 'db.sqlite');
     fs.copyFileSync(fx(name), file);
-    (await openDatabase(file, { backupDir: path.join(dir, 'b') })).db.close();
-    return DbAdapter.open(file, { foreignKeys: true });
+    const { db } = await openDatabase(file, { backupDir: path.join(dir, 'b') });
+    return { db, file };
   }
   const fails = (db: DbAdapter, fn: () => void) => {
     try { db.transaction(fn); return false; } catch (e: any) { return /FOREIGN KEY constraint failed/.test(e.message); }
   };
 
-  it('app "delete product" (DELETE FROM products) fails for a product with sales history', async () => {
-    const db = await migratedCopy('busy-store');
+  it('all seven legacy databases: foreign_key_check is empty after migration and enforcement is ON', async () => {
+    for (const n of ['fresh-first-boot', 'after-restart', 'busy-store', 'multi-tenant', 'orphans', 'pre-tenant-raw', 'pre-tenant-migrated-by-original']) {
+      const { db } = await migrated(n);
+      expect(db.foreignKeyViolations(), n).toEqual([]);
+      expect(db.pragma('foreign_keys'), n).toBe(1);
+      db.close();
+    }
+  });
+
+  it('orphans: placeholders reuse the exact missing ids; the invoice keeps its line, amounts and customer link', async () => {
+    const before = auditDatabase(fx('orphans')).findings;
+    const { db } = await migrated('orphans');
+    const ph = db.all<any>('SELECT id, name, archived_at, is_placeholder, stock, sale_price FROM products WHERE is_placeholder = 1');
+    expect(ph).toHaveLength(1);
+    expect(ph[0]).toMatchObject({ name: `[Deleted product #${ph[0].id}]`, is_placeholder: 1, stock: 0, sale_price: 0 });
+    expect(ph[0].archived_at).toBeTruthy();
+    const line = db.get<any>('SELECT si.subtotal, si.sale_price, p.name FROM sale_items si JOIN products p ON p.id = si.product_id WHERE p.id = ?', [ph[0].id]);
+    expect(line).toMatchObject({ subtotal: 10, sale_price: 10, name: `[Deleted product #${ph[0].id}]` });
+    const cust = db.get<any>('SELECT c.name, c.is_placeholder FROM sales_headers h JOIN customers c ON c.id = h.customer_id WHERE c.is_placeholder = 1');
+    expect(cust.name).toMatch(/^\[Deleted customer #\d+\]$/);
+    expect(before.length).toBe(2);
+    db.close();
+  });
+
+  it('multi-tenant: the deleted store, its invoice headers and products come back as archived placeholders; totals unchanged', async () => {
+    const { db } = await migrated('multi-tenant');
+    expect(db.get<any>("SELECT name, status, archived_at IS NOT NULL a FROM tenants WHERE is_placeholder = 1")).toMatchObject({ status: 'DELETED', a: 1 });
+    const headers = db.all<any>('SELECT invoice_number, grand_total, sale_date FROM sales_headers WHERE is_placeholder = 1');
+    expect(headers.length).toBe(3);
+    for (const h of headers) expect(h).toMatchObject({ grand_total: 0, sale_date: '1970-01-01 00:00:00' });
+    db.close();
+  });
+
+  it('with enforcement on, a sale line for a non-existent product is now rejected', async () => {
+    const { db } = await migrated('busy-store');
+    expect(fails(db, () => db.run("INSERT INTO sale_items (sale_id, product_id, quantity, unit, sale_price, cost_price, subtotal) VALUES (1, 99999, 1, 'Pack', 1, 1, 1)"))).toBe(true);
+    db.close();
+  });
+
+  it('with enforcement on, a raw DELETE of a product with history is blocked (the app archives instead)', async () => {
+    const { db } = await migrated('busy-store');
     expect(fails(db, () => db.run('DELETE FROM products WHERE id = 1'))).toBe(true);
     db.close();
   });
 
-  it('app "delete customer" (ledger/queues/users then customer) fails while their invoices exist', async () => {
-    const db = await migratedCopy('busy-store');
-    const c = db.get<{ customer_id: number }>('SELECT customer_id FROM sales_headers WHERE customer_id IS NOT NULL LIMIT 1')!.customer_id;
-    expect(fails(db, () => {
-      for (const sql of ['DELETE FROM customer_ledger WHERE customer_id = ?', 'DELETE FROM email_queue WHERE customer_id = ?', 'DELETE FROM sms_queue WHERE customer_id = ?', 'DELETE FROM users WHERE customer_id = ?', 'DELETE FROM customers WHERE id = ?']) db.run(sql, [c]);
-    })).toBe(true);
-    db.close();
-  });
-
-  it('app "delete user" fails for a user who created sales', async () => {
-    const db = await migratedCopy('busy-store');
-    expect(fails(db, () => db.run("DELETE FROM users WHERE username = 'admin'"))).toBe(true);
-    db.close();
-  });
-
-  it('app "void invoice" (items first, then header) still works with enforcement on', async () => {
-    const db = await migratedCopy('busy-store');
+  it('voiding an invoice (items first, then header) still works with enforcement on', async () => {
+    const { db } = await migrated('busy-store');
     const id = db.get<{ id: number }>('SELECT id FROM sales_headers ORDER BY id DESC LIMIT 1')!.id;
     expect(fails(db, () => { db.run('DELETE FROM sale_items WHERE sale_id = ?', [id]); db.run('DELETE FROM sales_headers WHERE id = ?', [id]); })).toBe(false);
     db.close();
   });
 
-  it('a sale for a non-existent product is rejected with enforcement on (it is accepted today)', async () => {
-    const db = await migratedCopy('busy-store');
-    expect(fails(db, () => db.run("INSERT INTO sale_items (sale_id, product_id, quantity, unit, sale_price, cost_price, subtotal) VALUES (1, 99999, 1, 'Pack', 1, 1, 1)"))).toBe(true);
+  it('a database with a new unresolvable violation is refused at startup (not auto-repaired)', async () => {
+    const { db, file } = await migrated('busy-store');
+    db.setForeignKeys(false);
+    db.run('INSERT INTO customer_ledger (customer_id, type, debit, credit, balance_after) VALUES (424242, \'PAYMENT\', 0, 1, 0)');
     db.close();
-  });
-
-  it('existing orphans do not block opening or reading, but foreign_key_check reports them', async () => {
-    const db = await migratedCopy('orphans');
-    expect(db.all('PRAGMA foreign_key_check').length).toBe(2);
-    expect(db.get<{ n: number }>('SELECT COUNT(*) n FROM sale_items')!.n).toBeGreaterThan(0);
-    db.close();
+    await expect(openDatabase(file, { backupDir: path.join(path.dirname(file), 'b') })).rejects.toThrow(/broken reference/);
   });
 });

@@ -9,7 +9,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { DbAdapter } from './adapter';
-import { migrate, MigrationReport } from './migrate';
+import { migrate, MigrationReport, MigrationError } from './migrate';
 import { MIGRATIONS } from './migrations';
 
 export class DatabaseIntegrityError extends Error {
@@ -45,9 +45,19 @@ export async function openDatabase(
     const problems = checkExistingDatabase(file);
     if (problems.length) throw new DatabaseIntegrityError(file, problems);
   }
-  const db = DbAdapter.open(file);
+  const db = DbAdapter.open(file); // migrations run with foreign_keys OFF (legacy data may contain orphans)
   try {
     const migration = await migrate(db, MIGRATIONS, opts);
+    // FK5: only switch enforcement on when the database is fully consistent. Nothing is auto-repaired here:
+    // migration 0005 already created placeholders, so anything left is a new problem to report.
+    const violations = db.foreignKeyViolations();
+    if (violations.length) {
+      throw new MigrationError(
+        `The database has ${violations.length} broken reference(s) that could not be resolved; it was not opened for use.`,
+        { violations: violations.slice(0, 20) },
+      );
+    }
+    db.setForeignKeys(true);
     return { db, migration, created: !existed };
   } catch (e) {
     db.close();

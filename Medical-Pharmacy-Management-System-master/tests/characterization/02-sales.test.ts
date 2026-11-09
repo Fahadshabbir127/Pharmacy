@@ -25,8 +25,8 @@ describe('cash sale', () => {
     const p = await product(1); // Panadol, stock 120, price 220
     const r = await admin.post('/sales', salePayload([cartItem(p, 3)]));
     expect(r.status).toBe(200);
-    // fresh DB: the seeded INV-1001 has tenant_id NULL (see 00-startup), so the count is 0
-    expect(r.body).toMatchObject({ invoice_number: 'INV-1-1001', grand_total: 660, amount_paid: 660, amount_due: 0 });
+    // the seeded INV-1001 now belongs to store #1 from the first start, so the next number is 1001 + 1
+    expect(r.body).toMatchObject({ invoice_number: 'INV-1-1002', grand_total: 660, amount_paid: 660, amount_due: 0 });
     expect((await product(1)).stock).toBe(117);
 
     const detail = await admin.get(`/sales/${r.body.sale_id}`);
@@ -114,11 +114,11 @@ describe('known defects in the sale path', () => {
 
   it('[LEGACY-BUG R4] after deleting an older invoice, the next sale fails on a duplicate invoice number', async () => {
     const p = await product(1);
-    const s1 = await admin.post('/sales', salePayload([cartItem(p, 1)])); // INV-1-1001
-    const s2 = await admin.post('/sales', salePayload([cartItem(p, 1)])); // INV-1-1002
-    expect(s2.body.invoice_number).toBe('INV-1-1002');
+    const s1 = await admin.post('/sales', salePayload([cartItem(p, 1)])); // INV-1-1002
+    const s2 = await admin.post('/sales', salePayload([cartItem(p, 1)])); // INV-1-1003
+    expect(s2.body.invoice_number).toBe('INV-1-1003');
     expect((await admin.del(`/sales/${s1.body.sale_id}`)).status).toBe(200);
-    const s3 = await admin.post('/sales', salePayload([cartItem(p, 1)])); // computes INV-1-1002 again
+    const s3 = await admin.post('/sales', salePayload([cartItem(p, 1)])); // computes INV-1-1003 again
     expect(s3.status).toBe(500);
     expect(s3.body.error).toMatch(/UNIQUE/i);
   });
@@ -131,21 +131,30 @@ describe('known defects in the sale path', () => {
     expect(s2.body.invoice_number).toBe(s1.body.invoice_number);
   });
 
-  it('[LEGACY-BUG] a sale referencing a non-existent product id is recorded (no FK / existence check)', async () => {
+  // FK5 fix (was: the sale was recorded against a product that does not exist)
+  it('[FIXED FK5] a sale referencing a non-existent product id is rejected and nothing is recorded', async () => {
     const ghost = { id: 99999, name: 'Ghost', unit: 'Pack', sale_price: 10, purchase_price: 5, gst_rate: 0 };
     const r = await admin.post('/sales', salePayload([cartItem(ghost, 1)]));
-    expect(r.status).toBe(200);
+    expect(r.status).toBe(500);
+    expect(r.body.error).toMatch(/FOREIGN KEY/);
+    const db = await openReadOnly(srv.dbFile);
+    expect(one(db, "SELECT COUNT(*) n FROM sales_headers WHERE invoice_number LIKE 'INV-1-%'")).toEqual({ n: 0 });
   });
 
-  it('[LEGACY-BUG] deleting a product hides its lines from past invoice details (inner JOIN)', async () => {
+  // FK2 fix (was: deleting the product made its lines disappear from past invoices)
+  it('[FIXED FK2] deleting a sold product archives it: past invoices keep the line, the product leaves the active list', async () => {
     const add = await admin.post('/inventory', { name: 'Temp Med', unit: 'Pack', purchase_price: 5, sale_price: 10, stock: 10 });
     const p = await product(add.body.id);
     const s = await admin.post('/sales', salePayload([cartItem(p, 1)]));
     expect((await admin.get(`/sales/${s.body.sale_id}`)).body.items).toHaveLength(1);
-    expect((await admin.del(`/inventory/${p.id}`)).status).toBe(200);
+    const del = await admin.del(`/inventory/${p.id}`);
+    expect(del.status).toBe(200);
+    expect(del.body.archived).toBe(true);
     const after = await admin.get(`/sales/${s.body.sale_id}`);
-    expect(after.body.items).toHaveLength(0);
+    expect(after.body.items).toHaveLength(1);
+    expect(after.body.items[0]).toMatchObject({ product_name: 'Temp Med', subtotal: 10 });
     expect(after.body.grand_total).toBe(10);
+    expect(await product(p.id)).toBeUndefined();
   });
 });
 
@@ -202,8 +211,8 @@ describe('sales history', () => {
     const p = await product(1);
     await admin.post('/sales', salePayload([cartItem(p, 1)], { payment_method: 'UDHAR', customer_id: 2 }));
     const allSales = (await admin.get('/sales/history')).body;
-    // [LEGACY-BUG] the seeded demo sale (tenant_id NULL, creator tenant_id NULL on first boot) is not listed
-    expect(allSales.length).toBe(1);
+    // first-boot fix: the seeded demo sale is listed too
+    expect(allSales.length).toBe(2);
     const forCust = (await admin.get('/sales/history?customer_id=2')).body;
     expect(forCust).toHaveLength(1);
     expect(forCust[0]).toMatchObject({ customer_name: 'Tariq Mahmood', created_by_name: 'Muhammad Asghar (Owner)' });

@@ -4,6 +4,105 @@ This report contains only results that were actually executed. Anything not exec
 
 ---
 
+## Phase 4: desktop app, FK1–FK5, first-run setup, HTTPS LAN host/client
+
+| | |
+|---|---|
+| Date | 2026-11-09 |
+| Environment | Linux container (no Windows), Node 22.23.4, **Electron 45.2.3** under `xvfb-run`, Playwright's Electron driver |
+| Commands | `npm test` (unit + backend), `xvfb-run -a npm run test:e2e` (builds UI + desktop runtime, then drives the real app) |
+| Result | **Unit/backend: 15 files, 220 tests, all passing. Desktop end-to-end: 2 files, 17 tests, all passing on two consecutive runs.** `npm run lint` clean; `audit:db-callsites` 0 problems; no stray processes after the runs. |
+
+### What the desktop end-to-end tests do (real app, real UI, real backend in Electron's utilityProcess)
+
+**Single computer, `standalone.e2e.ts` (12 tests).**
+
+First run and data layout:
+- First start opens the setup wizard; no demo login works.
+- Wizard flow: "Single computer", "Start a new pharmacy", create the administrator with the demo catalogue, open the pharmacy.
+- The login screen shows the pharmacy's own name.
+- `config.json`, `data/pharmacy.sqlite`, the certificate, its key and the logs are all in the data folder.
+
+Security:
+- The page has no `require`, `process` or `module`. `window.braintech` is frozen, with the exact expected keys.
+- The sandboxed preload bundle requires only `electron`.
+- Navigation to a website is blocked, and `window.open` to a website is refused.
+- An `about:blank` print popup **cannot call the privileged API**.
+- HTML responses carry a strict Content-Security-Policy.
+- API traffic goes through the pinned HTTPS proxy.
+
+POS through the real UI:
+- Sign in, type a batch number, press Enter, CASH, "Complete Sale & Print Receipt".
+- The receipt is built from the **saved** sale, `Invoice_INV-1-n.txt` is saved, and stock drops by 1.
+- The same `client_txn_id` sent twice through the desktop proxy records one sale.
+
+Restart:
+- Closing and reopening goes straight to the pharmacy; every sale and the stock level are still there.
+
+**Host + client, `lan.e2e.ts` (5 tests).** Two app instances with separate data folders.
+
+Pairing:
+- The host shows its address, port and pairing code.
+- With a **wrong code, the client itself rejects the host's proof**.
+- With the right code it pairs, and the host lists "Billing Counter".
+- The client keeps **no database** and stores the pinned fingerprint.
+
+Shared data:
+- The client signs in with the host's account and sees the host's 12 products.
+- A **cash sale made in the client UI** reduces the host's stock and appears in its register.
+- A stock adjustment on the host is visible on the client.
+
+Host crash **after COMMIT, before the reply** (one-shot test crash point):
+- The client shows **SALE NOT CONFIRMED** and keeps the cart.
+- The host's supervisor restarts its backend by itself, and the client reconnects.
+- **"Check status" finds the sale**, the receipt appears, and stock dropped **exactly once**.
+
+Host computer closed:
+- The client shows the blocking "Pharmacy server unreachable" overlay, and API calls answer 503 `HOST_UNREACHABLE` / outcome `UNKNOWN`.
+- When the host restarts, the client reconnects by itself and the overlay disappears.
+
+### New backend tests (`npm test`)
+
+| File | Tests | Covers |
+|---|---|---|
+| `08-archiving.test.ts` | 9 | FK2/FK3: archive product, customer, user, supplier, store with history; hidden from lists and counts, still on invoices, reports and ledgers; archived logins blocked; unique values reusable; no re-assignment of a user's sales; FK enforced at runtime |
+| `09-desktop-backend.test.ts` | 13 | First-run admin (C4): weak password, duplicate, loopback-only, no demo logins, demo catalogue without accounts. Health endpoint, idempotent sales and status lookup. HTTPS-only host: plain HTTP refused, wrong pin refused, **real non-private address refused**. Local admin token. Pairing (wrong code, right code, token hash stored, revoke). **Impostor certificate relaying the real host's answers fails even with the right code.** Standalone refuses network requests. |
+| `lan-guard-pairing.test.ts` | 15 | Address ranges; guard decisions with simulated private/public addresses and valid/revoked/missing client tokens; pairing proofs, replay, code rotation and expiry; certificate SANs, validity and fingerprint; JWT secret file; UDP discovery (answer, junk ignored, none found) |
+| `07-durability.test.ts` | +2 | Every interrupted sale traced individually; deterministic crash **inside** the transaction (sale fully absent) and **after COMMIT** (sale fully present) |
+| `migrations.test.ts`, `fk-audit.test.ts` | updated | All 7 old-format databases: placeholders with the exact missing ids, every original row kept, totals identical, `foreign_key_check` empty, enforcement ON; a new unresolved violation stops startup |
+
+### Crash test (approval condition 5)
+
+- **Random hard kill during a burst** (run in every full-suite run, more than 5 times): 25 acknowledged sales were all present. The 30 interrupted requests were each either fully committed or fully absent; most runs were 0 committed / 30 rolled back, and one run was 1 / 29. There were **0 partial rows and 0 duplicates** across header, line, balance and ledger.
+- **Deterministic crash points** make the two hard cases certain, not luck: a crash *inside* the transaction leaves nothing, and a crash *after COMMIT* leaves the complete sale.
+
+### Defects found and fixed during Phase 4
+
+| Defect | Found by | Status |
+|---|---|---|
+| **Certificate pin not enforced**: Node skips `checkServerIdentity` for self-signed certificates | wrong-pin test | Fixed: the pin is checked on the socket before sending |
+| Bundled backend crashed at load (`node-cron` uses `import.meta.url`) | first desktop launch | Fixed in the build |
+| That fix broke the sandboxed preload (`window.braintech` missing) | E2E wizard test | Fixed; regression test added |
+| A startup database error showed a blocking dialog before any window existed | E2E | Now shows the settings page with the reason |
+| UI claimed "SQLite: Encrypted (WAL)"; the database is **not** encrypted at rest | screenshot review | Label corrected |
+| Receipts and purchase orders printed another store's address, phone, NTN and a **made-up drug licence number** when the pharmacy had not set its own | screenshot review | Only the pharmacy's own settings are printed |
+| Legacy: deleting a user re-assigned their sales to user #1; system emails used fake customer ids (PO emails used the supplier id) | FK work | Fixed |
+| Legacy: first boot left every seeded row without a store (`tenant_id NULL`) | Phase 2 finding | Fixed |
+
+### Not executed (honest list)
+
+| Area | Status |
+|---|---|
+| **Windows**: install, run, uninstall, SmartScreen, Firewall prompts, ProgramData permissions, DPAPI | **Not executed.** No Windows machine; installer is Phase 11 (GitHub Actions `windows-latest`). |
+| Real multi-computer LAN, Wi-Fi drop, router restart, DHCP address change | **Not executed.** Both instances ran on one Linux computer over 127.0.0.1. |
+| Client-token enforcement for real LAN addresses | Unit-tested with simulated addresses only (loopback bypasses it by design) |
+| UDP discovery between computers | Unit-tested over loopback only; the container's network is not a private LAN |
+| Printers (Windows, thermal, preview), USB barcode scanners, webcams | **Not executed** (no hardware). Camera permission policy is implemented; native printing IPC exists; the existing `window.print()` paths are kept. |
+| `safeStorage` on Windows | Not executed. On this Linux test system it reported encryption available. |
+| Long-running stability, memory | Not executed |
+
+---
+
 ## Phase 3: database layer (better-sqlite3), migrations, transactions, FK audit
 
 | | |
