@@ -30,7 +30,9 @@ export async function launch(base: string, extraEnv: Record<string, string> = {}
   const app = await _electron.launch({
     executablePath: ELECTRON,
     args: [ROOT, '--no-sandbox'],
-    env: { ...process.env, BRAINTECH_DATA_ROOT: dataRoot, BRAINTECH_USER_DATA: path.join(base, 'profile'), BRAINTECH_E2E: '1', BRAINTECH_E2E_DOWNLOADS: downloads, PHARMACY_TEST_LEGACY_SEED: '', ...extraEnv },
+    env: { ...process.env, BRAINTECH_DATA_ROOT: dataRoot, BRAINTECH_USER_DATA: path.join(base, 'profile'), BRAINTECH_E2E: '1', BRAINTECH_E2E_DOWNLOADS: downloads, PHARMACY_TEST_LEGACY_SEED: '',
+      // fixed pharmacy date (tests only; the backend logs a warning): the demo catalogue's expiry dates must not decide test outcomes
+      PHARMACY_TEST_TODAY: '2026-06-01', ...extraEnv },
     timeout: 90_000,
   });
   const logs: string[] = [];
@@ -81,6 +83,15 @@ export async function loginUi(win: Page, user: string, password: string) {
   } catch (e) {
     await win.screenshot({ path: path.join(os.tmpdir(), `bt-e2e-login-failure-${Date.now()}.png`) });
     throw new Error(`login did not reach the POS screen; visible text: ${(await win.evaluate(() => document.body.innerText)).slice(0, 400)}`);
+  }
+}
+
+/** Turn the app's "Print on Save" off (the native print dialog cannot be driven by a test and blocks the window). */
+export async function printOff(win: Page) {
+  await win.waitForSelector('button:has-text("Print on Save:")', { timeout: 30_000 });
+  if (await win.locator('button:has-text("Print on Save: ON")').count()) {
+    await win.click('button:has-text("Print on Save: ON")');
+    await win.waitForSelector('button:has-text("Print on Save: OFF")');
   }
 }
 

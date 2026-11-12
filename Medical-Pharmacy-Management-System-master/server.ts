@@ -20,6 +20,10 @@ import { PairingManager, PairingError, hashToken, safeEqualHex } from './server/
 import { certificateFingerprint, shortFingerprint } from './server/lan/tls';
 import { loadOrCreateJwtSecret } from './server/security/jwtSecret';
 import { currentVersion } from './server/db/migrate';
+import { today, addDays, isExpired, batchStatus, parseExpiryInput, parseMfgInput } from './server/inventory/expiry';
+import { planFefo, weightedCost, fefoOrder, LineRequest } from './server/inventory/fefo';
+import { createBatch, takeFromBatch, addToBatch, batchesFor, inventoryInvariantIssues, StockConflictError } from './server/inventory/batches';
+import { normalizeExpiry } from './server/inventory/expiry';
 
 const PORT = Number(process.env.PHARMACY_PORT) || 3000;
 // C8: per-installation secret (set in startServer). The original public fallback secret is gone.
@@ -92,7 +96,7 @@ async function initDatabase() {
     }
     if (db.get("SELECT 1 AS x FROM tenants WHERE id = 1")) {
       db.run("UPDATE users SET tenant_id = 1 WHERE tenant_id IS NULL AND role != 'SUPER_ADMIN' AND is_placeholder = 0");
-      for (const t of ['products', 'sales_headers', 'customers', 'categories', 'suppliers', 'purchase_headers', 'stock_adjustments', 'settings']) {
+      for (const t of ['products', 'sales_headers', 'customers', 'categories', 'suppliers', 'purchase_headers', 'stock_adjustments', 'settings', 'product_batches']) {
         db.run(`UPDATE ${t} SET tenant_id = 1 WHERE tenant_id IS NULL${['products', 'sales_headers', 'customers', 'categories', 'suppliers', 'purchase_headers'].includes(t) ? ' AND is_placeholder = 0' : ''}`);
       }
     }
@@ -101,6 +105,19 @@ async function initDatabase() {
   });
 
   console.log("SQLite Database initialized successfully.");
+  checkInventoryAtStartup();
+}
+
+/** Phase 6: report (never repair) inventory problems at startup; shown on the host status screen. */
+let inventoryStartupReport: { checkedAt: string; issues: any[]; migrationIssues: number; testDateOverride: string | null } | null = null;
+function checkInventoryAtStartup() {
+  const override = process.env.PHARMACY_TEST_TODAY || null;
+  if (override) console.warn(`[INVENTORY] WARNING: PHARMACY_TEST_TODAY=${override} is set. Expiry checks use this date instead of the real date. This is for automated tests only.`);
+  const issues = inventoryInvariantIssues(db);
+  const migrationIssues = db.get<{ n: number }>("SELECT COUNT(*) AS n FROM inventory_migration_issues")?.n ?? 0;
+  if (issues.length) console.error(`[INVENTORY] ${issues.length} inventory consistency problem(s) found (nothing was changed): ${JSON.stringify(issues.slice(0, 20))}`);
+  if (migrationIssues) console.warn(`[INVENTORY] ${migrationIssues} item(s) were recorded during the batch upgrade (see inventory_migration_issues / audit log).`);
+  inventoryStartupReport = { checkedAt: new Date().toISOString(), issues, migrationIssues, testDateOverride: override };
 }
 
 // Query helpers (delegate to the DB adapter).
@@ -358,6 +375,7 @@ async function startServer() {
     if (b.loadDemoData && !db.get("SELECT 1 AS x FROM products LIMIT 1")) {
       seedDemoCatalog(db, adminId);
       for (const t of ['products', 'sales_headers', 'customers', 'categories', 'suppliers']) db.run(`UPDATE ${t} SET tenant_id = 1 WHERE tenant_id IS NULL AND is_placeholder = 0`);
+      db.run('UPDATE product_batches SET tenant_id = 1 WHERE tenant_id IS NULL');
     }
     logAudit(adminId, b.ownerName, 'SETUP_INITIAL_ADMIN', `First-run setup: store "${b.storeName}" and administrator "${b.username}" created${b.loadDemoData ? ' (with demo catalogue)' : ''}`, 'USER', adminId, req, 1);
     res.json({ ok: true, username: b.username });
@@ -378,6 +396,7 @@ async function startServer() {
       db: { ok: true, file: DB_FILE, sizeBytes, schemaVersion: currentVersion(db), integrity: 'checked at startup' },
       lastBackup: backups.length ? backups[backups.length - 1] : null,
       needsSetup: needsSetup(),
+      inventory: inventoryStartupReport,
     });
   });
   app.post('/api/local/pairing/rotate', requireLocal, (req, res) => { pairing.rotate(); res.json(pairing.current()); });
@@ -1143,9 +1162,10 @@ async function startServer() {
     }
 
     if (search) {
-      sql += ` AND (p.name LIKE ? OR p.batch_number LIKE ? OR p.hsn_code LIKE ? OR p.barcode LIKE ? OR CAST(p.id AS TEXT) = ?)`;
+      sql += ` AND (p.name LIKE ? OR p.batch_number LIKE ? OR p.hsn_code LIKE ? OR p.barcode LIKE ? OR CAST(p.id AS TEXT) = ?
+               OR EXISTS (SELECT 1 FROM product_batches sb WHERE sb.product_id = p.id AND sb.qty_on_hand > 0 AND sb.batch_number LIKE ?))`;
       const term = `%${search}%`;
-      params.push(term, term, term, term, String(search).trim());
+      params.push(term, term, term, term, String(search).trim(), term);
     }
 
     if (category_id) {
@@ -1153,24 +1173,58 @@ async function startServer() {
       params.push(Number(category_id));
     }
 
+    const onDate = today();
     if (low_stock === 'true') {
-      sql += ` AND p.stock <= p.min_stock`;
+      // sellable stock (expired batches cannot be sold) at or below the minimum
+      sql += ` AND (SELECT COALESCE(SUM(lb.qty_on_hand), 0) FROM product_batches lb WHERE lb.product_id = p.id AND (lb.expiry_date IS NULL OR lb.expiry_date >= ?)) <= p.min_stock`;
+      params.push(onDate);
     }
 
     if (expiring === 'true' || req.query.expiry_days) {
       const days = Number(req.query.expiry_days) || 90;
-      const targetDate = new Date();
-      targetDate.setDate(targetDate.getDate() + days);
-      const dateStr = targetDate.toISOString().split('T')[0];
-      sql += ` AND p.expiry_date <= ? AND p.expiry_date != ''`;
-      params.push(dateStr);
+      sql += ` AND EXISTS (SELECT 1 FROM product_batches eb WHERE eb.product_id = p.id AND eb.qty_on_hand > 0 AND eb.expiry_date IS NOT NULL AND eb.expiry_date <= ?)`;
+      params.push(addDays(onDate, days));
     }
 
     sql += ` ORDER BY p.name ASC`;
 
-    const products = queryAll(sql, params);
-    res.json(products);
+    const products = queryAll<any>(sql, params);
+    res.json(withBatchSummary(products, onDate));
   });
+
+  /**
+   * Phase 6: each product carries a summary of its batches. batch_number / expiry_date describe the
+   * batch FEFO will sell next (or the earliest expired one if nothing is sellable), so existing screens
+   * keep showing sensible values.
+   */
+  function withBatchSummary(products: any[], onDate: string): any[] {
+    if (!products.length) return products;
+    const ids = products.map((p) => p.id);
+    const rows: any[] = [];
+    for (let i = 0; i < ids.length; i += 500) {
+      const chunk = ids.slice(i, i + 500);
+      rows.push(...queryAll<any>(`SELECT id, product_id, batch_number, expiry_date, qty_on_hand, purchase_price, sale_price FROM product_batches WHERE qty_on_hand > 0 AND product_id IN (${chunk.map(() => '?').join(',')})`, chunk));
+    }
+    const byProduct = new Map<number, any[]>();
+    for (const r of rows) byProduct.set(r.product_id, [...(byProduct.get(r.product_id) ?? []), r]);
+    return products.map((p) => {
+      const list = (byProduct.get(p.id) ?? []).sort(fefoOrder);
+      const sellable = list.filter((b) => !isExpired(b.expiry_date, onDate));
+      const expired = list.filter((b) => isExpired(b.expiry_date, onDate));
+      const next = sellable[0] ?? expired[0];
+      return {
+        ...p,
+        sellable_stock: sellable.reduce((s, b) => s + b.qty_on_hand, 0),
+        expired_stock: expired.reduce((s, b) => s + b.qty_on_hand, 0),
+        batch_count: list.length,
+        next_batch_id: sellable[0]?.id ?? null,
+        batch_number: next ? (next.batch_number || '') : p.batch_number,
+        expiry_date: next ? (next.expiry_date || '') : (list.length ? '' : p.expiry_date),
+        next_expiry: sellable[0]?.expiry_date ?? null,
+        has_undated_stock: list.some((b) => !b.expiry_date),
+      };
+    });
+  }
 
   // Helper to resolve or auto-create category
   function resolveCategoryId(val: any, tenantId: number): number | null {
@@ -1221,23 +1275,37 @@ async function startServer() {
 
       const pPrice = isNaN(Number(purchase_price)) ? 0 : Math.max(0, Number(purchase_price));
       const sPrice = isNaN(Number(sale_price)) ? 0 : Math.max(0, Number(sale_price));
+
+      // Phase 6: validate the opening stock BEFORE writing anything; it becomes an OPENING batch
+      const openingQty = stock === undefined || stock === null || stock === '' ? 0 : Number(stock);
+      if (!Number.isInteger(openingQty) || openingQty < 0) return res.status(400).json({ error: 'Opening stock must be a whole number of units (0 or more).' });
+      const exp = parseExpiryInput(expiry_date);
+      if (!exp.ok) return res.status(400).json({ error: exp.error });
+      const mfg = parseMfgInput(req.body.mfg_date);
+      if (!mfg.ok) return res.status(400).json({ error: mfg.error });
+      if (mfg.date && exp.date && mfg.date > exp.date) return res.status(400).json({ error: 'Manufacturing date is after the expiry date.' });
+
       const catId = resolveCategoryId(category_id, userTenantId);
       const suppId = resolveSupplierId(supplier_id, userTenantId);
 
-      db.run(`
+      const newProductId = db.run(`
         INSERT INTO products 
         (name, unit, purchase_price, sale_price, min_stock, stock, batch_number, expiry_date, category_id, hsn_code, gst_rate, rack_location, supplier_id, barcode, tenant_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `, [
         cleanName, cleanUnit, pPrice, sPrice,
-        Number(min_stock || 10), Number(stock || 0),
-        sanitizeInput(batch_number) || '', sanitizeInput(expiry_date) || '', catId,
+        Number(min_stock || 10),
+        sanitizeInput(batch_number) || '', exp.date || '', catId,
         sanitizeInput(hsn_code) || '3004.90', Number(gst_rate || 0), sanitizeInput(rack_location) || '', suppId,
         sanitizeInput(barcode) || '', userTenantId
-      ]);
+      ]).lastInsertRowid;
+      if (openingQty > 0) {
+        createBatch(db, { productId: newProductId, batchNumber: sanitizeInput(batch_number) || null, mfgDate: mfg.date, expiryDate: exp.date, expiryRaw: expiry_date ?? null,
+          purchasePrice: pPrice, salePrice: sPrice, quantity: openingQty, supplierId: suppId, source: 'OPENING', tenantId: userTenantId, createdBy: req.user?.id });
+      }
 
       // C11: no invented manufacturer barcodes; a product without one simply has none (manual entry later)
-      const newProd = queryOne<any>("SELECT id FROM products WHERE tenant_id = ? ORDER BY id DESC LIMIT 1", [userTenantId]);
+      const newProd = { id: newProductId };
       logAudit(req.user?.id, req.user?.fullName, 'PRODUCT_ADD', `Added product "${cleanName}" (Unit: ${cleanUnit}, Sale Price: Rs. ${sPrice}, Initial Stock: ${stock || 0})`, 'PRODUCT', newProd ? newProd.id : undefined, req);
 
       res.json({ message: 'Product added successfully', id: newProd?.id });
@@ -1268,20 +1336,26 @@ async function startServer() {
       const cleanName = sanitizeInput(name);
       if (!cleanName) return res.status(400).json({ error: 'Medicine name is required.' });
 
+      // D1: stock is changed only by purchases, stock adjustments and sales (it is the sum of the batches).
+      if (stock !== undefined && stock !== null && stock !== '' && Number(stock) !== Number(existingProd.stock)) {
+        return res.status(409).json({ code: 'STOCK_NOT_EDITABLE', error: 'Stock cannot be changed from the product form. Use Stock Adjustment (per batch) or record a Purchase.' });
+      }
+
       const pPrice = isNaN(Number(purchase_price)) ? 0 : Math.max(0, Number(purchase_price));
       const sPrice = isNaN(Number(sale_price)) ? 0 : Math.max(0, Number(sale_price));
       const catId = resolveCategoryId(category_id, userTenantId);
       const suppId = resolveSupplierId(supplier_id, userTenantId);
 
+      // batch number / expiry live on the batches now (edited from the Batches panel); not changed here
       db.run(`
         UPDATE products SET
-        name = ?, unit = ?, purchase_price = ?, sale_price = ?, min_stock = ?, stock = ?,
-        batch_number = ?, expiry_date = ?, category_id = ?, hsn_code = ?, gst_rate = ?,
+        name = ?, unit = ?, purchase_price = ?, sale_price = ?, min_stock = ?,
+        category_id = ?, hsn_code = ?, gst_rate = ?,
         rack_location = ?, supplier_id = ?, barcode = ?, updated_at = CURRENT_TIMESTAMP
         WHERE id = ?
       `, [
         cleanName, sanitizeInput(unit) || 'Pack', pPrice, sPrice,
-        Number(min_stock || 10), Number(stock || 0), sanitizeInput(batch_number), sanitizeInput(expiry_date),
+        Number(min_stock || 10),
         catId, sanitizeInput(hsn_code), Number(gst_rate || 0),
         sanitizeInput(rack_location), suppId, sanitizeInput(barcode) || '', id
       ]);
@@ -1316,47 +1390,175 @@ async function startServer() {
       return res.json({ message: 'Product removed from the list. It has sales/purchase history, so it was archived and its history is kept.', archived: true });
     }
 
+    // no sales/purchases/adjustments: its batches (opening/migrated stock only) go with it
+    const stockGone = queryOne<any>("SELECT COALESCE(SUM(qty_on_hand), 0) AS q, COUNT(*) AS n FROM product_batches WHERE product_id = ?", [id]);
+    db.run("DELETE FROM product_batches WHERE product_id = ?", [id]);
     db.run("DELETE FROM products WHERE id = ?", [id]);
 
-    logAudit(req.user?.id, req.user?.fullName, 'PRODUCT_DELETE', `Deleted product #${id} (${prod.name})`, 'PRODUCT', id, req);
+    logAudit(req.user?.id, req.user?.fullName, 'PRODUCT_DELETE', `Deleted product #${id} (${prod.name})${stockGone.n ? ` with ${stockGone.n} batch(es), ${stockGone.q} unit(s)` : ''}`, 'PRODUCT', id, req);
 
     res.json({ message: 'Product deleted' });
   }));
 
+  const ADJUST_REASONS = ['DAMAGED', 'EXPIRED', 'LOST', 'THEFT', 'COUNT_CORRECTION', 'OTHER'];
+
+  /**
+   * Phase 6 stock adjustment, per batch.
+   *  REMOVE: needs the batch (which physical units are damaged/expired/lost) and never goes below 0 (409).
+   *  ADD:    adds to an existing batch, or creates an ADJUSTMENT batch (batch number / expiry optional).
+   *          Expired stock may be recorded so it can be written off; it is never sellable.
+   */
   app.post('/api/inventory/adjust', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
-    const { product_id, adjustment_type, quantity, reason } = req.body;
-    if (!product_id || !quantity || !reason) {
-      return res.status(400).json({ error: 'Missing adjustment parameters' });
+    const { product_id, batch_id, adjustment_type, quantity, reason } = req.body;
+    if (!product_id || !reason || !String(reason).trim()) {
+      return res.status(400).json({ error: 'Missing adjustment parameters (product and reason are required).' });
     }
+    if (adjustment_type !== 'ADD' && adjustment_type !== 'REMOVE') return res.status(400).json({ error: 'adjustment_type must be ADD or REMOVE.' });
+    const qty = Number(quantity);
+    if (!Number.isInteger(qty) || qty <= 0) return res.status(400).json({ error: 'Quantity must be a whole number greater than zero.' });
+    const reasonCode = req.body.reason_code ? String(req.body.reason_code).toUpperCase() : 'OTHER';
+    if (!ADJUST_REASONS.includes(reasonCode)) return res.status(400).json({ error: `reason_code must be one of ${ADJUST_REASONS.join(', ')}.` });
 
     const userTenantId = req.user?.tenant_id || 1;
     const prod = queryOne<any>("SELECT * FROM products WHERE id = ?", [product_id]);
     if (!prod) return res.status(404).json({ error: 'Product not found' });
-
     if (req.user?.role !== 'SUPER_ADMIN' && prod.tenant_id && prod.tenant_id !== userTenantId) {
       return res.status(403).json({ error: 'Access denied: Product belongs to another store.' });
     }
+    const batch = batch_id ? queryOne<any>("SELECT * FROM product_batches WHERE id = ?", [Number(batch_id)]) : null;
+    if (batch_id && (!batch || batch.product_id !== prod.id)) return res.status(404).json({ error: 'Batch not found for this product.' });
 
-    let newStock = prod.stock;
-    if (adjustment_type === 'ADD') {
-      newStock += Number(quantity);
+    let targetBatchId: number;
+    if (adjustment_type === 'REMOVE') {
+      if (!batch) return res.status(400).json({ code: 'BATCH_REQUIRED', error: 'Choose the batch the units are removed from.' });
+      if (qty > batch.qty_on_hand) {
+        return res.status(409).json({ code: 'INSUFFICIENT_BATCH_STOCK', error: `Batch ${batch.batch_number || '#' + batch.id} has only ${batch.qty_on_hand} unit(s); cannot remove ${qty}.`, available: batch.qty_on_hand });
+      }
+      takeFromBatch(db, batch.id, qty);
+      targetBatchId = batch.id;
+    } else if (batch) {
+      addToBatch(db, batch.id, qty);
+      targetBatchId = batch.id;
     } else {
-      newStock = Math.max(0, newStock - Number(quantity));
+      const exp = parseExpiryInput(req.body.expiry_date);
+      if (!exp.ok) return res.status(400).json({ error: exp.error });
+      const mfg = parseMfgInput(req.body.mfg_date);
+      if (!mfg.ok) return res.status(400).json({ error: mfg.error });
+      targetBatchId = createBatch(db, {
+        productId: prod.id, batchNumber: sanitizeInput(req.body.batch_number) || null, mfgDate: mfg.date, expiryDate: exp.date, expiryRaw: req.body.expiry_date ?? null,
+        purchasePrice: req.body.purchase_price !== undefined ? Math.max(0, Number(req.body.purchase_price) || 0) : prod.purchase_price,
+        salePrice: req.body.sale_price !== undefined ? Math.max(0, Number(req.body.sale_price) || 0) : prod.sale_price,
+        quantity: qty, source: 'ADJUSTMENT', tenantId: prod.tenant_id ?? userTenantId, createdBy: req.user?.id,
+      });
     }
 
-    db.run("UPDATE products SET stock = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?", [newStock, product_id]);
-    try {
-      db.run(`
-        INSERT INTO stock_adjustments (product_id, adjustment_type, quantity, reason, user_id, tenant_id)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `, [product_id, adjustment_type, Number(quantity), reason, req.user!.id, userTenantId]);
-    } catch (e) {}
+    db.run(`
+      INSERT INTO stock_adjustments (product_id, adjustment_type, quantity, reason, user_id, tenant_id, batch_id, reason_code)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `, [product_id, adjustment_type, qty, sanitizeInput(reason), req.user!.id, userTenantId, targetBatchId, reasonCode]);
 
+    const newStock = queryOne<any>("SELECT stock FROM products WHERE id = ?", [product_id]).stock;
+    const b = queryOne<any>("SELECT batch_number, qty_on_hand FROM product_batches WHERE id = ?", [targetBatchId]);
+    logAudit(req.user?.id, req.user?.fullName, 'STOCK_ADJUSTMENT', `Adjusted stock for product #${product_id} (${prod.name}), batch ${b.batch_number || '#' + targetBatchId}: ${adjustment_type} ${qty} [${reasonCode}] (Product stock: ${prod.stock} -> ${newStock}). Reason: ${sanitizeInput(reason)}`, 'PRODUCT', Number(product_id), req);
 
-    logAudit(req.user?.id, req.user?.fullName, 'STOCK_ADJUSTMENT', `Adjusted stock for product #${product_id} (${prod.name}): ${adjustment_type} ${quantity} (Old: ${prod.stock}, New: ${newStock}). Reason: ${reason}`, 'PRODUCT', Number(product_id), req);
-
-    res.json({ message: `Stock adjusted successfully. New stock: ${newStock}` });
+    res.json({ message: `Stock adjusted successfully. New stock: ${newStock}`, stock: newStock, batch_id: targetBatchId, batch_qty: b.qty_on_hand });
   }));
+
+  // ---- Phase 6: batches ----
+  const batchView = (b: any, onDate: string) => ({ ...b, status: batchStatus(b.expiry_date, b.qty_on_hand, onDate), sellable: b.qty_on_hand > 0 && !isExpired(b.expiry_date, onDate) });
+  const productForUser = (req: AuthRequest, id: number) => {
+    const p = queryOne<any>("SELECT * FROM products WHERE id = ?", [id]);
+    if (!p) return { error: 404 as const };
+    if (req.user?.role !== 'SUPER_ADMIN' && p.tenant_id && p.tenant_id !== (req.user?.tenant_id || 1)) return { error: 403 as const };
+    return { product: p };
+  };
+
+  app.get('/api/inventory/expiry-report', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+    const days = Math.min(Math.max(Number(req.query.days) || 90, 0), 3650);
+    const onDate = today();
+    const tenantId = req.user?.tenant_id || 1;
+    const rows = queryAll<any>(`
+      SELECT b.*, p.name AS product_name, p.unit, s.name AS supplier_name
+      FROM product_batches b JOIN products p ON p.id = b.product_id LEFT JOIN suppliers s ON s.id = b.supplier_id
+      WHERE b.qty_on_hand > 0 AND p.archived_at IS NULL AND (p.tenant_id = ? OR p.tenant_id IS NULL)
+        AND (b.expiry_date IS NULL OR b.expiry_date <= ?)
+      ORDER BY b.expiry_date IS NULL, b.expiry_date ASC, p.name ASC`, [tenantId, addDays(onDate, days)]).map((b) => batchView(b, onDate));
+    const sum = (st: string) => rows.filter((r) => r.status === st);
+    res.json({
+      today: onDate, days,
+      expired: sum('EXPIRED'), expiring: sum('EXPIRING_SOON').concat(rows.filter((r) => r.status === 'OK')), noExpiry: sum('NO_EXPIRY'),
+      totals: { expiredUnits: sum('EXPIRED').reduce((s, r) => s + r.qty_on_hand, 0), expiredValue: sum('EXPIRED').reduce((s, r) => s + r.qty_on_hand * (r.purchase_price || 0), 0) },
+    });
+  });
+
+  app.get('/api/inventory/:id/batches', authenticateToken, (req: AuthRequest, res) => {
+    const r = productForUser(req, Number(req.params.id));
+    if (r.error) return res.status(r.error).json({ error: r.error === 404 ? 'Product not found' : 'Access denied: Product belongs to another store.' });
+    const onDate = today();
+    const all = req.query.include_empty === 'true';
+    const batches = queryAll<any>(`SELECT b.*, s.name AS supplier_name FROM product_batches b LEFT JOIN suppliers s ON s.id = b.supplier_id WHERE b.product_id = ? ${all ? '' : 'AND b.qty_on_hand > 0'}`, [r.product.id])
+      .sort(fefoOrder).map((b) => batchView(b, onDate));
+    res.json({ product_id: r.product.id, product_name: r.product.name, stock: r.product.stock, today: onDate, batches });
+  });
+
+  /** Corrections to a batch's identity (number, dates, sale price). Quantities change only through sales, purchases and adjustments. */
+  app.put('/api/batches/:id', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
+    const b = queryOne<any>("SELECT * FROM product_batches WHERE id = ?", [Number(req.params.id)]);
+    if (!b) return res.status(404).json({ error: 'Batch not found' });
+    const r = productForUser(req, b.product_id);
+    if (r.error) return res.status(r.error).json({ error: 'Access denied: Product belongs to another store.' });
+    if (req.body.qty_on_hand !== undefined || req.body.quantity !== undefined) {
+      return res.status(400).json({ code: 'QUANTITY_NOT_EDITABLE', error: 'Batch quantity cannot be edited here. Use a stock adjustment.' });
+    }
+    const next = { batch_number: b.batch_number, mfg_date: b.mfg_date, expiry_date: b.expiry_date, expiry_raw: b.expiry_raw, sale_price: b.sale_price };
+    if (req.body.batch_number !== undefined) next.batch_number = sanitizeInput(req.body.batch_number) || null;
+    if (req.body.expiry_date !== undefined) {
+      const e = parseExpiryInput(req.body.expiry_date);
+      if (!e.ok) return res.status(400).json({ error: e.error });
+      next.expiry_date = e.date; next.expiry_raw = req.body.expiry_date === null ? null : String(req.body.expiry_date);
+    }
+    if (req.body.mfg_date !== undefined) {
+      const m = parseMfgInput(req.body.mfg_date);
+      if (!m.ok) return res.status(400).json({ error: m.error });
+      next.mfg_date = m.date;
+    }
+    if (next.mfg_date && next.mfg_date > today()) return res.status(400).json({ error: 'Manufacturing date cannot be in the future.' });
+    if (next.mfg_date && next.expiry_date && next.mfg_date > next.expiry_date) return res.status(400).json({ error: 'Manufacturing date must be on or before the expiry date.' });
+    if (req.body.sale_price !== undefined) {
+      const sp = Number(req.body.sale_price);
+      if (!Number.isFinite(sp) || sp < 0) return res.status(400).json({ error: 'Sale price must be zero or more.' });
+      next.sale_price = sp;
+    }
+    const reason = sanitizeInput(req.body.reason || '');
+    if (!reason) return res.status(400).json({ error: 'A reason for the correction is required.' });
+    const changes = Object.entries(next).filter(([k, v]) => k !== 'expiry_raw' && (b as any)[k] !== v).map(([k, v]) => `${k}: ${(b as any)[k] ?? '-'} -> ${v ?? '-'}`);
+    if (!changes.length) return res.json({ ...b, unchanged: true });
+    db.run("UPDATE product_batches SET batch_number = ?, mfg_date = ?, expiry_date = ?, expiry_raw = ?, sale_price = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+      [next.batch_number, next.mfg_date, next.expiry_date, next.expiry_raw, next.sale_price, b.id]);
+    logAudit(req.user?.id, req.user?.fullName, 'BATCH_CORRECTION', `Corrected batch #${b.id} of product #${b.product_id} (${r.product.name}): ${changes.join('; ')}. Reason: ${reason}`, 'BATCH', b.id, req);
+    res.json(batchView(queryOne<any>("SELECT * FROM product_batches WHERE id = ?", [b.id]), today()));
+  }));
+
+  app.get('/api/batches/:id/history', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+    const b = queryOne<any>("SELECT * FROM product_batches WHERE id = ?", [Number(req.params.id)]);
+    if (!b) return res.status(404).json({ error: 'Batch not found' });
+    const r = productForUser(req, b.product_id);
+    if (r.error) return res.status(r.error).json({ error: 'Access denied: Product belongs to another store.' });
+    const events: any[] = [];
+    events.push({ type: b.source, date: b.created_at, quantity: b.qty_received, detail: b.source === 'PURCHASE' ? 'Received on purchase' : b.source === 'MIGRATION' ? 'Stock carried over from before batch tracking' : b.source === 'OPENING' ? 'Opening stock' : b.source === 'VOID_RESTORE' ? 'Returned by a voided sale' : 'Added by stock adjustment' });
+    if (b.purchase_item_id) {
+      const p = queryOne<any>("SELECT ph.id, ph.invoice_number, ph.purchase_date FROM purchase_items pi JOIN purchase_headers ph ON ph.id = pi.purchase_id WHERE pi.id = ?", [b.purchase_item_id]);
+      if (p) events[0].reference = { purchase_id: p.id, invoice_number: p.invoice_number };
+    }
+    for (const s of queryAll<any>(`SELECT x.quantity, sh.id AS sale_id, sh.invoice_number, sh.sale_date AS created_at FROM sale_item_batches x JOIN sale_items si ON si.id = x.sale_item_id JOIN sales_headers sh ON sh.id = si.sale_id WHERE x.batch_id = ?`, [b.id])) {
+      events.push({ type: 'SALE', date: s.created_at, quantity: -s.quantity, reference: { sale_id: s.sale_id, invoice_number: s.invoice_number } });
+    }
+    for (const a of queryAll<any>(`SELECT * FROM stock_adjustments WHERE batch_id = ?`, [b.id])) {
+      events.push({ type: 'ADJUSTMENT', date: a.created_at, quantity: a.adjustment_type === 'REMOVE' ? -a.quantity : a.quantity, detail: `${a.reason_code || ''} ${a.reason || ''}`.trim() });
+    }
+    events.sort((x, y) => String(x.date).localeCompare(String(y.date)));
+    res.json({ batch: batchView(b, today()), product_name: r.product.name, events });
+  });
 
   // 3. Categories & Suppliers
   app.get('/api/categories', authenticateToken, (req: AuthRequest, res) => {
@@ -1834,6 +2036,30 @@ async function startServer() {
       return res.status(400).json({ error: 'Customer selection is required for Udhar/Partial payment' });
     }
 
+    // Phase 6: every line is validated and the FEFO plan is computed BEFORE anything is written.
+    // (4xx answers commit in tx(), so nothing may be written before these checks.)
+    const lineRequests: LineRequest[] = [];
+    const lineProducts: any[] = [];
+    for (const [i, item] of items.entries()) {
+      const qty = Number(item?.quantity);
+      if (!Number.isInteger(qty) || qty <= 0) return res.status(400).json({ code: 'INVALID_QUANTITY', error: `Line ${i + 1}: quantity must be a whole number greater than zero.` });
+      const product = item?.product?.id ? queryOne<any>("SELECT id, name, unit, tenant_id, archived_at FROM products WHERE id = ?", [Number(item.product.id)]) : null;
+      if (!product) return res.status(400).json({ code: 'PRODUCT_NOT_FOUND', error: `Line ${i + 1}: this product does not exist.` });
+      if (req.user?.role !== 'SUPER_ADMIN' && product.tenant_id && product.tenant_id !== userTenantId) return res.status(403).json({ error: `Line ${i + 1}: product belongs to another store.` });
+      if (product.archived_at) return res.status(400).json({ code: 'PRODUCT_ARCHIVED', error: `"${product.name}" has been removed from the product list and cannot be sold.` });
+      lineRequests.push({ line: i, productId: product.id, quantity: qty });
+      lineProducts.push(product);
+    }
+    const plan = planFefo(lineRequests, batchesFor(db, lineRequests.map((l) => l.productId)), today());
+    if (!plan.ok) {
+      const sh = (plan as Extract<typeof plan, { ok: false }>).shortage;
+      const name = lineProducts.find((p) => p.id === sh.productId)?.name || `#${sh.productId}`;
+      const why = sh.code === 'EXPIRED_STOCK'
+        ? `All remaining stock of "${name}" has expired (${sh.expired} unit(s)) and cannot be sold.`
+        : `Not enough stock of "${name}": ${sh.requested} requested, ${sh.sellable} available to sell${sh.expired ? ` (${sh.expired} more unit(s) are expired and cannot be sold)` : ''}.`;
+      return res.status(409).json({ code: sh.code, error: why, product_id: sh.productId, product_name: name, requested: sh.requested, available: sh.sellable, expired: sh.expired });
+    }
+
     const invCountRes = queryOne<any>("SELECT COUNT(*) as cnt FROM sales_headers WHERE tenant_id = ?", [userTenantId]);
     const nextInvNum = `INV-${userTenantId}-${1001 + (invCountRes ? invCountRes.cnt : 0)}`;
 
@@ -1882,31 +2108,38 @@ async function startServer() {
 
       const saleId = saleHeaderInsert.lastInsertRowid;
 
-      // Process each cart item & update stock
-      for (const item of items) {
-        db.run(`
+      // Process each cart item: record the line, then take the units from the planned batches (FEFO).
+      // Price charged is the POS price as before (D2); cost is the real batch cost (D6).
+      const allocationSummary: any[] = [];
+      for (const [i, item] of items.entries()) {
+        const allocs = plan.lines.get(i)!;
+        const product = lineProducts[i];
+        const batchNumbers = [...new Set(allocs.map((a) => a.batchNumber).filter(Boolean))].join(', ');
+        const earliestExpiry = allocs.map((a) => a.expiryDate).filter(Boolean).sort()[0] || '';
+        const saleItemId = db.run(`
           INSERT INTO sale_items 
           (sale_id, product_id, quantity, unit, sale_price, cost_price, discount_percent, discount_amount, gst_amount, batch_number, expiry_date, subtotal)
           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `, [
           saleId,
-          item.product.id,
-          item.quantity,
-          item.product.unit,
+          product.id,
+          lineRequests[i].quantity,
+          product.unit || item.product?.unit || 'Pack',
           item.unit_price,
-          item.product.purchase_price,
+          weightedCost(allocs),
           item.discount_percent || 0,
           item.discount_amount || 0,
           item.gst_amount || 0,
-          item.product.batch_number || '',
-          item.product.expiry_date || '',
+          batchNumbers,
+          earliestExpiry,
           item.subtotal
-        ]);
+        ]).lastInsertRowid;
 
-        // Deduct Stock
-        db.run("UPDATE products SET stock = MAX(0, stock - ?), updated_at = CURRENT_TIMESTAMP WHERE id = ?", [
-          item.quantity, item.product.id
-        ]);
+        for (const a of allocs) {
+          takeFromBatch(db, a.batchId, a.quantity); // guarded: never below 0, else the whole sale rolls back
+          db.run("INSERT INTO sale_item_batches (sale_item_id, batch_id, quantity, unit_cost) VALUES (?, ?, ?, ?)", [saleItemId, a.batchId, a.quantity, a.unitCost]);
+        }
+        allocationSummary.push({ line: i, product_id: product.id, batches: allocs.map((a) => ({ batch_id: a.batchId, batch_number: a.batchNumber, expiry_date: a.expiryDate, quantity: a.quantity })) });
       }
 
       // Update Customer Ledger if customer is selected
@@ -1963,6 +2196,7 @@ async function startServer() {
         previous_balance: prevBal,
         new_balance: newBal,
         client_txn_id: clientTxnId,
+        allocations: allocationSummary,
       };
       if (clientTxnId) {
         db.run("INSERT INTO idempotency_keys (key, route, user_id, response, created_at) VALUES (?, 'POST /api/sales', ?, ?, ?)",
@@ -1971,7 +2205,8 @@ async function startServer() {
       res.json(saleResult);
     } catch (err: any) {
       console.error("Sale transaction failed:", err);
-      res.status(500).json({ error: 'Failed to process sale transaction permanently: ' + err.message });
+      // 500 => the tx() wrapper rolls the whole sale back (stock, batches, ledger, invoice)
+      res.status(500).json({ code: err instanceof StockConflictError ? 'STOCK_CONFLICT' : undefined, error: 'Failed to process sale transaction permanently: ' + err.message });
     }
   }));
 
@@ -2065,12 +2300,15 @@ async function startServer() {
       return res.status(403).json({ error: 'Access denied: Invoice belongs to another store.' });
     }
 
-    const items = queryAll(`
+    const items = queryAll<any>(`
       SELECT si.*, p.name as product_name 
       FROM sale_items si
       JOIN products p ON si.product_id = p.id
       WHERE si.sale_id = ?
     `, [saleId]);
+    for (const it of items) {
+      it.batches = queryAll(`SELECT b.id AS batch_id, b.batch_number, b.expiry_date, x.quantity FROM sale_item_batches x JOIN product_batches b ON b.id = x.batch_id WHERE x.sale_item_id = ? ORDER BY x.id`, [it.id]);
+    }
 
     res.json({ ...sale, items });
   }));
@@ -2122,46 +2360,73 @@ async function startServer() {
     res.json({ ...purchase, items });
   });
 
+  /**
+   * Phase 6 purchase: every line becomes its own PURCHASE batch (C6: product batch/expiry are no
+   * longer overwritten). All lines are validated before anything is written.
+   */
   app.post('/api/purchases', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     const userTenantId = req.user?.role === 'SUPER_ADMIN' && req.body.tenant_id ? Number(req.body.tenant_id) : (req.user?.tenant_id || 1);
     const { supplier_id, invoice_number, items, notes } = req.body;
 
-    if (!supplier_id || !items || items.length === 0) {
+    if (!supplier_id || !Array.isArray(items) || items.length === 0) {
       return res.status(400).json({ error: 'Supplier and items required' });
     }
+    const supplier = queryOne<any>("SELECT id, tenant_id, archived_at FROM suppliers WHERE id = ?", [Number(supplier_id)]);
+    if (!supplier) return res.status(400).json({ error: 'Supplier not found.' });
 
-    let totalAmount = 0;
-    items.forEach((it: any) => {
-      totalAmount += it.quantity * it.purchase_price;
-    });
-
-    const invNum = invoice_number || `PUR-${userTenantId}-${Date.now().toString().slice(-6)}`;
-
-    db.run(`
-      INSERT INTO purchase_headers (invoice_number, supplier_id, total_amount, notes, tenant_id)
-      VALUES (?, ?, ?, ?, ?)
-    `, [invNum, supplier_id, totalAmount, notes || '', userTenantId]);
-
-    const purHeader = queryOne<any>("SELECT id FROM purchase_headers WHERE invoice_number = ?", [invNum]);
-    const purId = purHeader.id;
-
-    for (const item of items) {
-      db.run(`
-        INSERT INTO purchase_items (purchase_id, product_id, quantity, purchase_price, batch_number, expiry_date)
-        VALUES (?, ?, ?, ?, ?, ?)
-      `, [purId, item.product_id, item.quantity, item.purchase_price, item.batch_number || '', item.expiry_date || '']);
-
-      // Increase Stock and update purchase price
-      db.run(`
-        UPDATE products 
-        SET stock = stock + ?, purchase_price = ?, batch_number = COALESCE(NULLIF(?, ''), batch_number), expiry_date = COALESCE(NULLIF(?, ''), expiry_date), updated_at = CURRENT_TIMESTAMP
-        WHERE id = ?
-      `, [item.quantity, item.purchase_price, item.batch_number || '', item.expiry_date || '', item.product_id]);
+    const onDate = today();
+    const lines: any[] = [];
+    for (const [i, it] of items.entries()) {
+      const n = i + 1;
+      const product = it?.product_id ? queryOne<any>("SELECT id, name, tenant_id, archived_at, sale_price FROM products WHERE id = ?", [Number(it.product_id)]) : null;
+      if (!product) return res.status(400).json({ error: `Line ${n}: product not found.` });
+      if (req.user?.role !== 'SUPER_ADMIN' && product.tenant_id && product.tenant_id !== userTenantId) return res.status(403).json({ error: `Line ${n}: product belongs to another store.` });
+      if (product.archived_at) return res.status(400).json({ error: `Line ${n}: "${product.name}" has been removed from the product list.` });
+      const qty = Number(it.quantity);
+      if (!Number.isInteger(qty) || qty <= 0) return res.status(400).json({ error: `Line ${n} (${product.name}): quantity must be a whole number greater than zero.` });
+      const cost = Number(it.purchase_price);
+      if (!Number.isFinite(cost) || cost < 0) return res.status(400).json({ error: `Line ${n} (${product.name}): purchase price must be 0 or more.` });
+      const salePrice = it.sale_price === undefined || it.sale_price === null || it.sale_price === '' ? null : Number(it.sale_price);
+      if (salePrice !== null && (!Number.isFinite(salePrice) || salePrice < 0)) return res.status(400).json({ error: `Line ${n} (${product.name}): selling price must be 0 or more.` });
+      const exp = parseExpiryInput(it.expiry_date);
+      if (!exp.ok) return res.status(400).json({ error: `Line ${n} (${product.name}): ${exp.error}` });
+      if (exp.date && isExpired(exp.date, onDate)) return res.status(400).json({ code: 'EXPIRED_ON_RECEIPT', error: `Line ${n} (${product.name}): this batch expired on ${exp.date} and cannot be received as sellable stock.` });
+      const mfg = parseMfgInput(it.mfg_date);
+      if (!mfg.ok) return res.status(400).json({ error: `Line ${n} (${product.name}): ${mfg.error}` });
+      if (mfg.date && mfg.date > onDate) return res.status(400).json({ error: `Line ${n} (${product.name}): manufacturing date is in the future.` });
+      if (mfg.date && exp.date && mfg.date > exp.date) return res.status(400).json({ error: `Line ${n} (${product.name}): manufacturing date is after the expiry date.` });
+      lines.push({ product, qty, cost, salePrice: salePrice ?? product.sale_price, setSalePrice: salePrice !== null, expiry: exp.date, expiryRaw: it.expiry_date ?? null, mfg: mfg.date, batchNumber: sanitizeInput(it.batch_number) || null });
     }
 
-    logAudit(req.user?.id, req.user?.fullName, 'RECORD_PURCHASE', `Recorded stock purchase #${invNum} total Rs. ${totalAmount}`, 'PURCHASE', purId, req);
+    const totalAmount = lines.reduce((acc, l) => acc + l.qty * l.cost, 0);
+    const invNum = invoice_number || `PUR-${userTenantId}-${Date.now().toString().slice(-6)}`;
 
-    res.json({ message: 'Purchase recorded and stock updated successfully', id: purId, invoice_number: invNum });
+    const purId = db.run(`
+      INSERT INTO purchase_headers (invoice_number, supplier_id, total_amount, notes, tenant_id)
+      VALUES (?, ?, ?, ?, ?)
+    `, [invNum, supplier.id, totalAmount, notes || '', userTenantId]).lastInsertRowid;
+
+    const created: any[] = [];
+    for (const l of lines) {
+      const itemId = db.run(`
+        INSERT INTO purchase_items (purchase_id, product_id, quantity, purchase_price, batch_number, expiry_date, mfg_date, sale_price)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+      `, [purId, l.product.id, l.qty, l.cost, l.batchNumber || '', l.expiry || '', l.mfg, l.salePrice]).lastInsertRowid;
+      const batchId = createBatch(db, {
+        productId: l.product.id, batchNumber: l.batchNumber, mfgDate: l.mfg, expiryDate: l.expiry, expiryRaw: l.expiryRaw,
+        purchasePrice: l.cost, salePrice: l.salePrice, quantity: l.qty, supplierId: supplier.id, purchaseItemId: itemId,
+        source: 'PURCHASE', tenantId: l.product.tenant_id ?? userTenantId, createdBy: req.user?.id,
+      });
+      db.run("UPDATE purchase_items SET batch_id = ? WHERE id = ?", [batchId, itemId]);
+      // the latest purchase price (and selling price, if given) become the product's defaults
+      db.run(`UPDATE products SET purchase_price = ?${l.setSalePrice ? ', sale_price = ?' : ''}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        l.setSalePrice ? [l.cost, l.salePrice, l.product.id] : [l.cost, l.product.id]);
+      created.push({ product_id: l.product.id, batch_id: batchId, quantity: l.qty });
+    }
+
+    logAudit(req.user?.id, req.user?.fullName, 'RECORD_PURCHASE', `Recorded stock purchase #${invNum} total Rs. ${totalAmount} (${created.length} batch(es))`, 'PURCHASE', purId, req);
+
+    res.json({ message: 'Purchase recorded and stock updated successfully', id: purId, invoice_number: invNum, batches: created });
   }));
 
   app.post('/api/purchases/email-po', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
@@ -2236,17 +2501,22 @@ async function startServer() {
       SELECT COALESCE(SUM(current_balance), 0) as total_udhar FROM customers WHERE current_balance > 0 AND (tenant_id = ? OR tenant_id IS NULL)
     `, [userTenantId]);
 
+    const onDate = today();
     const lowStockRes = queryOne<any>(`
-      SELECT COUNT(*) as count FROM products WHERE stock <= min_stock AND archived_at IS NULL AND (tenant_id = ? OR tenant_id IS NULL)
-    `, [userTenantId]);
+      SELECT COUNT(*) as count FROM products p WHERE p.archived_at IS NULL AND (p.tenant_id = ? OR p.tenant_id IS NULL)
+        AND (SELECT COALESCE(SUM(b.qty_on_hand), 0) FROM product_batches b WHERE b.product_id = p.id AND (b.expiry_date IS NULL OR b.expiry_date >= ?)) <= p.min_stock
+    `, [userTenantId, onDate]);
 
-    const ninetyDaysAhead = new Date();
-    ninetyDaysAhead.setDate(ninetyDaysAhead.getDate() + 90);
-    const expDateStr = ninetyDaysAhead.toISOString().split('T')[0];
 
+    // batches with stock that expire within 90 days or have already expired (Phase 6: counted per batch)
     const expiringRes = queryOne<any>(`
-      SELECT COUNT(*) as count FROM products WHERE expiry_date <= ? AND stock > 0 AND archived_at IS NULL AND (tenant_id = ? OR tenant_id IS NULL)
-    `, [expDateStr, userTenantId]);
+      SELECT COUNT(*) as count FROM product_batches b JOIN products p ON p.id = b.product_id
+      WHERE b.qty_on_hand > 0 AND b.expiry_date IS NOT NULL AND b.expiry_date <= ? AND p.archived_at IS NULL AND (p.tenant_id = ? OR p.tenant_id IS NULL)
+    `, [addDays(onDate, 90), userTenantId]);
+    const expiredRes = queryOne<any>(`
+      SELECT COUNT(*) as count, COALESCE(SUM(b.qty_on_hand), 0) AS units FROM product_batches b JOIN products p ON p.id = b.product_id
+      WHERE b.qty_on_hand > 0 AND b.expiry_date IS NOT NULL AND b.expiry_date < ? AND p.archived_at IS NULL AND (p.tenant_id = ? OR p.tenant_id IS NULL)
+    `, [onDate, userTenantId]);
 
     const totalProd = queryOne<any>("SELECT COUNT(*) as count FROM products WHERE (tenant_id = ? OR tenant_id IS NULL) AND archived_at IS NULL", [userTenantId]);
     const totalCust = queryOne<any>("SELECT COUNT(*) as count FROM customers WHERE (tenant_id = ? OR tenant_id IS NULL) AND archived_at IS NULL", [userTenantId]);
@@ -2267,6 +2537,8 @@ async function startServer() {
       totalUdharBalance: udharRes ? udharRes.total_udhar : 0,
       lowStockCount: lowStockRes ? lowStockRes.count : 0,
       expiringCount: expiringRes ? expiringRes.count : 0,
+      expiredBatchCount: expiredRes ? expiredRes.count : 0,
+      expiredUnits: expiredRes ? expiredRes.units : 0,
       totalProductsCount: totalProd ? totalProd.count : 0,
       totalCustomersCount: totalCust ? totalCust.count : 0
     });
@@ -3019,10 +3291,19 @@ async function startServer() {
     const sale = queryOne<any>("SELECT * FROM sales_headers WHERE id = ?", [saleId]);
     if (!sale) return res.status(404).json({ error: 'Invoice not found' });
 
-    // 1. Restore stock
+    // 1. Restore stock into the exact batches the units came from (Phase 6). Sales recorded before
+    //    batches existed have no allocation: their units go into a VOID_RESTORE batch built from the line.
     const items = queryAll<any>("SELECT * FROM sale_items WHERE sale_id = ?", [saleId]);
     for (const item of items) {
-      db.run("UPDATE products SET stock = stock + ? WHERE id = ?", [item.quantity, item.product_id]);
+      const allocs = queryAll<any>("SELECT batch_id, quantity FROM sale_item_batches WHERE sale_item_id = ?", [item.id]);
+      if (allocs.length) {
+        for (const a of allocs) addToBatch(db, a.batch_id, a.quantity);
+        db.run("DELETE FROM sale_item_batches WHERE sale_item_id = ?", [item.id]);
+      } else if (Number.isInteger(Number(item.quantity)) && Number(item.quantity) > 0) {
+        const exp = normalizeExpiry(item.expiry_date);
+        createBatch(db, { productId: item.product_id, batchNumber: item.batch_number || null, expiryDate: exp.date, expiryRaw: item.expiry_date || null,
+          purchasePrice: item.cost_price, salePrice: item.sale_price, quantity: Number(item.quantity), source: 'VOID_RESTORE', tenantId: sale.tenant_id, createdBy: req.user?.id });
+      }
     }
 
     // 2. Reverse customer balance

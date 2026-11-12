@@ -119,6 +119,11 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
     }
   };
 
+  // Phase 6: only non-expired stock can be sold. The server decides finally (FEFO, 409 on shortage).
+  const sellableOf = (p: Product) => (typeof p.sellable_stock === 'number' ? p.sellable_stock : p.stock);
+  const expiredOnly = (p: Product) => sellableOf(p) <= 0 && (p.expired_stock || 0) > 0;
+  const [stockRefusal, setStockRefusal] = useState<string | null>(null);
+
   // Find product by Barcode / GTIN / SKU / Batch / HSN / ID / Name
   const findProductByBarcode = (query: string): Product | undefined => {
     if (!query || !query.trim()) return undefined;
@@ -165,11 +170,13 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
     const matchedProduct = findProductByBarcode(trimmed);
 
     if (matchedProduct) {
-      if (matchedProduct.stock <= 0) {
+      if (sellableOf(matchedProduct) <= 0) {
         playScanBeep('error');
         setScanNotice({
           type: 'error',
-          message: `⚠️ Out of Stock! "${matchedProduct.name}" is currently unavailable in inventory.`
+          message: expiredOnly(matchedProduct)
+            ? `⚠️ Expired! All remaining stock of "${matchedProduct.name}" has expired and cannot be sold.`
+            : `⚠️ Out of Stock! "${matchedProduct.name}" is currently unavailable in inventory.`
         });
         return;
       }
@@ -348,7 +355,11 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
 
   // Add Product to Cart
   const handleAddToCart = (product: Product) => {
-    if (product.stock <= 0) {
+    if (expiredOnly(product)) {
+      setStockRefusal(`All remaining stock of "${product.name}" (${product.expired_stock} ${product.unit}) has expired and cannot be sold.`);
+      return;
+    }
+    if (sellableOf(product) <= 0) {
       alert(`"${product.name}" is currently Out of Stock!`);
       return;
     }
@@ -358,8 +369,8 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
       if (existingIndex > -1) {
         const updated = [...prev];
         const currentQty = updated[existingIndex].quantity;
-        if (currentQty + 1 > product.stock) {
-          alert(`Cannot add more than available stock (${product.stock} ${product.unit})`);
+        if (currentQty + 1 > sellableOf(product)) {
+          alert(`Cannot add more than available stock (${sellableOf(product)} ${product.unit})`);
           return prev;
         }
         const newQty = currentQty + 1;
@@ -412,8 +423,8 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
         if (item.product.id === productId) {
           const newQty = item.quantity + delta;
           if (newQty <= 0) return null;
-          if (newQty > item.product.stock) {
-            alert(`Maximum available stock reached (${item.product.stock})`);
+          if (newQty > sellableOf(item.product)) {
+            alert(`Maximum available stock reached (${sellableOf(item.product)})`);
             return item;
           }
           const subtotal = calculateItemSubtotal(newQty, item.unit_price, item.discount_percent, item.gst_percent);
@@ -432,9 +443,9 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
           if (isNaN(targetQty) || targetQty <= 0) {
             targetQty = 1;
           }
-          if (targetQty > item.product.stock) {
-            alert(`Maximum available stock reached for "${item.product.name}" (${item.product.stock} ${item.product.unit})`);
-            targetQty = item.product.stock;
+          if (targetQty > sellableOf(item.product)) {
+            alert(`Maximum available stock reached for "${item.product.name}" (${sellableOf(item.product)} ${item.product.unit})`);
+            targetQty = Math.max(1, sellableOf(item.product));
           }
           const subtotal = calculateItemSubtotal(targetQty, item.unit_price, item.discount_percent, item.gst_percent);
           return { ...item, quantity: targetQty, subtotal };
@@ -601,6 +612,16 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
       if (err instanceof ApiError && err.outcome === 'UNKNOWN') {
         // The server may or may not have saved it. Keep the cart and the SAME transaction id.
         setUnconfirmed({ txnId: pending.id, message: err.message });
+      } else if (err instanceof ApiError && err.status === 409 && (err.code === 'INSUFFICIENT_STOCK' || err.code === 'EXPIRED_STOCK')) {
+        // Definite refusal (Phase 6): nothing was saved. Keep the cart, show why, refresh the stock figures.
+        pendingTxnRef.current = null;
+        setShowPaymentModal(false);
+        setStockRefusal(`Sale not saved. ${err.message} Adjust the quantity in the cart and try again.`);
+        try {
+          const fresh = await api.getInventory();
+          setProducts(fresh);
+          setCart((prev) => prev.map((it) => ({ ...it, product: fresh.find((p) => p.id === it.product.id) || it.product })));
+        } catch { /* the figures refresh on the next load */ }
       } else {
         // Definite failure: nothing was saved. The next attempt gets a new transaction id.
         pendingTxnRef.current = null;
@@ -694,7 +715,7 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
           <div>
             <div className="text-[10px] uppercase font-bold text-slate-500">Low Stock Alerts</div>
             <div className="text-base font-black text-orange-600 font-mono">
-              {products.filter(p => p.stock <= p.min_stock).length}
+              {products.filter(p => sellableOf(p) <= p.min_stock).length}
             </div>
           </div>
           <span className="text-[10px] bg-orange-100 text-orange-800 font-bold px-1.5 py-0.5 rounded">
@@ -706,7 +727,7 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
           <div>
             <div className="text-[10px] uppercase font-bold text-slate-500">Out of Stock</div>
             <div className="text-base font-black text-red-600 font-mono">
-              {products.filter(p => p.stock <= 0).length}
+              {products.filter(p => sellableOf(p) <= 0).length}
             </div>
           </div>
           <span className="text-[10px] bg-red-100 text-red-800 font-bold px-1.5 py-0.5 rounded">
@@ -934,8 +955,9 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
             ) : (
               <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-2">
                 {filteredProducts.map(product => {
-                  const isLowStock = product.stock <= product.min_stock;
-                  const isOutOfStock = product.stock <= 0;
+                  const isLowStock = sellableOf(product) <= product.min_stock;
+                  const isOutOfStock = sellableOf(product) <= 0;
+                  const isExpiredOnly = expiredOnly(product);
 
                   return (
                     <div
@@ -959,6 +981,14 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
                           <span>Unit: {product.unit}</span>
                           <span>•</span>
                           <span>Batch: {product.batch_number || '-'}</span>
+                          {product.expiry_date && (
+                            <>
+                              <span>•</span>
+                              <span className={isExpiredOnly ? 'text-red-700 font-bold' : ''}>Exp: {product.expiry_date}</span>
+                            </>
+                          )}
+                          {(product.batch_count || 0) > 1 && <span className="text-[9px] bg-slate-100 border border-slate-300 rounded px-1">{product.batch_count} batches</span>}
+                          {isExpiredOnly && <span data-testid="expired-badge" className="text-[9px] font-black bg-red-600 text-white rounded px-1">EXPIRED</span>}
                           {product.barcode && (
                             <>
                               <span>•</span>
@@ -975,11 +1005,12 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
                         <span className={`font-bold ${
                           isOutOfStock ? 'text-red-600' : isLowStock ? 'text-orange-600' : 'text-emerald-700'
                         }`}>
-                          Stock: {product.stock} {product.unit}s
+                          Stock: {sellableOf(product)} {product.unit}s
+                          {(product.expired_stock || 0) > 0 && <span className="text-red-600 font-normal"> (+{product.expired_stock} expired)</span>}
                         </span>
 
                         <button
-                          disabled={isOutOfStock}
+                          disabled={isOutOfStock && !isExpiredOnly}
                           className={`px-2 py-0.5 rounded flex items-center space-x-1 font-bold text-[10px] ${
                             isOutOfStock
                               ? 'bg-slate-200 text-slate-400 cursor-not-allowed'
@@ -1098,7 +1129,7 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
                       <input
                         type="number"
                         min="1"
-                        max={item.product.stock}
+                        max={sellableOf(item.product)}
                         value={item.quantity}
                         onChange={(e) => setDirectCartQuantity(item.product.id, parseInt(e.target.value, 10))}
                         onFocus={(e) => e.target.select()}
@@ -1406,6 +1437,16 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
               </button>
             </div>
           </form>
+        </div>
+      )}
+
+      {stockRefusal && (
+        <div className="fixed inset-0 z-[85] bg-slate-950/70 flex items-center justify-center p-4" role="alertdialog" aria-labelledby="stock-refusal-title">
+          <div data-testid="stock-refusal" className="w-full max-w-md bg-white rounded-xl shadow-2xl border-4 border-red-500 p-5 space-y-3">
+            <h2 id="stock-refusal-title" className="text-lg font-black text-red-700">NOT ENOUGH SELLABLE STOCK</h2>
+            <p className="text-sm text-slate-800">{stockRefusal}</p>
+            <button type="button" onClick={() => setStockRefusal(null)} className="px-3 py-2 rounded-lg bg-slate-800 text-white font-bold text-sm">OK</button>
+          </div>
         </div>
       )}
 

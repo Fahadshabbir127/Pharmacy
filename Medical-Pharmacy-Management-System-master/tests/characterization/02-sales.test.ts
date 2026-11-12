@@ -83,14 +83,19 @@ describe('credit (udhar) and partial sales', () => {
 });
 
 describe('known defects in the sale path', () => {
-  it('[LEGACY-BUG C2/R5] overselling is accepted and stock is clamped to 0', async () => {
+  // Phase 6 fix of C2/R5 (was: overselling accepted with 200 and stock clamped to 0)
+  it('[FIXED C2/R5] overselling is refused with 409 INSUFFICIENT_STOCK and nothing is recorded', async () => {
     const p = await product(6); // Calamox, stock 8
     const r = await admin.post('/sales', salePayload([cartItem(p, 50)]));
-    expect(r.status).toBe(200);
-    expect((await product(6)).stock).toBe(0);
+    expect(r.status).toBe(409);
+    expect(r.body).toMatchObject({ code: 'INSUFFICIENT_STOCK', product_id: 6, requested: 50, available: 8 });
+    expect((await product(6)).stock).toBe(8);
+    const db = await openReadOnly(srv.dbFile);
+    expect(one(db, 'SELECT COUNT(*) n FROM sales_headers')).toEqual({ n: 1 });
   });
 
-  it('[LEGACY-SECURITY C9/S6] server trusts client-supplied prices, cost and totals', async () => {
+  // Phase 6 (D6): cost now comes from the batch on the server; prices/totals are still trusted until Phase 7 (C9)
+  it('[LEGACY-SECURITY C9/S6] server trusts client-supplied prices and totals (cost is now the batch cost, D6)', async () => {
     const p = await product(1);
     const tampered = { ...p, purchase_price: 0 };
     const item = cartItem(tampered, 5, { unit_price: 1 });
@@ -98,7 +103,7 @@ describe('known defects in the sale path', () => {
     expect(r.status).toBe(200);
     const d = await admin.get(`/sales/${r.body.sale_id}`);
     expect(d.body.grand_total).toBe(5);
-    expect(d.body.items[0]).toMatchObject({ sale_price: 1, cost_price: 0 });
+    expect(d.body.items[0]).toMatchObject({ sale_price: 1, cost_price: 180 });
   });
 
   it('[LEGACY-BUG C3] posting the same sale twice creates two sales (no idempotency)', async () => {
@@ -132,11 +137,12 @@ describe('known defects in the sale path', () => {
   });
 
   // FK5 fix (was: the sale was recorded against a product that does not exist)
+  // Phase 6: now caught by validation before any write (400) instead of by the foreign key (500)
   it('[FIXED FK5] a sale referencing a non-existent product id is rejected and nothing is recorded', async () => {
     const ghost = { id: 99999, name: 'Ghost', unit: 'Pack', sale_price: 10, purchase_price: 5, gst_rate: 0 };
     const r = await admin.post('/sales', salePayload([cartItem(ghost, 1)]));
-    expect(r.status).toBe(500);
-    expect(r.body.error).toMatch(/FOREIGN KEY/);
+    expect(r.status).toBe(400);
+    expect(r.body.code).toBe('PRODUCT_NOT_FOUND');
     const db = await openReadOnly(srv.dbFile);
     expect(one(db, "SELECT COUNT(*) n FROM sales_headers WHERE invoice_number LIKE 'INV-1-%'")).toEqual({ n: 0 });
   });
@@ -163,10 +169,14 @@ describe('atomicity', () => {
     const p = await product(1);
     const before = (await admin.get('/customers')).body.find((c: any) => c.id === 1).current_balance;
     const good = cartItem(p, 4);
-    const broken = { quantity: 1, unit_price: 1, subtotal: 1 }; // no `product` -> TypeError inside the transaction
+    // Phase 6: a line without a product is now refused by validation before any write (400);
+    // a mid-way failure is produced with a value SQLite cannot store in the 2nd line's INSERT.
+    expect((await admin.post('/sales', salePayload([good, { quantity: 1, unit_price: 1, subtotal: 1 } as any]))).status).toBe(400);
+    const broken = { ...cartItem(await product(2), 1), discount_percent: { not: 'a number' } };
     const r = await admin.post('/sales', salePayload([good, broken as any], { payment_method: 'UDHAR', customer_id: 1 }));
     expect(r.status).toBe(500);
     expect((await product(1)).stock).toBe(120);
+    expect((await product(2)).stock).toBe(45);
     expect((await admin.get('/customers')).body.find((c: any) => c.id === 1).current_balance).toBe(before);
     const db = await openReadOnly(srv.dbFile);
     expect(one(db, 'SELECT COUNT(*) n FROM sales_headers')).toEqual({ n: 1 });

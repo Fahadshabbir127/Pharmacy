@@ -188,16 +188,16 @@ All rows start as `pending`.
 
 Batch inventory and FEFO · supplier returns · customer returns/refunds · configurable and split payments · tax configuration · shifts and cash reconciliation · branch invoice sequences · invoice templates · native printer selection · standalone, host and client modes · HTTPS pairing · real-time updates · verified encrypted backups with retention and an external drive. See `ARCHITECTURE.md`.
 
-## Status of the approved changes (after Phase 4)
+## Status of the approved changes (after Phase 6)
 
 | Change | Status |
 |---|---|
 | C1 soft-void invoices | Not yet (Phase 7). Delete-invoice still works as before; FK enforcement is compatible with it. |
-| C2 reject oversell | Not yet (Phase 6, with batches/FEFO) |
+| C2 reject oversell | **Done (Phase 6).** 409 `INSUFFICIENT_STOCK` / `EXPIRED_STOCK`, FEFO across batches, database-level protection; POS keeps the cart and explains the refusal; tested incl. 50 concurrent sales and a host+client last-unit race. |
 | C3 no silent offline queue; idempotent retry | **Done.** `client_txn_id`, SALE NOT CONFIRMED + Retry / Check status; legacy queue manual-review only; tested end to end including a host crash after COMMIT. |
 | C4 no forced/backdoor accounts, first-run admin | **Done** |
 | C5 OTP not returned; SMTP or admin approval | Not yet (Phase 10) |
-| C6 purchases keep batches | Not yet (Phase 6) |
+| C6 purchases keep batches | **Done (Phase 6).** Each purchase line is its own batch (batch, mfg date, expiry, cost, sale price). |
 | C7 BrainTech branding, pharmacy's own name/logo | **Done** for names, receipts, purchase orders, messages and file names. Logo upload is not built yet. |
 | C8 per-install token secret, re-login | **Done** (plus: the role is read from the database, not the token) |
 | C9 server-side totals | Not yet (Phase 7) |
@@ -209,6 +209,16 @@ Features verified in the **desktop app** by automated end-to-end tests on Linux 
 - login (A1);
 - POS search by batch, cart, cash sale, receipt, invoice download (P1, P4, P8, P10, P16, P17);
 - persistence across restart;
-- data shared between host and client.
+- data shared between host and client;
+- Phase 6: stock deducted per batch by FEFO and refused when short or expired (P19), receipt with batch lines (P16), purchase entry with batch/mfg/expiry (PU1), inventory batches panel, expiry tracker and per-batch write-off (I1, I4).
+
+**Phase 6 changes to existing behaviour (approved D1–D7):**
+- I2: the product form sets **opening** stock, batch and expiry only when a product is created; when editing, stock is read-only (D1) and batches are edited in the Batches panel.
+- I4: REMOVE needs the batch and a reason code; more than the batch holds is refused (was clamped).
+- I7: the sidebar counts expiring **batches** (incl. expired) and shows expired batches separately; low stock uses sellable (non-expired) stock.
+- P19: overselling and selling expired stock are refused (C2).
+- PU1: purchases no longer overwrite the product's batch/expiry/cost (C6); the product's purchase/sale price is still updated as the default for new entries.
+- SR5: voiding a sale returns units to the batches they came from (still a hard delete until Phase 7).
+- Excel export adds sellable stock, expired stock and batch count columns (existing columns unchanged).
 
 All other rows remain `pending` until they are checked on Windows.

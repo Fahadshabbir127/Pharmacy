@@ -76,7 +76,7 @@ describe('health and idempotent sales (C3)', () => {
   it('/api/health is public and reveals no secrets', async () => {
     const r = await new Api().get('/health');
     expect(r.status).toBe(200);
-    expect(r.body).toMatchObject({ status: 'ok', apiProtocol: 1, mode: 'legacy', db: { ok: true } });
+    expect(r.body).toMatchObject({ status: 'ok', apiProtocol: 2, mode: 'legacy', db: { ok: true } });
     expect(Object.keys(r.body).sort()).toEqual(['apiProtocol', 'appVersion', 'db', 'mode', 'serverTime', 'status']);
   });
 
@@ -108,7 +108,7 @@ describe('health and idempotent sales (C3)', () => {
   it('a failed sale stores no transaction id, so a corrected retry with the same id can succeed', async () => {
     const txn = crypto.randomUUID();
     const ghost = { id: 99999, name: 'Ghost', unit: 'Pack', sale_price: 10, purchase_price: 5, gst_rate: 0 };
-    expect((await admin.post('/sales', salePayload([cartItem(ghost, 1)], { client_txn_id: txn }))).status).toBe(500);
+    expect((await admin.post('/sales', salePayload([cartItem(ghost, 1)], { client_txn_id: txn }))).status).toBe(400); // Phase 6: validation
     expect((await admin.get(`/sales/by-txn/${txn}`)).status).toBe(404);
     const p = (await admin.get('/inventory')).body.find((x: any) => x.id === 1);
     expect((await admin.post('/sales', salePayload([cartItem(p, 1)], { client_txn_id: txn }))).status).toBe(200);

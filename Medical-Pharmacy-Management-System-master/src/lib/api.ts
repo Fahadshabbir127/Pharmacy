@@ -1,9 +1,11 @@
-import { User, Product, Category, Customer, LedgerEntry, SaleHeader, CartItem, SMSQueueItem, SystemSettings, Supplier, Tenant } from '../types';
+import { User, Product, Category, Customer, LedgerEntry, SaleHeader, CartItem, SMSQueueItem, SystemSettings, Supplier, Tenant, ProductBatch, AdjustReasonCode } from '../types';
 
 const API_BASE = '/api';
 
 /** Error from the API, with enough detail to tell "failed" from "outcome unknown". */
 export class ApiError extends Error {
+  /** the full JSON error body (e.g. product_id / requested / available for 409 INSUFFICIENT_STOCK) */
+  details: Record<string, any> = {};
   constructor(message: string, readonly status: number, readonly code?: string, readonly outcome: 'FAILED' | 'UNKNOWN' = 'FAILED') {
     super(message);
     this.name = 'ApiError';
@@ -84,7 +86,9 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     const errorData = await response.json().catch(() => ({ error: 'An unexpected error occurred' }));
     // 5xx without a definite answer, 503 from the desktop connection layer, timeouts: outcome unknown.
     const outcome = errorData.outcome || (response.status === 502 || response.status === 503 || response.status === 504 ? 'UNKNOWN' : 'FAILED');
-    throw new ApiError(errorData.error || `HTTP ${response.status}`, response.status, errorData.code, outcome);
+    const err = new ApiError(errorData.error || `HTTP ${response.status}`, response.status, errorData.code, outcome);
+    err.details = errorData && typeof errorData === 'object' ? errorData : {};
+    throw err;
   }
 
   return response.json() as Promise<T>;
@@ -248,11 +252,21 @@ export const api = {
     request<{ message: string }>(`/inventory/${id}`, {
       method: 'DELETE',
     }),
-  adjustStock: (productId: number, type: 'ADD' | 'REMOVE', quantity: number, reason: string) =>
-    request<{ message: string; newStock: number }>('/inventory/adjust', {
+  /** Phase 6: REMOVE needs the batch; ADD goes to an existing batch or creates a new one from `newBatch`. */
+  adjustStock: (productId: number, type: 'ADD' | 'REMOVE', quantity: number, reason: string,
+    opts: { batchId?: number | null; reasonCode?: AdjustReasonCode; newBatch?: { batch_number?: string; expiry_date?: string; mfg_date?: string; purchase_price?: number; sale_price?: number } } = {}) =>
+    request<{ message: string; stock: number; batch_id: number; batch_qty: number }>('/inventory/adjust', {
       method: 'POST',
-      body: JSON.stringify({ product_id: productId, adjustment_type: type, quantity, reason }),
+      body: JSON.stringify({ product_id: productId, adjustment_type: type, quantity, reason, batch_id: opts.batchId || undefined, reason_code: opts.reasonCode || 'OTHER', ...(opts.newBatch || {}) }),
     }),
+  getProductBatches: (productId: number, includeEmpty = false) =>
+    request<{ product_id: number; product_name: string; stock: number; today: string; batches: ProductBatch[] }>(`/inventory/${productId}/batches${includeEmpty ? '?include_empty=true' : ''}`),
+  correctBatch: (batchId: number, data: { batch_number?: string; expiry_date?: string | null; mfg_date?: string | null; sale_price?: number; reason: string }) =>
+    request<ProductBatch>(`/batches/${batchId}`, { method: 'PUT', body: JSON.stringify(data) }),
+  getBatchHistory: (batchId: number) =>
+    request<{ batch: ProductBatch; product_name: string; events: { type: string; date: string; quantity: number; detail?: string; reference?: { sale_id?: number; purchase_id?: number; invoice_number?: string } }[] }>(`/batches/${batchId}/history`),
+  getExpiryReport: (days = 90) =>
+    request<{ today: string; days: number; expired: (ProductBatch & { product_name: string; unit: string })[]; expiring: (ProductBatch & { product_name: string; unit: string })[]; noExpiry: (ProductBatch & { product_name: string; unit: string })[]; totals: { expiredUnits: number; expiredValue: number } }>(`/inventory/expiry-report?days=${days}`),
 
   // Categories & Suppliers
   getCategories: () => request<Category[]>('/categories'),

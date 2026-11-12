@@ -18,11 +18,11 @@ describe('startup on an empty data directory', () => {
     expect(fs.existsSync(srv.dbFile)).toBe(true);
   });
 
-  it('creates all 17 legacy tables plus schema_migrations, paired_clients, idempotency_keys and uses WAL', async () => {
+  it('creates all 17 legacy tables plus schema_migrations, paired_clients, idempotency_keys, the Phase 6 batch tables and uses WAL', async () => {
     const db = await openReadOnly(srv.dbFile);
     expect(tableNames(db)).toEqual([
-      'audit_logs', 'categories', 'customer_ledger', 'customers', 'email_queue', 'idempotency_keys', 'otp_verifications',
-      'paired_clients', 'products', 'purchase_headers', 'purchase_items', 'sale_items', 'sales_headers', 'schema_migrations', 'settings',
+      'audit_logs', 'categories', 'customer_ledger', 'customers', 'email_queue', 'idempotency_keys', 'inventory_migration_issues', 'otp_verifications',
+      'paired_clients', 'product_batches', 'products', 'purchase_headers', 'purchase_items', 'sale_item_batches', 'sale_items', 'sales_headers', 'schema_migrations', 'settings',
       'sms_queue', 'stock_adjustments', 'suppliers', 'tenants', 'users',
     ]);
     expect(integrityCheck(db)).toEqual([]);

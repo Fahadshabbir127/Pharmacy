@@ -89,7 +89,46 @@ export interface Product {
   supplier_name?: string;
   created_at?: string;
   updated_at?: string;
+  // Phase 6 batch summary (from the server; stock = sum of all batches, sellable_stock excludes expired ones)
+  sellable_stock?: number;
+  expired_stock?: number;
+  batch_count?: number;
+  next_batch_id?: number | null;
+  next_expiry?: string | null;
+  has_undated_stock?: boolean;
 }
+
+export type BatchStatus = 'EMPTY' | 'EXPIRED' | 'EXPIRING_SOON' | 'NO_EXPIRY' | 'OK';
+export type BatchSource = 'MIGRATION' | 'OPENING' | 'PURCHASE' | 'ADJUSTMENT' | 'VOID_RESTORE';
+
+export interface ProductBatch {
+  id: number;
+  product_id: number;
+  batch_number: string | null;
+  mfg_date: string | null;
+  expiry_date: string | null;
+  expiry_raw?: string | null;
+  purchase_price: number;
+  sale_price: number;
+  qty_received: number;
+  qty_on_hand: number;
+  supplier_id?: number | null;
+  supplier_name?: string | null;
+  source: BatchSource;
+  created_at?: string;
+  status: BatchStatus;
+  sellable: boolean;
+}
+
+export interface SaleLineBatch {
+  batch_id: number;
+  batch_number: string | null;
+  expiry_date: string | null;
+  quantity: number;
+}
+
+export const ADJUST_REASON_CODES = ['DAMAGED', 'EXPIRED', 'LOST', 'THEFT', 'COUNT_CORRECTION', 'OTHER'] as const;
+export type AdjustReasonCode = typeof ADJUST_REASON_CODES[number];
 
 export interface Customer {
   id: number;
@@ -176,6 +215,8 @@ export interface SaleItem {
   batch_number: string;
   expiry_date: string;
   subtotal: number;
+  /** Phase 6: which batches the units were taken from (empty for sales recorded before batch tracking) */
+  batches?: SaleLineBatch[];
 }
 
 export interface PurchaseHeader {
@@ -268,6 +309,9 @@ export interface DashboardStats {
   totalUdharBalance: number;
   lowStockCount: number;
   expiringCount: number;
+  /** Phase 6: batches with stock whose expiry date has passed (and their units) */
+  expiredBatchCount?: number;
+  expiredUnits?: number;
   totalProductsCount: number;
   totalCustomersCount: number;
 }

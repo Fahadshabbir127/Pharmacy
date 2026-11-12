@@ -150,7 +150,8 @@ describe('stores (FK3)', () => {
 
 describe('foreign keys are enforced at runtime', () => {
   it('foreign_keys is ON in the running server (writes with dangling ids fail)', async () => {
-    expect((await admin.post('/purchases', { supplier_id: 999, items: [{ product_id: 1, quantity: 1, purchase_price: 1 }] })).status).toBe(500);
+    // Phase 6: an unknown supplier is now refused by validation (400) before the foreign key is reached
+    expect((await admin.post('/purchases', { supplier_id: 999, items: [{ product_id: 1, quantity: 1, purchase_price: 1 }] })).status).toBe(400);
     expect((await admin.post('/sales', salePayload([cartItem(await prod(1), 1)], { payment_method: 'UDHAR', customer_id: 999 }))).status).toBe(500);
     const db = await openReadOnly(srv.dbFile);
     expect(all(db, 'SELECT COUNT(*) n FROM purchase_headers')).toEqual([{ n: 0 }]);

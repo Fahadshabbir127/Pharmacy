@@ -53,8 +53,8 @@ function portInUse(port: number): Promise<boolean> {
 async function waitForServer(proc: ChildProcess, logs: () => string, timeoutMs = 45000, tlsPin?: string): Promise<void> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    if (proc.exitCode !== null) {
-      throw new Error(`Server exited early with code ${proc.exitCode}\n${logs()}`);
+    if (proc.exitCode !== null || proc.signalCode !== null) {
+      throw new Error(`Server exited early with code ${proc.exitCode ?? proc.signalCode}\n${logs()}`);
     }
     try {
       if (tlsPin) {
@@ -95,7 +95,9 @@ export async function startServer(opts: { workDir?: string; entry?: string; seed
   const proc = spawn(process.execPath, ['--import', TSX_LOADER, opts.entry ?? CURRENT_SERVER], {
     cwd: workDir,
     // PHARMACY_TEST_LEGACY_SEED: load the original demo seed (known demo logins) - tests only, never in the app
-    env: { ...process.env, NODE_ENV: 'production', PHARMACY_TEST_LEGACY_SEED: '1', ...opts.env },
+    // PHARMACY_TEST_TODAY: a fixed pharmacy date, so the demo seed's expiry dates (some in 2026) do not make
+    // tests change outcome as the real calendar moves on. Expiry tests set their own date explicitly.
+    env: { ...process.env, NODE_ENV: 'production', PHARMACY_TEST_LEGACY_SEED: '1', PHARMACY_TEST_TODAY: '2026-06-01', ...opts.env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   live.add(proc);
