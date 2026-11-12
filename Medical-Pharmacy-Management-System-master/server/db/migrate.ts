@@ -145,6 +145,8 @@ export async function migrate(
         if (lost.length) throw new MigrationError(`Migration ${m.version} (${m.name}) would remove data; rolled back.`, { lost });
         const problems = db.integrityCheck();
         if (problems.length) throw new MigrationError(`Migration ${m.version} (${m.name}) broke integrity; rolled back.`, { problems });
+        // Crash-test hook (tests only): hard-kill the process inside this migration's transaction, before COMMIT.
+        if (process.env.PHARMACY_TEST_CRASH_MIGRATION === String(m.version)) process.kill(process.pid, 'SIGKILL');
       });
     } catch (e: any) {
       if (e instanceof MigrationError) throw Object.assign(e, { details: { ...e.details, migration: m.version, backupFile: report.backupFile } });

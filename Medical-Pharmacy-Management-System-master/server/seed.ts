@@ -13,6 +13,7 @@
  */
 import bcrypt from 'bcryptjs';
 import type { DbAdapter } from './db/adapter';
+import { createBatch } from './inventory/batches';
 
 function catalog(db: DbAdapter, saleCreatorId: number) {
   // Seed Categories
@@ -62,13 +63,16 @@ function catalog(db: DbAdapter, saleCreatorId: number) {
     ['Nestle Pure Life Water 1.5L', 'Bottle', 80, 110, 24, 60, 'NW-15', '2027-01-01', 10, '2201.10', 18, 'Rack H1', 2]
   ];
 
+  // Phase 6: a product starts with stock 0; its stock is an OPENING batch (products.stock follows the batches)
   sampleProducts.forEach(p => {
-    db.run(
+    const [name, unit, purchasePrice, salePrice, minStock, stock, batchNumber, expiry, categoryId, hsn, gst, rack, supplierId] = p as any[];
+    const productId = db.run(
       `INSERT INTO products 
       (name, unit, purchase_price, sale_price, min_stock, stock, batch_number, expiry_date, category_id, hsn_code, gst_rate, rack_location, supplier_id) 
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      p
-    );
+      VALUES (?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)`,
+      [name, unit, purchasePrice, salePrice, minStock, batchNumber, expiry, categoryId, hsn, gst, rack, supplierId]
+    ).lastInsertRowid;
+    createBatch(db, { productId, batchNumber, expiryDate: expiry, purchasePrice, salePrice, quantity: stock, supplierId, source: 'OPENING' });
   });
 
   // Seed Initial Customer Ledger & Sale

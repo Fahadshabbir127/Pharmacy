@@ -30,6 +30,8 @@ export const PurchaseScreen: React.FC = () => {
     purchase_price: number;
     batch_number: string;
     expiry_date: string;
+    mfg_date?: string;
+    sale_price?: number;
   }>>([]);
 
   // Item Row Form Input
@@ -38,6 +40,9 @@ export const PurchaseScreen: React.FC = () => {
   const [itemPrice, setItemPrice] = useState<number>(100);
   const [itemBatch, setItemBatch] = useState<string>('');
   const [itemExpiry, setItemExpiry] = useState<string>('');
+  const [itemMfg, setItemMfg] = useState<string>('');
+  const [itemSalePrice, setItemSalePrice] = useState<number>(0);
+  const [itemError, setItemError] = useState<string | null>(null);
 
   const [submitting, setSubmitting] = useState<boolean>(false);
 
@@ -84,6 +89,12 @@ export const PurchaseScreen: React.FC = () => {
     if (!selectedProductId) return;
     const prod = products.find(p => p.id === Number(selectedProductId));
     if (!prod) return;
+    // Phase 6: each line becomes its own batch. Rules that depend on "today" (already expired, mfg date in
+    // the future) are checked by the server against the pharmacy's date, not this computer's clock.
+    if (!Number.isInteger(itemQty) || itemQty <= 0) { setItemError('Quantity must be a whole number greater than zero.'); return; }
+    if (!(itemPrice >= 0)) { setItemError('Cost price must be zero or more.'); return; }
+    if (itemMfg && itemExpiry && itemMfg > itemExpiry) { setItemError('Manufacturing date must be on or before the expiry date.'); return; }
+    setItemError(null);
 
     setPurchaseItems(prev => [
       ...prev,
@@ -91,9 +102,11 @@ export const PurchaseScreen: React.FC = () => {
         product_id: prod.id,
         product_name: prod.name,
         quantity: itemQty,
-        purchase_price: itemPrice || prod.purchase_price,
-        batch_number: itemBatch || prod.batch_number || '',
-        expiry_date: itemExpiry || prod.expiry_date || ''
+        purchase_price: Number.isFinite(itemPrice) ? itemPrice : prod.purchase_price,
+        batch_number: itemBatch.trim(),
+        expiry_date: itemExpiry,
+        mfg_date: itemMfg || undefined,
+        sale_price: itemSalePrice > 0 ? itemSalePrice : undefined
       }
     ]);
 
@@ -102,6 +115,8 @@ export const PurchaseScreen: React.FC = () => {
     setItemPrice(100);
     setItemBatch('');
     setItemExpiry('');
+    setItemMfg('');
+    setItemSalePrice(0);
   };
 
   const handleRemoveRow = (idx: number) => {
@@ -148,9 +163,12 @@ export const PurchaseScreen: React.FC = () => {
     setSelectedProductId(prodIdStr);
     const prod = products.find(p => p.id === Number(prodIdStr));
     if (prod) {
+      // a purchase is a NEW batch: batch number and dates are typed from the supplier's invoice
       setItemPrice(prod.purchase_price);
-      setItemBatch(prod.batch_number || '');
-      setItemExpiry(prod.expiry_date || '');
+      setItemSalePrice(prod.sale_price);
+      setItemBatch('');
+      setItemExpiry('');
+      setItemMfg('');
     }
   };
 
@@ -395,7 +413,7 @@ export const PurchaseScreen: React.FC = () => {
               >
                 <option value="">Select Item...</option>
                 {products.map(p => (
-                  <option key={p.id} value={p.id}>{p.name} (Cur. Stock: {p.stock})</option>
+                  <option key={p.id} value={p.id}>{p.name} (Cur. Stock: {p.stock}{p.batch_count ? `, ${p.batch_count} batch${p.batch_count > 1 ? 'es' : ''}` : ''})</option>
                 ))}
               </select>
             </div>
@@ -405,6 +423,7 @@ export const PurchaseScreen: React.FC = () => {
               <input
                 type="number"
                 min="1"
+                aria-label="Purchase quantity"
                 value={itemQty}
                 onChange={(e) => setItemQty(Number(e.target.value))}
                 className="w-full bg-slate-900 text-white p-2 rounded-lg border border-slate-700 focus:outline-none focus:border-emerald-500"
@@ -416,6 +435,7 @@ export const PurchaseScreen: React.FC = () => {
               <input
                 type="number"
                 min="0"
+                aria-label="Cost price"
                 value={itemPrice}
                 onChange={(e) => setItemPrice(Number(e.target.value))}
                 className="w-full bg-slate-900 text-white p-2 rounded-lg border border-slate-700 focus:outline-none focus:border-emerald-500"
@@ -426,12 +446,49 @@ export const PurchaseScreen: React.FC = () => {
               <label className="block text-slate-400 font-semibold mb-1">Batch #:</label>
               <input
                 type="text"
+                aria-label="Batch number"
                 value={itemBatch}
                 onChange={(e) => setItemBatch(e.target.value)}
                 placeholder="B-901"
                 className="w-full bg-slate-900 text-white p-2 rounded-lg border border-slate-700 focus:outline-none focus:border-emerald-500"
               />
             </div>
+
+            <div className="sm:col-span-2">
+              <label className="block text-slate-400 font-semibold mb-1">Sale Price (Rs.):</label>
+              <input
+                type="number"
+                min="0"
+                aria-label="Batch sale price"
+                value={itemSalePrice}
+                onChange={(e) => setItemSalePrice(Number(e.target.value))}
+                className="w-full bg-slate-900 text-white p-2 rounded-lg border border-slate-700 focus:outline-none focus:border-emerald-500"
+              />
+            </div>
+
+            <div className="sm:col-span-3">
+              <label className="block text-slate-400 font-semibold mb-1">Mfg Date:</label>
+              <input
+                type="date"
+                aria-label="Manufacturing date"
+                value={itemMfg}
+                onChange={(e) => setItemMfg(e.target.value)}
+                className="w-full bg-slate-900 text-white p-2 rounded-lg border border-slate-700 focus:outline-none focus:border-emerald-500"
+              />
+            </div>
+
+            <div className="sm:col-span-3">
+              <label className="block text-slate-400 font-semibold mb-1">Expiry Date:</label>
+              <input
+                type="date"
+                aria-label="Expiry date"
+                value={itemExpiry}
+                onChange={(e) => setItemExpiry(e.target.value)}
+                className="w-full bg-slate-900 text-white p-2 rounded-lg border border-slate-700 focus:outline-none focus:border-emerald-500"
+              />
+            </div>
+
+            {itemError && <div role="alert" className="sm:col-span-12 bg-rose-950 border border-rose-800 text-rose-200 p-2 rounded-lg">{itemError}</div>}
 
             <div className="sm:col-span-2 flex items-end">
               <button
@@ -451,7 +508,7 @@ export const PurchaseScreen: React.FC = () => {
                 <tr>
                   <th className="py-2.5 px-3">Medicine</th>
                   <th className="py-2.5 px-3 text-center hidden sm:table-cell">Batch #</th>
-                  <th className="py-2.5 px-3 text-center hidden md:table-cell">Expiry</th>
+                  <th className="py-2.5 px-3 text-center hidden md:table-cell">Mfg / Expiry</th>
                   <th className="py-2.5 px-3 text-center">Qty</th>
                   <th className="py-2.5 px-3 text-right hidden sm:table-cell">Cost Price</th>
                   <th className="py-2.5 px-3 text-right">Total</th>
@@ -475,7 +532,7 @@ export const PurchaseScreen: React.FC = () => {
                         </div>
                       </td>
                       <td className="py-2.5 px-3 text-center font-mono hidden sm:table-cell">{item.batch_number || '-'}</td>
-                      <td className="py-2.5 px-3 text-center text-slate-400 hidden md:table-cell">{item.expiry_date || '-'}</td>
+                      <td className="py-2.5 px-3 text-center text-slate-400 hidden md:table-cell">{item.mfg_date || '-'} / {item.expiry_date || 'no expiry'}</td>
                       <td className="py-2.5 px-3 text-center font-bold text-emerald-400">{item.quantity}</td>
                       <td className="py-2.5 px-3 text-right hidden sm:table-cell">Rs. {item.purchase_price}</td>
                       <td className="py-2.5 px-3 text-right font-bold text-white">

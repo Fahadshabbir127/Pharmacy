@@ -10,7 +10,7 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
-import { launch, quit, tempRoot, runWizardLocal, loginUi, apiFromRenderer, Instance, sleep } from './helpers';
+import { launch, quit, tempRoot, runWizardLocal, loginUi, apiFromRenderer, printOff, Instance, sleep } from './helpers';
 
 const ADMIN = { store: 'Shifa Medical Store', owner: 'Owner', user: 'owner', password: 'Str0ngPass!', demo: true };
 let hostBase: string;
@@ -110,6 +110,51 @@ describe('shared data between the two computers', () => {
   }, 90_000);
 });
 
+describe('Phase 6: batches across host and client', () => {
+  it('a client UI sale spanning two batches is allocated on the host; both computers see the same batch quantities', async () => {
+    const brufen = (await apiFromRenderer(host.win, 'GET', '/inventory')).body.find((p: any) => p.batch_number === 'BF-109');
+    expect(brufen.stock).toBe(80);
+    const pur = await apiFromRenderer(host.win, 'POST', '/purchases', { supplier_id: brufen.supplier_id, items: [{ product_id: brufen.id, quantity: 2, purchase_price: 130, batch_number: 'BF-EARLY', expiry_date: '2026-12-31' }] });
+    expect(pur.status).toBe(200);
+
+    await client.win.goto('app://braintech/index.html'); // reload the POS product list
+    await loginUi(client.win, ADMIN.user, ADMIN.password);
+    await printOff(client.win);
+    const search = client.win.locator('input[placeholder^="Scan Barcode or Search Medicine"]');
+    await search.fill('BF-EARLY');
+    await search.press('Enter');
+    await client.win.locator('input[title="Click to type quantity manually"]').fill('3');
+    await client.win.waitForTimeout(300);
+    await client.win.click('button:has-text("CASH")');
+    await client.win.click('button:has-text("Complete Sale & Print Receipt")');
+    await client.win.waitForSelector('text=Invoice / Thermal Receipt', { timeout: 30_000 });
+    const cell = (await client.win.locator('[data-testid="receipt-batches"]').first().innerText()).replace(/\s+/g, ' ');
+    expect(cell).toContain('BF-EARLY ×2');
+    expect(cell).toContain('BF-109 ×1');
+    await client.win.screenshot({ path: path.join(clientBase, '05-client-multibatch.png') });
+    await client.win.click('button:text-is("Close")');
+
+    const view = async (i: Instance) => (await apiFromRenderer(i.win, 'GET', `/inventory/${brufen.id}/batches?include_empty=true`)).body.batches.map((b: any) => [b.batch_number, b.qty_on_hand]);
+    expect(await view(host)).toEqual([['BF-EARLY', 0], ['BF-109', 79]]);
+    expect(await view(client)).toEqual(await view(host));
+  }, 120_000);
+
+  it('host and client sell the last unit at the same moment: exactly one sale succeeds, the other is refused, stock is 0 on both', async () => {
+    const c = await apiFromRenderer(host.win, 'POST', '/inventory', { name: 'E2E Last Vial', unit: 'Vial', purchase_price: 100, sale_price: 150 });
+    await apiFromRenderer(host.win, 'POST', '/inventory/adjust', { product_id: c.body.id, adjustment_type: 'ADD', quantity: 1, reason: 'E2E', reason_code: 'COUNT_CORRECTION', batch_number: 'V-1', expiry_date: '2027-06-30' });
+    const p = (await apiFromRenderer(host.win, 'GET', '/inventory')).body.find((x: any) => x.id === c.body.id);
+    const sale = { items: [{ product: p, quantity: 1, unit_price: 150, discount_percent: 0, discount_amount: 0, gst_amount: 0, subtotal: 150 }], total_amount: 150, discount_percent: 0, discount_amount: 0, net_amount: 150, total_gst: 0, grand_total: 150, payment_method: 'CASH', amount_paid: 150 };
+    const [a, b] = await Promise.all([apiFromRenderer(host.win, 'POST', '/sales', sale), apiFromRenderer(client.win, 'POST', '/sales', sale)]);
+    expect([a.status, b.status].sort()).toEqual([200, 409]);
+    const refused = a.status === 409 ? a : b;
+    expect(refused.body).toMatchObject({ code: 'INSUFFICIENT_STOCK', requested: 1, available: 0 });
+    for (const i of [host, client]) {
+      const now = (await apiFromRenderer(i.win, 'GET', '/inventory')).body.find((x: any) => x.id === c.body.id);
+      expect(now).toMatchObject({ stock: 0, sellable_stock: 0 });
+    }
+  }, 60_000);
+});
+
 describe('host crash after saving a sale, before answering (the hardest case)', () => {
   it('the client shows SALE NOT CONFIRMED, keeps the cart; "Check status" finds the saved sale exactly once', async () => {
     fs.rmSync(crashMarker); // arm the one-shot crash: the host backend dies right after COMMIT of the next sale
@@ -134,7 +179,7 @@ describe('host crash after saving a sale, before answering (the hardest case)', 
     const after = (await apiFromRenderer(host.win, 'GET', '/inventory')).body.find((p: any) => p.batch_number === 'HY-908').stock;
     expect(after).toBe(before - 1); // recorded exactly once
     const sales = (await apiFromRenderer(host.win, 'GET', '/sales/history')).body;
-    expect(sales.length).toBe(3);
+    expect(sales.length).toBe(5); // demo + client sale + client multi-batch sale + last-unit race winner + this one
   }, 180_000);
 });
 

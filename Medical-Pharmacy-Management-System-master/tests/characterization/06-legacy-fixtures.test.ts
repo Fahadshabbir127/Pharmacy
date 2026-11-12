@@ -29,7 +29,7 @@ describe('frozen original backend', () => {
 describe('generated legacy fixtures', () => {
   it('all fixtures exist and pass integrity_check', () => {
     expect(Object.keys(manifest).sort()).toEqual([
-      'after-restart', 'busy-store', 'fresh-first-boot', 'multi-tenant', 'orphans', 'pre-tenant-migrated-by-original', 'pre-tenant-raw',
+      'after-restart', 'busy-store', 'fresh-first-boot', 'inventory-edge-cases', 'multi-tenant', 'orphans', 'pre-tenant-migrated-by-original', 'pre-tenant-raw',
     ]);
     for (const [name, m] of Object.entries(manifest)) {
       expect(fs.existsSync(path.join(FIXTURE_DIR, m.file)), name).toBe(true);

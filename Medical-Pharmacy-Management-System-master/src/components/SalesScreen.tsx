@@ -287,6 +287,7 @@ export const SalesScreen: React.FC<SalesScreenProps> = ({ currentUser }) => {
                       <td className="py-1.5 flex items-center gap-2">
                         <Package className="w-3.5 h-3.5 text-slate-400 shrink-0" />
                         <span className="font-semibold">{item.product_name}</span>
+                        {item.batch_number && <span className="text-[10px] text-slate-400">Batch {item.batch_number}{item.expiry_date ? ` · exp ${item.expiry_date}` : ''}</span>}
                       </td>
                       <td className="py-1.5 text-right font-medium">{item.quantity} {item.unit || 'Pcs'}</td>
                       <td className="py-1.5 text-right font-mono">Rs. {(Number(item.sale_price) || 0).toFixed(2)}</td>

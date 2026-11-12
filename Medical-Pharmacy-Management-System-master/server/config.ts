@@ -5,7 +5,7 @@ import net from 'node:net';
 import os from 'node:os';
 
 /** Bumped whenever the HTTP API changes incompatibly; host and clients must match. */
-export const API_PROTOCOL = 1;
+export const API_PROTOCOL = 2; // 2 = Phase 6 batch inventory (sale answers 409 INSUFFICIENT_STOCK / EXPIRED_STOCK)
 
 export const APP_VERSION = process.env.PHARMACY_APP_VERSION || '1.0.0';
 

@@ -123,3 +123,18 @@ Database integrity is not weakened: every relationship that was declared is now 
 `openDatabase()` runs the migrations with enforcement off (old databases may contain orphans), then runs `PRAGMA foreign_key_check`. If anything is still broken, **startup stops and reports the rows; nothing is auto-repaired**. Otherwise it sets `foreign_keys = ON` for the session.
 
 A database that gains a new broken reference later is refused at the next start, with the rows listed (tested).
+
+## 6. Phase 6: foreign keys added with batch inventory (migration `0007_batch_inventory`)
+
+All new links are declared in the schema and enforced (enforcement is ON since FK5). `foreign_key_check` is empty after migration 0007 on all 8 legacy fixtures (tested in `tests/unit/batch-migration.test.ts`).
+
+| Relationship | Declared | Notes |
+|---|---|---|
+| `product_batches.product_id → products.id` | yes | A product with history is archived, never deleted, so its batches stay valid. A product **without** history is deleted together with its batches (audited with the unit count). |
+| `product_batches.supplier_id → suppliers.id` | yes (nullable) | The migration sets it only when the legacy product's supplier still exists; suppliers with purchases are archived, not deleted. |
+| `product_batches.purchase_item_id → purchase_items.id` | yes (nullable) | Set for PURCHASE batches. |
+| `sale_item_batches.sale_item_id → sale_items.id` | yes | Voiding a sale deletes the allocation rows first, then the sale lines (void is still a hard delete until Phase 7). |
+| `sale_item_batches.batch_id → product_batches.id` | yes | Batches are never deleted while they have allocations (only a product without any history deletes its batches). |
+| `purchase_items.batch_id → product_batches.id` | yes (nullable, added by ALTER) | Old purchase lines keep NULL. |
+| `stock_adjustments.batch_id → product_batches.id` | yes (nullable, added by ALTER) | Old adjustments keep NULL. |
+| `product_batches.tenant_id`, `created_by`, `inventory_migration_issues.product_id` | no (application-enforced, as FK4) | `inventory_migration_issues` is a report and must keep its rows even if a product is later removed. |

@@ -100,7 +100,13 @@ export const ThermalReceiptModal: React.FC<ThermalReceiptModalProps> = ({ sale, 
                   <td className="py-1 font-sans font-medium pr-1">
                     {item.product_name}
                   </td>
-                  <td className="py-1 text-center text-[9px] text-slate-500">{item.batch_number || '-'}</td>
+                  <td className="py-1 text-center text-[9px] text-slate-500" data-testid="receipt-batches">
+                    {Array.isArray(item.batches) && item.batches.length > 0
+                      ? item.batches.map((b: any, i: number) => (
+                          <div key={i} className="whitespace-nowrap">{b.batch_number || '-'}{item.batches.length > 1 ? ` ×${b.quantity}` : ''}{b.expiry_date ? ` (exp ${b.expiry_date})` : ''}</div>
+                        ))
+                      : (item.batch_number || '-')}
+                  </td>
                   <td className="py-1 text-center font-bold">{item.quantity} {item.unit}</td>
                   <td className="py-1 text-right">Rs. {item.sale_price}</td>
                   <td className="py-1 text-right font-bold">Rs. {item.subtotal}</td>

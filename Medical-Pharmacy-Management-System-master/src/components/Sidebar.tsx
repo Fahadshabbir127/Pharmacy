@@ -23,6 +23,7 @@ interface SidebarProps {
   allowedServices?: string;
   lowStockCount?: number;
   expiringCount?: number;
+  expiredBatchCount?: number;
   isMobileOpen?: boolean;
   onCloseMobile?: () => void;
 }
@@ -34,6 +35,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   allowedServices,
   lowStockCount = 0,
   expiringCount = 0,
+  expiredBatchCount = 0,
   isMobileOpen = false,
   onCloseMobile
 }) => {
@@ -265,10 +267,26 @@ export const Sidebar: React.FC<SidebarProps> = ({
             >
               <div className="flex items-center space-x-1.5">
                 <Clock className="w-3.5 h-3.5 text-rose-400" />
-                <span className="font-bold">Expiring 90d</span>
+                <span className="font-bold">Expiring / expired 90d</span>
               </div>
               <span className="font-bold bg-rose-800 text-white px-1.5 py-0.5 rounded text-[10px]">
                 {expiringCount} Batches
+              </span>
+            </div>
+          )}
+
+          {expiredBatchCount > 0 && (
+            <div
+              onClick={() => handleItemClick('inventory')}
+              className="p-2 rounded bg-rose-900/70 border border-rose-600 text-rose-100 text-[11px] flex items-center justify-between cursor-pointer hover:bg-rose-800/70 transition-colors"
+              title="Expired stock cannot be sold. Write it off with Stock Adjustment."
+            >
+              <div className="flex items-center space-x-1.5">
+                <Clock className="w-3.5 h-3.5 text-rose-300" />
+                <span className="font-bold">Expired (not sellable)</span>
+              </div>
+              <span className="font-bold bg-rose-600 text-white px-1.5 py-0.5 rounded text-[10px]">
+                {expiredBatchCount} Batches
               </span>
             </div>
           )}

@@ -217,6 +217,21 @@ sales_returns / sales_return_items (sale_item_id, batch_id, qty, restock flag, r
 - **Invariant**, checked in the same transaction and by a periodic health check: `products.stock = SUM(qty_on_hand of non-quarantined batches)`.
 - **Migration:** one batch per existing product with `stock > 0`, using its current batch, expiry and prices.
 
+### As built in Phase 6 (differences from the design above)
+
+| Item | Built |
+|---|---|
+| Tables | `product_batches` (batch_number, mfg_date, expiry_date `YYYY-MM-DD` or NULL, **expiry_raw** = original text, purchase_price, sale_price, qty_received, qty_on_hand `CHECK >= 0`, supplier_id, purchase_item_id, source MIGRATION/OPENING/PURCHASE/ADJUSTMENT/VOID_RESTORE, tenant_id, created_by, archive columns), `sale_item_batches` (quantity `CHECK > 0`, unit_cost), `inventory_migration_issues`; new columns `purchase_items.batch_id/mfg_date/sale_price`, `stock_adjustments.batch_id/reason_code`. No `mrp`, `status`/quarantine, supplier or customer returns yet (later phases). |
+| Stock total | `products.stock` is kept by triggers on `product_batches` (insert/update/delete). Guard triggers abort any direct write of `products.stock` (`STOCK_GUARD`), so a forgotten code path fails loudly instead of desynchronising stock. |
+| FEFO | `server/inventory/fefo.ts`: non-expired batches with stock, expiry ascending, **undated batches last** (D5), then id. Lines for the same product share one pool. The whole plan is computed and validated before the first write. No cashier batch pinning yet. |
+| Expiry rule | `server/inventory/expiry.ts`: sellable up to and including the expiry date (D3); `YYYY-MM` / `MM/YYYY` = last day of that month; ambiguous day/month text is not guessed (kept in `expiry_raw`, reported). "Today" = the host computer's local date. |
+| Refusals | 409 `INSUFFICIENT_STOCK` / `EXPIRED_STOCK` with `product_id`, `product_name`, `requested`, `available`, `expired`. 400 for invalid quantity, unknown or archived product. Nothing is written for a refusal. |
+| Sale records | `sale_item_batches` rows; `sale_items.batch_number` = the batch numbers used, `expiry_date` = earliest; `cost_price` = weighted batch cost (D6); the price charged is still the POS price (D2, C9 in Phase 7). |
+| Void | Still the old hard delete (soft-void is Phase 7); units return to the exact batches; pre-batch sales go into a VOID_RESTORE batch built from the line's batch/expiry text. |
+| Invariant check | `inventoryInvariantIssues()` at backend startup (stock = sum of batches, no negative batch, sale line quantity = its allocations). Problems are logged and shown in `/api/local/host-status` → `inventory`; nothing is auto-repaired. No periodic re-check yet. |
+| Endpoints | `GET /api/inventory/:id/batches`, `PUT /api/batches/:id` (ADMIN; number, dates, sale price; reason required; audited; never quantity), `GET /api/batches/:id/history`, `GET /api/inventory/expiry-report?days=`. `GET /api/inventory` adds `sellable_stock`, `expired_stock`, `batch_count`, `next_batch_id`, `next_expiry`, `has_undated_stock`; its `batch_number`/`expiry_date` describe the next FEFO batch. |
+| Protocol | `API_PROTOCOL` = 2 (D7): a host and a client on different versions get the existing "different versions" screen. |
+
 ## 11. POS model
 
 | Concern | Design |
@@ -296,7 +311,7 @@ sales_returns / sales_return_items (sale_item_id, batch_id, qty, restock flag, r
 Every phase ends with tests, a build check, a regression check against `FEATURE_PRESERVATION_CHECKLIST.md`, doc updates and a commit pushed to `claude/beautiful-einstein-ps972s`.
 
 
-## 17. As built (after Phase 4) and deviations from the design
+## 17. As built (after Phase 6) and deviations from the design
 
 | Area | Design said | Built | Why |
 |---|---|---|---|
@@ -312,6 +327,8 @@ Every phase ends with tests, a build check, a regression check against `FEATURE_
 | FK enforcement | after approved fixes | **ON** (FK1–FK5, see `FK_AUDIT_REPORT.md`) | n/a |
 | Idempotency | `client_txn_id` column on each table | `idempotency_keys` table (key, route, stored result), written in the same transaction as the sale | One mechanism for every route, no table rebuilds; used by sales now, payments/purchases in Phase 7 |
 | Real-time updates | SSE | **Not built yet** (Phase 8). Every screen reads fresh data from the host when it loads. | Phase order |
+| Batch inventory (Phase 6) | §10 | Built as described in §10 "As built in Phase 6". Stock protection is in the database (CHECK + triggers), not only in code. | A missed code path must fail, not silently corrupt stock |
+| Stock invariant check | in-transaction + periodic | at startup only, reported, never repaired; the database triggers make a mismatch impossible through normal writes | Periodic check deferred |
 
 ### Module map
 
@@ -326,7 +343,8 @@ electron/ipc.ts          channel registry, sender check (app://braintech only), 
 electron/ui/             setup wizard + Connection & Server Settings (no inline scripts)
 server/config.ts         modes, address classification, API protocol version
 server/lan/*             tls, pairing, pinnedClient, guard, discovery
-server/db/*              adapter, migrations 0001-0006, open (integrity + migrate + FK check), legacy import, transactional routes
+server/db/*              adapter, migrations 0001-0007, open (integrity + migrate + FK check), legacy import, transactional routes
+server/inventory/*       expiry rules (D3/D5), FEFO planner, batch helpers (guarded take/add, invariant check)
 server/seed.ts           optional demo catalogue (no logins); legacy test seed (tests only)
 server/security/*        per-install JWT secret
 ```

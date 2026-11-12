@@ -214,6 +214,26 @@ export async function generateFixtures(outDir: string, log: (m: string) => void 
     await save('orphans', srv.dbFile, 'Deleted product with sales history and deleted customer with invoices (FK violations).');
   }
 
+  // 6b. inventory edge cases the original app allowed (input for the Phase 6 batch migration)
+  {
+    const work = makeTempDir();
+    await withOriginal(work, async () => {});
+    const { srv } = await withOriginal(work, async (admin) => {
+      const p = async (id: number) => (await admin.get('/inventory')).body.find((x: any) => x.id === id);
+      const put = async (id: number, patch: Record<string, unknown>) => admin.put(`/inventory/${id}`, { ...(await p(id)), ...patch });
+      await put(1, { stock: -3 }); // negative stock typed into the product form
+      await put(2, { stock: 7, expiry_date: '12/2027' }); // month/year text
+      await put(3, { stock: 5, expiry_date: '05/10/2027' }); // ambiguous day/month
+      await put(4, { stock: 9, expiry_date: '' }); // stock without any expiry
+      await put(5, { stock: 2.5 }); // fractional stock
+      await put(6, { stock: 0 });
+      await put(7, { expiry_date: '2027-10' }); // year-month
+      const s = await admin.post('/sales', salePayload([cartItem(await p(8), 4)])); // a sale that must stay in history untouched
+      if (s.status !== 200) throw new Error('fixture sale failed');
+    });
+    await save('inventory-edge-cases', srv.dbFile, 'Original app: negative, fractional, zero stock; month/year, ambiguous and blank expiry text; one sale.');
+  }
+
   // 6. pre-tenant (oldest) schema, raw and after the original app migrated it
   {
     const raw = path.join(makeTempDir(), 'pre-tenant.sqlite');

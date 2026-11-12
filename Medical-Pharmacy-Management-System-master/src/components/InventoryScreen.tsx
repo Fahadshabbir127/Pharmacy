@@ -1,7 +1,9 @@
 import { exportToExcel } from '../lib/excel';
 import React, { useState, useEffect } from 'react';
-import { Product, Category, Supplier, User } from '../types';
+import { Product, Category, Supplier, User, ProductBatch, AdjustReasonCode } from '../types';
 import { api } from '../lib/api';
+import { BatchPanel } from './BatchPanel';
+import { ExpiryTracker } from './ExpiryTracker';
 import { 
   Package, 
   Search, 
@@ -14,8 +16,20 @@ import {
   Upload, 
   RefreshCw,
   Sliders,
-  X
+  X,
+  Layers,
+  CalendarClock
 } from 'lucide-react';
+
+// Phase 6: adjustment reasons (the label is also stored as the free-text reason)
+const ADJUST_REASONS: { code: AdjustReasonCode; label: string }[] = [
+  { code: 'COUNT_CORRECTION', label: 'Inventory Count Audit' },
+  { code: 'DAMAGED', label: 'Damaged Stock' },
+  { code: 'EXPIRED', label: 'Expired Product Disposal' },
+  { code: 'LOST', label: 'Lost / Missing' },
+  { code: 'THEFT', label: 'Theft' },
+  { code: 'OTHER', label: 'Supplier Return' },
+];
 
 interface InventoryScreenProps {
   currentUser?: User;
@@ -73,6 +87,30 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
   const [adjustType, setAdjustType] = useState<'ADD' | 'REMOVE'>('ADD');
   const [adjustQty, setAdjustQty] = useState<number>(1);
   const [adjustReason, setAdjustReason] = useState<string>('Inventory Count Audit');
+  const [adjustBatches, setAdjustBatches] = useState<ProductBatch[]>([]);
+  const [adjustBatchId, setAdjustBatchId] = useState<number | 'NEW' | ''>('');
+  const [adjustNewBatch, setAdjustNewBatch] = useState({ batch_number: '', expiry_date: '' });
+  const [adjustError, setAdjustError] = useState<string | null>(null);
+  const [batchProduct, setBatchProduct] = useState<Product | null>(null);
+  const [showExpiryTracker, setShowExpiryTracker] = useState<boolean>(false);
+
+  const openAdjust = async (p: Product) => {
+    setAdjustProduct(p);
+    setAdjustType('ADD');
+    setAdjustQty(1);
+    setAdjustError(null);
+    setAdjustBatches([]);
+    setAdjustBatchId('');
+    setAdjustNewBatch({ batch_number: '', expiry_date: '' });
+    setShowAdjustModal(true);
+    try {
+      const r = await api.getProductBatches(p.id);
+      setAdjustBatches(r.batches);
+      setAdjustBatchId(r.batches.length ? r.batches[0].id : 'NEW');
+    } catch (e: any) {
+      setAdjustError(e.message || 'Could not load batches');
+    }
+  };
 
   useEffect(() => {
     fetchInventory();
@@ -174,7 +212,9 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
       };
 
       if (editingProduct) {
-        await api.updateProduct(editingProduct.id, payload);
+        // D1: stock, batch and expiry are not edited here (they belong to batches)
+        const { stock: _s, batch_number: _b, expiry_date: _e, ...editable } = payload;
+        await api.updateProduct(editingProduct.id, editable);
       } else {
         await api.addProduct(payload);
       }
@@ -214,18 +254,26 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
   const handleStockAdjustment = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!adjustProduct) return;
+    setAdjustError(null);
+    if (!Number.isInteger(adjustQty) || adjustQty <= 0) { setAdjustError('Quantity must be a whole number greater than zero.'); return; }
+    if (adjustType === 'REMOVE' && (adjustBatchId === '' || adjustBatchId === 'NEW')) { setAdjustError('Choose the batch the units are removed from.'); return; }
+    const reasonCode = ADJUST_REASONS.find((r) => r.label === adjustReason)?.code || 'OTHER';
     try {
-      await api.adjustStock(adjustProduct.id, adjustType, adjustQty, adjustReason);
+      await api.adjustStock(adjustProduct.id, adjustType, adjustQty, adjustReason, {
+        batchId: adjustBatchId === 'NEW' || adjustBatchId === '' ? null : adjustBatchId,
+        reasonCode,
+        newBatch: adjustType === 'ADD' && adjustBatchId === 'NEW' ? { batch_number: adjustNewBatch.batch_number || undefined, expiry_date: adjustNewBatch.expiry_date || undefined } : undefined,
+      });
       setShowAdjustModal(false);
       fetchInventory();
     } catch (err: any) {
-      alert(err.message || 'Error adjusting stock');
+      setAdjustError(err.message || 'Error adjusting stock');
     }
   };
 
   // Excel Export
   const handleExportExcel = () => {
-    const headers = ['ID', 'Name', 'Category', 'Unit', 'Purchase Price', 'Sale Price', 'Stock', 'Min Stock', 'Batch #', 'Expiry Date', 'Rack Location'];
+    const headers = ['ID', 'Name', 'Category', 'Unit', 'Purchase Price', 'Sale Price', 'Stock', 'Min Stock', 'Batch #', 'Expiry Date', 'Rack Location', 'Sellable Stock', 'Expired Stock', 'Batches'];
     const rows = products.map(p => [
       p.id,
       p.name,
@@ -237,7 +285,10 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
       p.min_stock,
       p.batch_number || '',
       p.expiry_date || '',
-      p.rack_location || ''
+      p.rack_location || '',
+      p.sellable_stock ?? p.stock,
+      p.expired_stock ?? 0,
+      p.batch_count ?? 0
     ]);
 
     exportToExcel([headers, ...rows], `Inventory_${new Date().toISOString().split('T')[0]}`);
@@ -268,6 +319,14 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
               <span>Add Category</span>
             </button>
           )}
+
+          <button
+            onClick={() => setShowExpiryTracker(true)}
+            className="bg-slate-800 hover:bg-slate-700 text-amber-300 text-xs font-semibold px-2.5 sm:px-3 py-2 rounded-xl border border-slate-700 flex items-center space-x-1.5"
+          >
+            <CalendarClock className="w-3.5 h-3.5" />
+            <span>Expiry Tracker</span>
+          </button>
 
           <button
             onClick={handleExportExcel}
@@ -400,7 +459,8 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
                   </tr>
                 ) : (
                   products.map(p => {
-                    const isLowStock = p.stock <= p.min_stock;
+                    const sellable = typeof p.sellable_stock === 'number' ? p.sellable_stock : p.stock;
+                    const isLowStock = sellable <= p.min_stock;
                     
                     let daysUntilExpiry: number | null = null;
                     if (p.expiry_date) {
@@ -409,7 +469,8 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
                       daysUntilExpiry = Math.ceil((expTime - nowTime) / (1000 * 3600 * 24));
                     }
 
-                    const isExpired = daysUntilExpiry !== null && daysUntilExpiry <= 0;
+                    // Phase 6: the shown batch is the next one sold; it is "expired" only when nothing sellable is left
+                    const isExpired = sellable <= 0 && (p.expired_stock || 0) > 0;
                     const is30DaysExpiring = daysUntilExpiry !== null && daysUntilExpiry > 0 && daysUntilExpiry <= 30;
                     const is60DaysExpiring = daysUntilExpiry !== null && daysUntilExpiry > 30 && daysUntilExpiry <= 60;
                     const is90DaysExpiring = daysUntilExpiry !== null && daysUntilExpiry > 60 && daysUntilExpiry <= 90;
@@ -444,7 +505,7 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
                         </td>
 
                         <td className="py-3 px-4 text-center hidden sm:table-cell">
-                          <div className="font-mono text-slate-300">{p.batch_number || '-'}</div>
+                          <div className="font-mono text-slate-300">{p.batch_number || '-'}{(p.batch_count || 0) > 1 && <span className="ml-1 text-[9px] text-slate-500">+{(p.batch_count || 1) - 1} more</span>}</div>
                           
                           {p.expiry_date ? (
                             <div className="mt-0.5">
@@ -481,28 +542,34 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
                         <td className="py-3 px-4 text-center">
                           <div className="flex items-center justify-center space-x-1.5">
                             <span className={`font-bold px-2.5 py-1 rounded-full text-xs ${
-                              p.stock <= 0
+                              sellable <= 0
                                 ? 'bg-rose-950 text-rose-300 border border-rose-800'
                                 : isLowStock
                                 ? 'bg-amber-950 text-amber-300 border border-amber-800'
                                 : 'bg-emerald-950 text-emerald-300 border border-emerald-800'
                             }`}>
-                              {p.stock} {p.unit}s
+                              {sellable} {p.unit}s
                             </span>
                           </div>
+                          {(p.expired_stock || 0) > 0 && <div className="text-[10px] text-rose-400 font-bold mt-0.5">+{p.expired_stock} expired (not sellable)</div>}
                           <div className="text-[10px] text-slate-500 mt-0.5">Min: {p.min_stock}</div>
                         </td>
 
                         <td className="py-3 px-4 text-right">
                           {isStaff ? (
-                            <span className="text-slate-500 text-[11px] font-mono">View Only</span>
+                            <div className="flex items-center justify-end space-x-2">
+                              <button onClick={() => setBatchProduct(p)} className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[11px] font-semibold border border-slate-700 flex items-center gap-1" title="View batches">
+                                <Layers className="w-3 h-3" /> Batches
+                              </button>
+                              <span className="text-slate-500 text-[11px] font-mono">View Only</span>
+                            </div>
                           ) : (
                             <div className="flex items-center justify-end space-x-2">
+                              <button onClick={() => setBatchProduct(p)} className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[11px] font-semibold border border-slate-700 flex items-center gap-1" title="View batches">
+                                <Layers className="w-3 h-3" /> Batches
+                              </button>
                               <button
-                                onClick={() => {
-                                  setAdjustProduct(p);
-                                  setShowAdjustModal(true);
-                                }}
+                                onClick={() => { void openAdjust(p); }}
                                 className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded text-[11px] font-semibold border border-slate-700"
                                 title="Quick Stock Adjustment"
                               >
@@ -652,15 +719,19 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
               </div>
 
               <div>
-                <label className="block text-slate-300 font-semibold mb-1">Current Stock Quantity*:</label>
+                <label className="block text-slate-300 font-semibold mb-1">{editingProduct ? 'Current Stock (all batches):' : 'Opening Stock Quantity*:'}</label>
                 <input
                   type="number"
                   required
                   min="0"
+                  step="1"
                   value={formData.stock}
+                  disabled={!!editingProduct}
+                  readOnly={!!editingProduct}
                   onChange={(e) => setFormData({ ...formData, stock: Number(e.target.value) })}
-                  className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500"
+                  className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500 disabled:opacity-60"
                 />
+                {editingProduct && <p className="text-[10px] text-slate-500 mt-1">Stock changes only through Purchases and Stock Adjustment (per batch).</p>}
               </div>
 
               <div>
@@ -674,8 +745,9 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
                 />
               </div>
 
+              {!editingProduct ? (<>
               <div>
-                <label className="block text-slate-300 font-semibold mb-1">Batch Number:</label>
+                <label className="block text-slate-300 font-semibold mb-1">Opening Batch Number:</label>
                 <input
                   type="text"
                   value={formData.batch_number}
@@ -686,7 +758,7 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
               </div>
 
               <div>
-                <label className="block text-slate-300 font-semibold mb-1">Expiry Date:</label>
+                <label className="block text-slate-300 font-semibold mb-1">Opening Batch Expiry Date:</label>
                 <input
                   type="date"
                   value={formData.expiry_date}
@@ -694,6 +766,11 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
                   className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500"
                 />
               </div>
+              </>) : (
+              <div className="md:col-span-2 text-[11px] text-slate-400 bg-slate-800/60 border border-slate-700 rounded-xl p-2.5">
+                Batch numbers and expiry dates are kept per batch. Use the <strong>Batches</strong> button to see or correct them.
+              </div>
+              )}
 
               <div>
                 <label className="block text-slate-300 font-semibold mb-1">Rack / Shelf Location:</label>
@@ -834,6 +911,9 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
         </div>
       )}
 
+      {batchProduct && <BatchPanel product={batchProduct} canCorrect={currentUser?.role === 'ADMIN'} onClose={() => setBatchProduct(null)} onChanged={fetchInventory} />}
+      {showExpiryTracker && <ExpiryTracker onClose={() => setShowExpiryTracker(false)} />}
+
       {/* QUICK STOCK ADJUSTMENT MODAL */}
       {showAdjustModal && adjustProduct && (
         <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
@@ -842,6 +922,7 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
             <div className="text-xs text-slate-300">
               Product: <span className="font-bold text-emerald-400">{adjustProduct.name}</span> (Current Stock: {adjustProduct.stock})
             </div>
+            {adjustError && <div role="alert" className="text-xs bg-rose-950 border border-rose-800 text-rose-200 p-2 rounded">{adjustError}</div>}
 
             <div className="space-y-3 text-xs">
               <div>
@@ -858,7 +939,7 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
                   </button>
                   <button
                     type="button"
-                    onClick={() => setAdjustType('REMOVE')}
+                    onClick={() => { setAdjustType('REMOVE'); if (adjustBatchId === 'NEW') setAdjustBatchId(adjustBatches.length ? adjustBatches[0].id : ''); }}
                     className={`py-2 rounded-xl font-bold border text-center ${
                       adjustType === 'REMOVE' ? 'bg-rose-600 border-rose-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-300'
                     }`}
@@ -867,6 +948,28 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
                   </button>
                 </div>
               </div>
+
+              <div>
+                <label className="block text-slate-300 font-semibold mb-1">Batch:</label>
+                <select
+                  aria-label="Batch"
+                  value={adjustBatchId === '' ? '' : String(adjustBatchId)}
+                  onChange={(e) => setAdjustBatchId(e.target.value === 'NEW' ? 'NEW' : e.target.value === '' ? '' : Number(e.target.value))}
+                  className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500"
+                >
+                  {adjustBatches.length === 0 && <option value="">(no batches with stock)</option>}
+                  {adjustBatches.map((b) => (
+                    <option key={b.id} value={b.id}>{b.batch_number || `#${b.id}`} - exp {b.expiry_date || 'none'} - {b.qty_on_hand} on hand{b.status === 'EXPIRED' ? ' (EXPIRED)' : ''}</option>
+                  ))}
+                  {adjustType === 'ADD' && <option value="NEW">+ New batch</option>}
+                </select>
+              </div>
+              {adjustType === 'ADD' && adjustBatchId === 'NEW' && (
+                <div className="grid grid-cols-2 gap-2">
+                  <input placeholder="Batch number" aria-label="New batch number" value={adjustNewBatch.batch_number} onChange={(e) => setAdjustNewBatch({ ...adjustNewBatch, batch_number: e.target.value })} className="bg-slate-800 text-white p-2 rounded-xl border border-slate-700" />
+                  <input type="date" aria-label="New batch expiry" value={adjustNewBatch.expiry_date} onChange={(e) => setAdjustNewBatch({ ...adjustNewBatch, expiry_date: e.target.value })} className="bg-slate-800 text-white p-2 rounded-xl border border-slate-700" />
+                </div>
+              )}
 
               <div>
                 <label className="block text-slate-300 font-semibold mb-1">Quantity:</label>
@@ -887,10 +990,7 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
                   onChange={(e) => setAdjustReason(e.target.value)}
                   className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500"
                 >
-                  <option value="Inventory Count Audit">Inventory Count Audit</option>
-                  <option value="Damaged Stock">Damaged Stock</option>
-                  <option value="Expired Product Disposal">Expired Product Disposal</option>
-                  <option value="Supplier Return">Supplier Return</option>
+                  {ADJUST_REASONS.map((r) => <option key={r.code} value={r.label}>{r.label}</option>)}
                 </select>
               </div>
             </div>

@@ -63,7 +63,10 @@ describe('stock adjustments', () => {
   it('ADD and REMOVE adjust stock, record a row with reason, and audit', async () => {
     expect((await admin.post('/inventory/adjust', { product_id: 1, adjustment_type: 'ADD', quantity: 10, reason: 'Found in store' })).status).toBe(200);
     expect((await prod(1)).stock).toBe(130);
-    expect((await admin.post('/inventory/adjust', { product_id: 1, adjustment_type: 'REMOVE', quantity: 30, reason: 'Damaged' })).status).toBe(200);
+    // Phase 6: REMOVE names the batch the units come from
+    expect((await admin.post('/inventory/adjust', { product_id: 1, adjustment_type: 'REMOVE', quantity: 30, reason: 'Damaged' })).status).toBe(400);
+    const batch = (await admin.get('/inventory/1/batches')).body.batches.find((b: any) => b.batch_number === 'B-8910');
+    expect((await admin.post('/inventory/adjust', { product_id: 1, batch_id: batch.id, adjustment_type: 'REMOVE', quantity: 30, reason: 'Damaged', reason_code: 'DAMAGED' })).status).toBe(200);
     expect((await prod(1)).stock).toBe(100);
     const db = await openReadOnly(srv.dbFile);
     expect(all(db, 'SELECT adjustment_type, quantity, reason FROM stock_adjustments ORDER BY id')).toEqual([
@@ -73,11 +76,15 @@ describe('stock adjustments', () => {
     expect(one(db, "SELECT COUNT(*) n FROM audit_logs WHERE action_type='STOCK_ADJUSTMENT'")).toEqual({ n: 2 });
   });
 
-  it('REMOVE more than in stock clamps to 0 but records the full requested quantity', async () => {
-    await admin.post('/inventory/adjust', { product_id: 6, adjustment_type: 'REMOVE', quantity: 100, reason: 'Expired' });
-    expect((await prod(6)).stock).toBe(0);
+  // Phase 6 (was: clamped to 0 while recording the full requested quantity)
+  it('[FIXED] REMOVE more than the batch holds is refused (409) and nothing is recorded', async () => {
+    const batch = (await admin.get('/inventory/6/batches')).body.batches[0];
+    const r = await admin.post('/inventory/adjust', { product_id: 6, batch_id: batch.id, adjustment_type: 'REMOVE', quantity: 100, reason: 'Expired', reason_code: 'EXPIRED' });
+    expect(r.status).toBe(409);
+    expect(r.body).toMatchObject({ code: 'INSUFFICIENT_BATCH_STOCK', available: 8 });
+    expect((await prod(6)).stock).toBe(8);
     const db = await openReadOnly(srv.dbFile);
-    expect(one(db, 'SELECT quantity FROM stock_adjustments')).toEqual({ quantity: 100 });
+    expect(one(db, 'SELECT COUNT(*) n FROM stock_adjustments')).toEqual({ n: 0 });
   });
 
   it('requires product_id, quantity and reason (400)', async () => {
@@ -117,13 +124,19 @@ describe('purchases', () => {
     expect((await admin.get('/purchases')).body.length).toBe(1);
   });
 
-  it('[LEGACY-BUG C6/R6] a purchase overwrites the product batch, expiry and purchase price (older batch data lost)', async () => {
+  // Phase 6 fix of C6/R6 (was: the purchase overwrote the product's batch, expiry and cost; older batch data was lost)
+  it('[FIXED C6/R6] a purchase adds a new batch; the older batch keeps its number, expiry and cost', async () => {
     const before = await prod(1);
     expect(before).toMatchObject({ batch_number: 'B-8910', expiry_date: '2027-10-15', purchase_price: 180, stock: 120 });
-    await admin.post('/purchases', { supplier_id: 1, items: [{ product_id: 1, quantity: 10, purchase_price: 200, batch_number: 'B-LATE', expiry_date: '2030-12-31' }] });
+    expect((await admin.post('/purchases', { supplier_id: 1, items: [{ product_id: 1, quantity: 10, purchase_price: 200, batch_number: 'B-LATE', expiry_date: '2030-12-31' }] })).status).toBe(200);
     const after = await prod(1);
-    expect(after).toMatchObject({ batch_number: 'B-LATE', expiry_date: '2030-12-31', purchase_price: 200, stock: 130 });
-    // the 120 units of B-8910 expiring 2027-10-15 are no longer distinguishable
+    // FEFO: the product still shows the batch that will be sold next; 200 is the new default purchase price
+    expect(after).toMatchObject({ batch_number: 'B-8910', expiry_date: '2027-10-15', purchase_price: 200, stock: 130, batch_count: 2 });
+    const batches = (await admin.get('/inventory/1/batches')).body.batches;
+    expect(batches.map((b: any) => [b.batch_number, b.expiry_date, b.purchase_price, b.qty_on_hand])).toEqual([
+      ['B-8910', '2027-10-15', 180, 120],
+      ['B-LATE', '2030-12-31', 200, 10],
+    ]);
   });
 
   it('auto-generates a PUR-<tenant>-NNNNNN number when none is given', async () => {
@@ -135,9 +148,9 @@ describe('purchases', () => {
   it('[FIXED R3] a purchase whose 2nd item fails is rolled back completely', async () => {
     const r = await admin.post('/purchases', { supplier_id: 1, invoice_number: 'PARTIAL-1', items: [
       { product_id: 1, quantity: 5, purchase_price: 180 },
-      { product_id: null, quantity: 1, purchase_price: 300 }, // violates purchase_items.product_id NOT NULL
+      { product_id: null, quantity: 1, purchase_price: 300 }, // Phase 6: refused by validation before any write
     ] });
-    expect(r.status).toBe(500);
+    expect(r.status).toBe(400);
     expect((await prod(1)).stock).toBe(120);
     expect((await admin.get('/purchases')).body.map((p: any) => p.invoice_number)).not.toContain('PARTIAL-1');
     const db = await openReadOnly(srv.dbFile);

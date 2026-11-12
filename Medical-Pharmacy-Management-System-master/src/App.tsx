@@ -26,6 +26,7 @@ export default function App() {
   const [settings, setSettings] = useState<SystemSettings | null>(null);
   const [lowStockCount, setLowStockCount] = useState<number>(0);
   const [expiringCount, setExpiringCount] = useState<number>(0);
+  const [expiredBatchCount, setExpiredBatchCount] = useState<number>(0);
   const [checkingAuth, setCheckingAuth] = useState<boolean>(true);
   const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState<boolean>(false);
 
@@ -132,6 +133,7 @@ export default function App() {
       const stats = await api.getDashboardStats();
       setLowStockCount(stats.lowStockCount);
       setExpiringCount(stats.expiringCount);
+      setExpiredBatchCount(stats.expiredBatchCount || 0);
       
       const setts = await api.getSettings();
       setSettings(setts as any);
@@ -200,6 +202,7 @@ export default function App() {
             allowedServices={currentUser.allowed_services}
             lowStockCount={lowStockCount}
             expiringCount={expiringCount}
+            expiredBatchCount={expiredBatchCount}
             isMobileOpen={isMobileSidebarOpen}
             onCloseMobile={() => setIsMobileSidebarOpen(false)}
           />
