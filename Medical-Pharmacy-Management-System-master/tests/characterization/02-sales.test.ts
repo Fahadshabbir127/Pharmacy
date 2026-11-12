@@ -113,15 +113,19 @@ describe('known defects in the sale path', () => {
     expect(d.body.items[0]).toMatchObject({ sale_price: 220, cost_price: 180, subtotal: 1100 });
   });
 
-  it('[LEGACY-BUG C3] posting the same sale twice creates two sales (no idempotency)', async () => {
+  // Fixed by C3 (Phase 4, optional id) and Phase 7 Batch 2b (id required): the same sale posted twice is recorded once
+  it('[FIXED C3] posting the same sale twice records it once; a sale without a transaction id is refused', async () => {
     const p = await product(1);
     const payload = salePayload([cartItem(p, 1)]);
     const a = await admin.post('/sales', payload);
     const b = await admin.post('/sales', payload);
     expect(a.status).toBe(200);
-    expect(b.status).toBe(200);
-    expect(a.body.invoice_number).not.toBe(b.body.invoice_number);
-    expect((await product(1)).stock).toBe(118);
+    expect(b.body).toMatchObject({ replayed: true, invoice_number: a.body.invoice_number });
+    expect((await product(1)).stock).toBe(119);
+    const { client_txn_id: _t, ...noId } = salePayload([cartItem(p, 1)]) as any;
+    const r = await admin.post('/sales', noId);
+    expect([r.status, r.body.code]).toEqual([400, 'TXN_ID_REQUIRED']);
+    expect((await product(1)).stock).toBe(119);
   });
 
   it('[LEGACY-BUG R4] after deleting an older invoice, the next sale fails on a duplicate invoice number', async () => {

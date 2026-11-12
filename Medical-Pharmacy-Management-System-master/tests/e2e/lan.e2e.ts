@@ -144,7 +144,7 @@ describe('Phase 6: batches across host and client', () => {
     await apiFromRenderer(host.win, 'POST', '/inventory/adjust', { product_id: c.body.id, adjustment_type: 'ADD', quantity: 1, reason: 'E2E', reason_code: 'COUNT_CORRECTION', batch_number: 'V-1', expiry_date: '2027-06-30' });
     const p = (await apiFromRenderer(host.win, 'GET', '/inventory')).body.find((x: any) => x.id === c.body.id);
     const sale = { items: [{ product: p, quantity: 1, unit_price: 150, discount_percent: 0, discount_amount: 0, gst_amount: 0, subtotal: 150 }], total_amount: 150, discount_percent: 0, discount_amount: 0, net_amount: 150, total_gst: 0, grand_total: 150, payment_method: 'CASH', amount_paid: 150 };
-    const [a, b] = await Promise.all([apiFromRenderer(host.win, 'POST', '/sales', sale), apiFromRenderer(client.win, 'POST', '/sales', sale)]);
+    const [a, b] = await Promise.all([apiFromRenderer(host.win, 'POST', '/sales', { ...sale, client_txn_id: 'e2e-race-host-0001' }), apiFromRenderer(client.win, 'POST', '/sales', { ...sale, client_txn_id: 'e2e-race-client-0001' })]);
     expect([a.status, b.status].sort()).toEqual([200, 409]);
     const refused = a.status === 409 ? a : b;
     expect(refused.body).toMatchObject({ code: 'INSUFFICIENT_STOCK', requested: 1, available: 0 });

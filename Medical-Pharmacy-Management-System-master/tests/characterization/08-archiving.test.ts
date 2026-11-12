@@ -50,7 +50,7 @@ describe('customers', () => {
   it('archived customer: portal login disabled, ledger and balance kept, phone can be reused by a new customer', async () => {
     const p = await prod(1);
     await admin.post('/sales', salePayload([cartItem(p, 1)], { payment_method: 'CASH', customer_id: 1 }));
-    await admin.post('/customers/1/payment', { amount: 2450 }); // clear the udhar so delete is allowed
+    await admin.post('/customers/1/payment', { amount: 2450, client_txn_id: 'archive-test-pay-0001' }); // clear the udhar so delete is allowed
     expect((await admin.del('/customers/1')).body.archived).toBe(true);
     expect((await new Api().post('/auth/login', { username: '03001234567', password: 'customer123' })).status).toBe(403);
 

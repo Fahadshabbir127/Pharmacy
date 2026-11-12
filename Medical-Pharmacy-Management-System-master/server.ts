@@ -27,6 +27,7 @@ import { normalizeExpiry } from './server/inventory/expiry';
 import { priceBill, sameMoney, validPercent, round2, PricedBill } from './shared/pricing';
 import { DiscountAuthorizations, discountLimits } from './server/pos/discountAuth';
 import { reconcilePayments, PaymentReconciliation } from './server/payments/reconcile';
+import * as Pay from './server/payments/service';
 
 const PORT = Number(process.env.PHARMACY_PORT) || 3000;
 // C8: per-installation secret (set in startServer). The original public fallback secret is gone.
@@ -1853,6 +1854,8 @@ async function startServer() {
     if (hasHistory([
       ["SELECT 1 x FROM sales_headers WHERE customer_id = ? LIMIT 1", [customerId]],
       ["SELECT 1 x FROM customer_ledger WHERE customer_id = ? LIMIT 1", [customerId]],
+      ["SELECT 1 x FROM payments WHERE customer_id = ? LIMIT 1", [customerId]],
+      ["SELECT 1 x FROM customer_carried_over_balances WHERE customer_id = ? LIMIT 1", [customerId]],
     ])) {
       archiveRow('customers', customerId, req.user?.id, 'Deleted by user; kept because it has invoices or ledger history');
       db.run("UPDATE users SET status = 'ARCHIVED', archived_at = ?, archive_reason = 'Customer archived' WHERE customer_id = ? AND role = 'CUSTOMER'", [new Date().toISOString(), customerId]);
@@ -1929,54 +1932,218 @@ async function startServer() {
     res.json({ customer, ledger });
   });
 
-  app.post('/api/customers/:id/payment', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
-    const customerId = Number(req.params.id);
-    const userTenantId = req.user?.tenant_id || 1;
-    const { amount, payment_mode, notes } = req.body;
-
-    if (!amount || Number(amount) <= 0) {
-      return res.status(400).json({ error: 'Valid payment amount is required' });
-    }
-
-    const customer = queryOne<any>("SELECT * FROM customers WHERE id = ?", [customerId]);
-    if (!customer) return res.status(404).json({ error: 'Customer not found' });
-
-    if (req.user?.role !== 'SUPER_ADMIN' && customer.tenant_id && customer.tenant_id !== userTenantId) {
-      return res.status(403).json({ error: 'Access denied: Customer belongs to another store.' });
-    }
-
-    const payAmt = Number(amount);
-    const newBal = customer.current_balance - payAmt;
-
-    db.run("UPDATE customers SET current_balance = ? WHERE id = ?", [newBal, customerId]);
-
-    const refStr = `Payment Received (${payment_mode || 'Cash'})`;
-    db.run(`
-      INSERT INTO customer_ledger (customer_id, type, reference, debit, credit, balance_after, notes)
-      VALUES (?, 'PAYMENT', ?, 0, ?, ?, ?)
-    `, [customerId, refStr, payAmt, newBal, notes || '']);
-
-    // Queue BOTH Email and WhatsApp/SMS notifications for payment confirmation
+  // ---- Phase 7 Batch 2b: payments ----------------------------------------------------------------
+  /** Idempotency for payment writes (condition 1): the same transaction id returns the first result. */
+  const idemPrior = (key: string, route: string) => {
+    const prior = queryOne<{ response: string; route: string }>("SELECT response, route FROM idempotency_keys WHERE key = ?", [key]);
+    if (!prior) return null;
+    if (prior.route !== route) throw new Pay.PaymentError(409, 'TXN_ID_REUSED', 'This transaction id was already used for a different operation.');
+    return { ...JSON.parse(prior.response), replayed: true };
+  };
+  const idemStore = (key: string, route: string, userId: number, result: any) =>
+    db.run("INSERT INTO idempotency_keys (key, route, user_id, response, created_at) VALUES (?, ?, ?, ?, ?)", [key, route, userId, JSON.stringify(result), new Date().toISOString()]);
+  const payErr = (res: express.Response, e: any) => {
+    if (e instanceof Pay.PaymentError) return res.status(e.status).json({ code: e.code, error: e.message, ...e.extra });
+    // anything else: 500 -> the tx() wrapper rolls the whole transaction back (nothing is saved)
+    console.error('Payment operation failed:', e);
+    return res.status(500).json({ code: 'PAYMENT_FAILED', error: 'The payment failed and nothing was saved: ' + (e?.message || 'unknown error') });
+  };
+  const actorOf = (req: AuthRequest) => ({ id: req.user!.id, name: req.user?.fullName || req.user?.username || '' });
+  const auditFor = (req: AuthRequest): Pay.AuditFn => (action, description, targetType, targetId) => logAudit(req.user?.id, req.user?.fullName, action, description, targetType, targetId ?? undefined, req);
+  const customerForUser = (req: AuthRequest, id: number) => {
+    const c = queryOne<any>("SELECT * FROM customers WHERE id = ?", [id]);
+    if (!c) throw new Pay.PaymentError(404, 'CUSTOMER_NOT_FOUND', 'Customer not found');
+    if (req.user?.role !== 'SUPER_ADMIN' && c.tenant_id && c.tenant_id !== (req.user?.tenant_id || 1)) throw new Pay.PaymentError(403, 'FORBIDDEN', 'Access denied: Customer belongs to another store.');
+    return c;
+  };
+  const queueReceiptMessages = (customer: any, amount: number, label: string, newBal: number, tenantId: number) => {
     const emailSubject = `Payment Confirmation - ${storeLabel()}`;
-    const emailMsg = `Dear ${customer.name},\n\nWe have received your payment of Rs. ${payAmt.toFixed(2)} via ${payment_mode || 'Cash'}.\nYour updated ${storeLabel()} balance is Rs. ${newBal.toFixed(2)}.\n\nThank you for choosing ${storeLabel()}!`;
-    const custEmail = (customer as any).email || customer.phone || NO_EMAIL;
-    
-    const tId = req.user?.tenant_id || customer.tenant_id || 1;
+    const emailMsg = `Dear ${customer.name},\n\nWe have received your payment of Rs. ${amount.toFixed(2)} via ${label}.\nYour updated ${storeLabel()} balance is Rs. ${newBal.toFixed(2)}.\n\nThank you for choosing ${storeLabel()}!`;
+    db.run(`INSERT INTO email_queue (customer_id, email, subject, message, type, status, tenant_id) VALUES (?, ?, ?, ?, 'PAYMENT_CONFIRMATION', 'PENDING', ?)`,
+      [customer.id, customer.email || customer.phone || NO_EMAIL, emailSubject, emailMsg, tenantId]);
+    const smsMsg = `${storeLabel()}: Payment Received! Dear ${customer.name}, we received Rs. ${amount.toFixed(2)} (${label}). Your current Udhar balance is Rs. ${newBal.toFixed(2)}. Thank you!`;
+    db.run(`INSERT INTO sms_queue (customer_id, phone, message, type, status, tenant_id) VALUES (?, ?, ?, 'PAYMENT_CONFIRMATION', 'PENDING', ?)`, [customer.id, customer.phone, smsMsg, tenantId]);
+  };
 
-    // 1. Email Notification Queue
-    db.run(`
-      INSERT INTO email_queue (customer_id, email, subject, message, type, status, tenant_id)
-      VALUES (?, ?, ?, ?, 'PAYMENT_CONFIRMATION', 'PENDING', ?)
-    `, [customerId, custEmail, emailSubject, emailMsg, tId]);
+  /**
+   * A payment from a customer (E5/P2/Q1): applied to the opening balance, then confirmed carried-over balances,
+   * then the oldest invoices; anything left is kept as advance (never lost). Same URL and fields as before,
+   * plus method / method_detail / reference / client_txn_id (required).
+   */
+  app.post('/api/customers/:id/payment', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
+    const ROUTE = 'POST /api/customers/:id/payment';
+    try {
+      const txn = Pay.parseTxnId(req.body?.client_txn_id);
+      const prior = idemPrior(txn, ROUTE);
+      if (prior) return res.json(prior);
+      const customer = customerForUser(req, Number(req.params.id));
+      if (customer.archived_at) throw new Pay.PaymentError(400, 'CUSTOMER_ARCHIVED', 'This customer has been removed from the list.');
+      const amount = Pay.parseAmount(req.body?.amount, 'Payment amount');
+      const m = Pay.parseMethod(req.body?.method ?? req.body?.payment_mode ?? 'CASH', req.body?.method_detail);
+      const reference = Pay.parseText(req.body?.reference, 100);
+      const notes = Pay.parseText(req.body?.notes, 500);
+      const actor = actorOf(req);
+      const tenantId = customer.tenant_id || req.user?.tenant_id || 1;
 
-    // 2. WhatsApp / SMS Notification Queue
-    const smsMsg = `${storeLabel()}: Payment Received! Dear ${customer.name}, we received Rs. ${payAmt.toFixed(2)} (${payment_mode || 'Cash'}). Your current Udhar balance is Rs. ${newBal.toFixed(2)}. Thank you!`;
-    db.run(`
-      INSERT INTO sms_queue (customer_id, phone, message, type, status, tenant_id)
-      VALUES (?, ?, ?, 'PAYMENT_CONFIRMATION', 'PENDING', ?)
-    `, [customerId, customer.phone, smsMsg, tId]);
+      const pid = Pay.insertPayment(db, { tenantId, customerId: customer.id, kind: 'CUSTOMER_PAYMENT', method: m.method, detail: m.detail, amount, reference, notes, clientTxnId: txn, actor, source: 'CUSTOMER_SCREEN' });
+      const { allocations, advance } = Pay.allocateFifo(db, pid, customer.id, 'CUSTOMER_SCREEN', actor);
+      if (process.env.PHARMACY_TEST_THROW === 'payment-after-allocation') throw new Error('test: injected failure after allocating a payment');
+      db.run("UPDATE customers SET current_balance = current_balance - ? WHERE id = ?", [amount, customer.id]);
+      const newBal = queryOne<any>("SELECT current_balance b FROM customers WHERE id = ?", [customer.id]).b;
+      const label = Pay.methodLabel(m.method, m.detail);
+      db.run(`INSERT INTO customer_ledger (customer_id, type, reference, debit, credit, balance_after, notes, payment_id) VALUES (?, 'PAYMENT', ?, 0, ?, ?, ?, ?)`,
+        [customer.id, `Payment Received (${label})`, amount, newBal, [reference ? `Ref: ${reference}` : '', notes || ''].filter(Boolean).join(' - '), pid]);
+      queueReceiptMessages(customer, amount, label, newBal, tenantId);
+      logAudit(req.user?.id, req.user?.fullName, 'PAYMENT_RECORDED', `Customer payment #${pid} from ${customer.name} (#${customer.id}): Rs. ${amount} by ${label}${reference ? ` (ref ${reference})` : ''}. Applied to: ${Pay.describeAllocations(allocations)}${advance > 0.005 ? `; Rs. ${advance} kept as advance` : ''}. Balance Rs. ${customer.current_balance} -> Rs. ${newBal}.`, 'PAYMENT', pid, req);
+      const result = { message: 'Payment recorded successfully', newBalance: newBal, payment_id: pid, amount, method: m.method, method_detail: m.detail,
+        allocations: allocations.map((a) => ({ target: a.target, sale_id: a.saleId, invoice_number: a.invoiceNumber, carried_over_id: a.carriedOverId, amount: a.amount })), advance_remaining: advance, client_txn_id: txn };
+      idemStore(txn, ROUTE, req.user!.id, result);
+      res.json(result);
+    } catch (e: any) { return payErr(res, e); }
+  }));
 
-    res.json({ message: 'Payment recorded successfully', newBalance: newBal });
+  /** A payment against one invoice (P1): never more than what that invoice still owes. */
+  app.post('/api/sales/:id/payments', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
+    const ROUTE = 'POST /api/sales/:id/payments';
+    try {
+      const txn = Pay.parseTxnId(req.body?.client_txn_id);
+      const prior = idemPrior(txn, ROUTE);
+      if (prior) return res.json(prior);
+      const sale = queryOne<any>("SELECT * FROM sales_headers WHERE id = ?", [Number(req.params.id)]);
+      if (!sale || sale.is_placeholder) throw new Pay.PaymentError(404, 'SALE_NOT_FOUND', 'Invoice not found');
+      if (req.user?.role !== 'SUPER_ADMIN' && sale.tenant_id && sale.tenant_id !== (req.user?.tenant_id || 1)) throw new Pay.PaymentError(403, 'FORBIDDEN', 'Access denied: Invoice belongs to another store.');
+      const amount = Pay.parseAmount(req.body?.amount, 'Payment amount');
+      if (amount > Number(sale.balance_due) + 0.005) {
+        throw new Pay.PaymentError(400, 'OVERPAYMENT', `Invoice ${sale.invoice_number} owes Rs. ${Number(sale.balance_due).toFixed(2)}; a payment of Rs. ${amount.toFixed(2)} is more than that.`, { balance_due: sale.balance_due });
+      }
+      const m = Pay.parseMethod(req.body?.method, req.body?.method_detail);
+      const reference = Pay.parseText(req.body?.reference, 100);
+      const notes = Pay.parseText(req.body?.notes, 500);
+      const actor = actorOf(req);
+      const customer = sale.customer_id ? queryOne<any>("SELECT * FROM customers WHERE id = ?", [sale.customer_id]) : null;
+      const pid = Pay.insertPayment(db, { tenantId: sale.tenant_id, customerId: sale.customer_id ?? null, saleId: sale.id, invoiceNumber: sale.invoice_number, kind: 'INVOICE_PAYMENT',
+        method: m.method, detail: m.detail, amount, reference, notes, clientTxnId: txn, actor, source: 'SALES_REGISTER' });
+      const alloc = Pay.applyAllocation(db, { paymentId: pid, customerId: sale.customer_id ?? null, item: { target: 'SALE', saleId: sale.id, invoiceNumber: sale.invoice_number, carriedOverId: null }, amount, source: 'SALES_REGISTER', actor });
+      if (process.env.PHARMACY_TEST_THROW === 'payment-after-allocation') throw new Error('test: injected failure after allocating a payment');
+      let newBal: number | null = null;
+      const label = Pay.methodLabel(m.method, m.detail);
+      if (customer) {
+        db.run("UPDATE customers SET current_balance = current_balance - ? WHERE id = ?", [amount, customer.id]);
+        newBal = queryOne<any>("SELECT current_balance b FROM customers WHERE id = ?", [customer.id]).b;
+        db.run(`INSERT INTO customer_ledger (customer_id, type, reference, debit, credit, balance_after, notes, sale_id, payment_id) VALUES (?, 'PAYMENT', ?, 0, ?, ?, ?, ?, ?)`,
+          [customer.id, `Payment Received (${label})`, amount, newBal, `Invoice #${sale.invoice_number}${reference ? ` - Ref: ${reference}` : ''}${notes ? ` - ${notes}` : ''}`, sale.id, pid]);
+        queueReceiptMessages(customer, amount, label, newBal!, sale.tenant_id || 1);
+      }
+      const after = queryOne<any>("SELECT balance_due, settlement_status FROM sales_headers WHERE id = ?", [sale.id]);
+      logAudit(req.user?.id, req.user?.fullName, 'PAYMENT_RECORDED', `Invoice payment #${pid} for ${sale.invoice_number}: Rs. ${amount} by ${label}${reference ? ` (ref ${reference})` : ''}. Invoice balance Rs. ${sale.balance_due} -> Rs. ${after.balance_due} (${after.settlement_status}).`, 'PAYMENT', pid, req);
+      const result = { message: 'Payment recorded successfully', payment_id: pid, sale_id: sale.id, invoice_number: sale.invoice_number, amount, method: m.method, method_detail: m.detail,
+        allocation_id: alloc.allocationId, balance_due: after.balance_due, settlement_status: after.settlement_status, new_balance: newBal, client_txn_id: txn };
+      idemStore(txn, ROUTE, req.user!.id, result);
+      res.json(result);
+    } catch (e: any) { return payErr(res, e); }
+  }));
+
+  /** P7: ADMIN-only reversal with a mandatory reason; the original payment is never edited or deleted. */
+  app.post('/api/payments/:id/reverse', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
+    const ROUTE = 'POST /api/payments/:id/reverse';
+    try {
+      const txn = Pay.parseTxnId(req.body?.client_txn_id);
+      const prior = idemPrior(txn, ROUTE);
+      if (prior) return res.json(prior);
+      const reason = Pay.parseText(req.body?.reason, 300);
+      if (!reason) throw new Pay.PaymentError(400, 'REASON_REQUIRED', 'A reason is required to reverse a payment.');
+      const p = queryOne<any>("SELECT * FROM payments WHERE id = ?", [Number(req.params.id)]);
+      if (!p) throw new Pay.PaymentError(404, 'PAYMENT_NOT_FOUND', 'Payment not found.');
+      if (req.user?.role !== 'SUPER_ADMIN' && p.tenant_id && p.tenant_id !== (req.user?.tenant_id || 1)) throw new Pay.PaymentError(403, 'FORBIDDEN', 'Access denied.');
+      // money taken at a sale did not lower the customer's stored balance separately (the sale added only the
+      // due part), so reversing it raises the balance by the same amount the invoice is now owed again.
+      const r = Pay.reversePayment(db, { paymentId: p.id, reason, clientTxnId: txn, actor: actorOf(req), audit: auditFor(req), affectsCustomerBalance: true, source: 'SALES_REGISTER' });
+      const result = { message: 'Payment reversed', payment_id: p.id, reversal_id: r.reversalId, amount: p.amount, released: r.released.map((a) => ({ target: a.target, sale_id: a.saleId, invoice_number: a.invoiceNumber, amount: a.amount })), new_balance: r.newBalance, client_txn_id: txn };
+      idemStore(txn, ROUTE, req.user!.id, result);
+      res.json(result);
+    } catch (e: any) { return payErr(res, e); }
+  }));
+
+  const paymentRow = (p: any) => ({ ...p, allocations: queryAll<any>("SELECT id, target, sale_id, invoice_number, carried_over_id, kind, amount, releases_allocation_id, reason, source, created_at FROM payment_allocations WHERE payment_id = ? ORDER BY id", [p.id]),
+    reversed_by: queryOne<any>("SELECT id, amount, reason, received_at, received_by_user_id FROM payments WHERE reverses_payment_id = ?", [p.id]) || null });
+
+  /** What a customer owes, item by item, in payment order; advance; agreement with the stored balance. */
+  app.get('/api/customers/:id/outstanding', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+    try {
+      const c = customerForUser(req, Number(req.params.id));
+      const sum = Pay.customerSummary(db, c.id);
+      res.json({ customer_id: c.id, name: c.name, stored_balance: sum.stored, explained_balance: sum.explained, difference: sum.difference, owed: sum.owed, advance: sum.advance,
+        items: sum.items.map((i) => ({ target: i.target, sale_id: i.saleId, invoice_number: i.invoiceNumber, carried_over_id: i.carriedOverId, date: i.date, total: i.total, due: i.due })) });
+    } catch (e: any) { return payErr(res, e); }
+  });
+
+  app.get('/api/customers/:id/payments', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+    try {
+      const c = customerForUser(req, Number(req.params.id));
+      res.json(queryAll<any>("SELECT p.*, u.full_name AS received_by_name FROM payments p LEFT JOIN users u ON u.id = p.received_by_user_id WHERE p.customer_id = ? ORDER BY p.received_at DESC, p.id DESC", [c.id]).map(paymentRow));
+    } catch (e: any) { return payErr(res, e); }
+  });
+
+  app.get('/api/payments', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+    const where: string[] = ["(p.tenant_id = ? OR p.tenant_id IS NULL)"];
+    const params: any[] = [req.user?.tenant_id || 1];
+    if (req.query.from) { where.push("date(p.received_at) >= date(?)"); params.push(String(req.query.from)); }
+    if (req.query.to) { where.push("date(p.received_at) <= date(?)"); params.push(String(req.query.to)); }
+    if (req.query.method) { where.push("p.method = ?"); params.push(String(req.query.method).toUpperCase()); }
+    if (req.query.customer_id) { where.push("p.customer_id = ?"); params.push(Number(req.query.customer_id)); }
+    const limit = Math.min(Math.max(Number(req.query.limit) || 200, 1), 1000);
+    res.json(queryAll<any>(`SELECT p.*, c.name AS customer_name, u.full_name AS received_by_name FROM payments p LEFT JOIN customers c ON c.id = p.customer_id LEFT JOIN users u ON u.id = p.received_by_user_id
+      WHERE ${where.join(' AND ')} ORDER BY p.received_at DESC, p.id DESC LIMIT ${limit}`, params));
+  });
+
+  /** Historical and current reconciliation (ADMIN): mismatches, migration issues, confirmed carried-over items. */
+  app.get('/api/payments/reconciliation', authenticateToken, requireRoles(['ADMIN']), (req: AuthRequest, res) => {
+    const rep = reconcilePayments(db);
+    res.json({
+      checked_at: rep.checkedAt, customers_checked: rep.customersChecked,
+      mismatches: rep.mismatches.map((m) => ({ customer_id: m.customerId, name: m.name, stored_balance: m.stored, explained_balance: m.expected, difference: m.difference,
+        confirmable: m.difference > 0.005, action: m.difference > 0.005 ? 'Administrator may confirm as a carried-over balance' : 'Negative difference: manual review only (not correctable here)' })),
+      untracked_sales: rep.untrackedSales, walk_in_sales_with_due: queryAll("SELECT id, invoice_number, sale_date, grand_total, balance_due FROM sales_headers WHERE customer_id IS NULL AND balance_due > 0.005 ORDER BY id"),
+      migration_issues: queryAll("SELECT * FROM payment_migration_issues ORDER BY id"),
+      carried_over_balances: queryAll("SELECT b.*, c.name AS customer_name, u.full_name AS confirmed_by_name FROM customer_carried_over_balances b JOIN customers c ON c.id = b.customer_id LEFT JOIN users u ON u.id = b.confirmed_by_user_id ORDER BY b.id"),
+    });
+  });
+
+  /**
+   * Q1: an ADMIN confirms a POSITIVE unexplained balance difference as a carried-over balance item, with a reason.
+   * The customer's stored balance is NOT changed; the item makes the records explain it, and payments settle it
+   * right after the opening balance. The reviewed difference must still be the current one (no stale confirms);
+   * a discrepancy can be confirmed only once (unique key; afterwards there is no difference left).
+   */
+  app.post('/api/customers/:id/carried-over-balance', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
+    const ROUTE = 'POST /api/customers/:id/carried-over-balance';
+    try {
+      const txn = Pay.parseTxnId(req.body?.client_txn_id);
+      const prior = idemPrior(txn, ROUTE);
+      if (prior) return res.json(prior);
+      const c = customerForUser(req, Number(req.params.id));
+      const reason = Pay.parseText(req.body?.reason, 300);
+      if (!reason) throw new Pay.PaymentError(400, 'REASON_REQUIRED', 'A reason is required to confirm a carried-over balance.');
+      const reviewed = Number(req.body?.expected_difference);
+      if (!Number.isFinite(reviewed)) throw new Pay.PaymentError(400, 'INVALID_AMOUNT', 'expected_difference (the difference you reviewed) is required.');
+      const sum = Pay.customerSummary(db, c.id);
+      if (sum.difference <= 0.005) {
+        throw new Pay.PaymentError(409, sum.difference < -0.005 ? 'NEGATIVE_DISCREPANCY' : 'NO_DISCREPANCY',
+          sum.difference < -0.005 ? `The stored balance is Rs. ${Math.abs(sum.difference).toFixed(2)} LOWER than the records explain. Negative differences are for manual review and cannot be confirmed here.` : 'There is no unexplained balance to confirm for this customer.', { difference: sum.difference });
+      }
+      if (Math.abs(sum.difference - reviewed) > 0.005) throw new Pay.PaymentError(409, 'DISCREPANCY_CHANGED', `The difference is now Rs. ${sum.difference.toFixed(2)} (you reviewed Rs. ${reviewed.toFixed(2)}). Review it again.`, { difference: sum.difference });
+      const key = `customer:${c.id}:stored:${sum.stored.toFixed(2)}:explained:${sum.explained.toFixed(2)}`;
+      if (queryOne("SELECT 1 x FROM customer_carried_over_balances WHERE discrepancy_key = ?", [key])) throw new Pay.PaymentError(409, 'ALREADY_CONFIRMED', 'This discrepancy has already been confirmed.');
+      const issue = queryOne<any>("SELECT id FROM payment_migration_issues WHERE issue = 'BALANCE_MISMATCH' AND customer_id = ? ORDER BY id DESC LIMIT 1", [c.id]);
+      const at = Pay.nowTs();
+      const id = Number(db.run(`INSERT INTO customer_carried_over_balances (tenant_id, customer_id, amount, stored_balance, explained_balance, difference, discrepancy_key, reason, confirmed_by_user_id, confirmed_at, client_txn_id, migration_issue_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [c.tenant_id, c.id, sum.difference, sum.stored, sum.explained, sum.difference, key, reason, req.user!.id, at, txn, issue?.id ?? null]).lastInsertRowid);
+      logAudit(req.user?.id, req.user?.fullName, 'CARRIED_OVER_BALANCE_CONFIRMED', `Administrator #${req.user!.id} confirmed Rs. ${sum.difference.toFixed(2)} as a carried-over balance for customer "${c.name}" (#${c.id}) at ${at}: stored balance Rs. ${sum.stored.toFixed(2)}, explained by records Rs. ${sum.explained.toFixed(2)}${issue ? ` (migration issue #${issue.id})` : ''}. Stored balance not changed. Reason: ${reason}`, 'CUSTOMER', c.id, req);
+      const after = Pay.customerSummary(db, c.id);
+      const result = { message: 'Carried-over balance confirmed', carried_over_id: id, customer_id: c.id, amount: sum.difference, stored_balance: sum.stored, explained_balance_before: sum.explained, difference_after: after.difference, client_txn_id: txn };
+      idemStore(txn, ROUTE, req.user!.id, result);
+      res.json(result);
+    } catch (e: any) { return payErr(res, e); }
   }));
 
   app.post('/api/customers/:id/remind', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
@@ -2027,6 +2194,7 @@ async function startServer() {
     ok: true; tenantId: number; method: string; customerId: number | null;
     lineRequests: LineRequest[]; lineProducts: any[]; plan: any; bill: PricedBill; quote: any;
     paid: number; due: number; tendered: number; change: number;
+    tenders: { method: Pay.PayMethod; detail: string | null; amount: number; cashTendered: number | null; change: number | null; reference: string | null }[];
     discount: { maxUsed: number; aboveStaff: boolean; reason: string; token: string | null; grant: any; limits: { staff: number; admin: number } };
   };
 
@@ -2128,25 +2296,60 @@ async function startServer() {
       return fail(409, { code: sh.code, error: why, product_id: sh.productId, product_name: name, requested: sh.requested, available: sh.sellable, expired: sh.expired });
     }
 
-    // payment amounts (validated against the SERVER total)
+    // payment amounts (validated against the SERVER total). Phase 7 Batch 2b: the money taken is recorded as
+    // payment records (P6 split payments). The old form (payment_method + amount_paid) becomes one CASH tender.
     let paid = 0, tendered = 0, change = 0;
+    let saleMethod = method;
+    const tenders: SalePrep['tenders'] = [];
     if (!opts.forQuote) {
-      const raw = b.amount_paid;
-      const given = raw === undefined || raw === null || raw === '' ? null : Number(raw);
-      if (given !== null && (!Number.isFinite(given) || given < 0)) return fail(400, { code: 'INVALID_PAYMENT', error: 'Amount paid must be zero or more.' });
-      if (method === 'CASH') {
-        tendered = given === null ? bill.grand_total : round2(given);
-        if (tendered + 0.005 < bill.grand_total) return fail(400, { code: 'INSUFFICIENT_PAYMENT', error: `Cash received (Rs. ${tendered.toFixed(2)}) is less than the bill (Rs. ${bill.grand_total.toFixed(2)}). Use PARTIAL with a customer for part payment.` });
-        paid = bill.grand_total;
-        change = round2(tendered - bill.grand_total);
-      } else if (method === 'PARTIAL') {
-        paid = given === null ? 0 : round2(given);
-        if (paid > bill.grand_total + 0.005) return fail(400, { code: 'OVERPAYMENT', error: `Amount paid (Rs. ${paid.toFixed(2)}) is more than the bill (Rs. ${bill.grand_total.toFixed(2)}).` });
-        tendered = paid;
+      if (Array.isArray(b.payments)) {
+        if (b.payments.length > 10) return fail(400, { code: 'INVALID_PAYMENT', error: 'At most 10 payment entries per sale.' });
+        let cashGiven = 0;
+        let cashRef: string | null = null;
+        const nonCash: SalePrep['tenders'] = [];
+        try {
+          for (const [i, e] of b.payments.entries()) {
+            const m = Pay.parseMethod(e?.method, e?.method_detail);
+            const amount = Pay.parseAmount(e?.amount, `Payment ${i + 1} amount`);
+            const reference = Pay.parseText(e?.reference, 100);
+            if (m.method === 'CASH') { cashGiven = round2(cashGiven + amount); cashRef = cashRef ?? reference; }
+            else nonCash.push({ method: m.method, detail: m.detail, amount, cashTendered: null, change: null, reference });
+          }
+        } catch (e: any) {
+          if (e instanceof Pay.PaymentError) return fail(e.status, { code: e.code, error: e.message });
+          throw e;
+        }
+        const nonCashSum = round2(nonCash.reduce((sum, t) => sum + t.amount, 0));
+        if (nonCashSum > bill.grand_total + 0.005) return fail(400, { code: 'OVERPAYMENT', error: `Card, bank and wallet payments (Rs. ${nonCashSum.toFixed(2)}) are more than the bill (Rs. ${bill.grand_total.toFixed(2)}). Only cash can be given back as change.` });
+        const cashApplied = round2(Math.min(cashGiven, bill.grand_total - nonCashSum));
+        change = round2(cashGiven - cashApplied);
+        tendered = round2(cashGiven + nonCashSum);
+        paid = round2(nonCashSum + cashApplied);
+        tenders.push(...nonCash);
+        if (cashApplied > 0) tenders.push({ method: 'CASH', detail: null, amount: cashApplied, cashTendered: cashGiven, change, reference: cashRef });
+        saleMethod = paid + 0.005 >= bill.grand_total ? 'CASH' : paid > 0 ? 'PARTIAL' : 'UDHAR';
+        if (saleMethod !== 'CASH' && !customerId) {
+          return fail(400, { code: 'INSUFFICIENT_PAYMENT', error: `Payments (Rs. ${paid.toFixed(2)}) are less than the bill (Rs. ${bill.grand_total.toFixed(2)}). Choose a customer to put the rest on Udhar.` });
+        }
+      } else {
+        const raw = b.amount_paid;
+        const given = raw === undefined || raw === null || raw === '' ? null : Number(raw);
+        if (given !== null && (!Number.isFinite(given) || given < 0)) return fail(400, { code: 'INVALID_PAYMENT', error: 'Amount paid must be zero or more.' });
+        if (method === 'CASH') {
+          tendered = given === null ? bill.grand_total : round2(given);
+          if (tendered + 0.005 < bill.grand_total) return fail(400, { code: 'INSUFFICIENT_PAYMENT', error: `Cash received (Rs. ${tendered.toFixed(2)}) is less than the bill (Rs. ${bill.grand_total.toFixed(2)}). Use PARTIAL with a customer for part payment.` });
+          paid = bill.grand_total;
+          change = round2(tendered - bill.grand_total);
+        } else if (method === 'PARTIAL') {
+          paid = given === null ? 0 : round2(given);
+          if (paid > bill.grand_total + 0.005) return fail(400, { code: 'OVERPAYMENT', error: `Amount paid (Rs. ${paid.toFixed(2)}) is more than the bill (Rs. ${bill.grand_total.toFixed(2)}).` });
+          tendered = paid;
+        }
+        if (paid > 0) tenders.push({ method: 'CASH', detail: null, amount: paid, cashTendered: tendered, change: method === 'CASH' ? change : 0, reference: null });
       }
     }
     const due = round2(bill.grand_total - paid);
-    return { ok: true, tenantId, method, customerId, lineRequests, lineProducts, plan, bill, quote, paid, due, tendered, change, discount: { maxUsed, aboveStaff, reason, token, grant, limits } };
+    return { ok: true, tenantId, method: saleMethod, customerId, lineRequests, lineProducts, plan, bill, quote, paid, due, tendered, change, tenders, discount: { maxUsed, aboveStaff, reason, token, grant, limits } };
   }
 
   /** Price preview for the payment screen: the same validation and calculation as a sale, nothing written. */
@@ -2194,10 +2397,11 @@ async function startServer() {
     if (clientTxnId !== null && !/^[A-Za-z0-9-]{8,64}$/.test(clientTxnId)) {
       return res.status(400).json({ error: 'Invalid client_txn_id' });
     }
-    if (clientTxnId) {
-      const prior = queryOne<{ response: string }>("SELECT response FROM idempotency_keys WHERE key = ? AND route = 'POST /api/sales'", [clientTxnId]);
-      if (prior) return res.json({ ...JSON.parse(prior.response), replayed: true });
-    }
+    // Phase 7 Batch 2b (condition 1): a sale writes payment records, so it must carry a transaction id
+    if (clientTxnId === null) return res.status(400).json({ code: 'TXN_ID_REQUIRED', error: 'A transaction id (client_txn_id) is required for every sale.' });
+    const prior = queryOne<{ response: string; route: string }>("SELECT response, route FROM idempotency_keys WHERE key = ?", [clientTxnId]);
+    if (prior && prior.route !== 'POST /api/sales') return res.status(409).json({ code: 'TXN_ID_REUSED', error: 'This transaction id was already used for a different operation.' });
+    if (prior) return res.json({ ...JSON.parse(prior.response), replayed: true });
 
     // every check (lines, prices, discounts, stock, payment) runs BEFORE anything is written
     const prep = prepareSale(req, { forQuote: false });
@@ -2291,6 +2495,26 @@ async function startServer() {
         allocationSummary.push({ line: i, product_id: product.id, batches: allocs.map((a) => ({ batch_id: a.batchId, batch_number: a.batchNumber, expiry_date: a.expiryDate, quantity: a.quantity })) });
       }
 
+      // Phase 7 Batch 2b: the money taken is recorded as payment records applied to this invoice (P6),
+      // then the customer's available advance settles what is still owed (P3) - all in this transaction.
+      const actor = { id: req.user!.id, name: req.user?.fullName || req.user?.username || '' };
+      const paymentRecords: any[] = [];
+      for (const [i, t] of prep.tenders.entries()) {
+        const pid = Pay.insertPayment(db, { tenantId: userTenantId, customerId: customer_id ?? null, saleId: Number(saleId), invoiceNumber: nextInvNum, kind: 'SALE_TENDER',
+          method: t.method, detail: t.detail, amount: t.amount, cashTendered: t.cashTendered, changeGiven: t.method === 'CASH' ? t.change : null, reference: t.reference,
+          clientTxnId: `${clientTxnId}-t${i + 1}`, actor, source: 'POS' });
+        Pay.applyAllocation(db, { paymentId: pid, customerId: customer_id ?? null, item: { target: 'SALE', saleId: Number(saleId), invoiceNumber: nextInvNum, carriedOverId: null }, amount: t.amount, source: 'POS', actor });
+        paymentRecords.push({ payment_id: pid, method: t.method, method_detail: t.detail, amount: t.amount, cash_tendered: t.cashTendered, change_given: t.method === 'CASH' ? t.change : null, reference: t.reference });
+      }
+      let advanceApplied: any[] = [];
+      if (customer_id && prep.due > 0.005) {
+        advanceApplied = Pay.applyAdvanceToSale(db, Number(customer_id), Number(saleId), actor);
+        if (advanceApplied.length) {
+          logAudit(req.user?.id, req.user?.fullName, 'ADVANCE_APPLIED', `Customer #${customer_id} advance applied to invoice #${nextInvNum}: ${Pay.describeAllocations(advanceApplied)}`, 'SALE', Number(saleId), req);
+        }
+      }
+      if (process.env.PHARMACY_TEST_THROW === 'sale-after-payments') throw new Error('test: injected failure after recording payments');
+
       // Update Customer Ledger if customer is selected
       if (customer_id && customerObj) {
         const ledgerRef = `Invoice #${nextInvNum}`;
@@ -2351,6 +2575,9 @@ async function startServer() {
         amount_due: dueAmt,
         amount_tendered: prep.tendered,
         change_due: prep.change,
+        payments: paymentRecords,
+        advance_applied: advanceApplied.map((a) => ({ payment_id: a.paymentId, amount: a.amount })),
+        balance_due: queryOne<any>("SELECT balance_due FROM sales_headers WHERE id = ?", [saleId])?.balance_due,
         totals: { total_amount: bill.total_amount, discount_amount: bill.discount_amount, net_amount: bill.net_amount, total_gst: bill.total_gst, grand_total: bill.grand_total },
         previous_balance: prevBal,
         new_balance: newBal,
@@ -2468,8 +2695,12 @@ async function startServer() {
     for (const it of items) {
       it.batches = queryAll(`SELECT b.id AS batch_id, b.batch_number, b.expiry_date, x.quantity FROM sale_item_batches x JOIN product_batches b ON b.id = x.batch_id WHERE x.sale_item_id = ? ORDER BY x.id`, [it.id]);
     }
+    // Phase 7 Batch 2b: every payment applied to this invoice (at the sale, later, advance), and reversals
+    const payments = req.user?.role === 'CUSTOMER' ? [] : queryAll<any>(`SELECT DISTINCT p.id, p.kind, p.direction, p.method, p.method_detail, p.amount, p.cash_tendered, p.change_given, p.reference, p.received_at, p.reverses_payment_id, p.reason, p.source
+        FROM payments p WHERE p.sale_id = ? OR p.legacy_sale_id = ? OR p.id IN (SELECT payment_id FROM payment_allocations WHERE sale_id = ?) ORDER BY p.received_at, p.id`, [saleId, saleId, saleId])
+      .map((p) => ({ ...p, applied_to_this_invoice: queryOne<any>(`SELECT COALESCE(SUM(CASE kind WHEN 'APPLY' THEN amount ELSE -amount END), 0) v FROM payment_allocations WHERE payment_id = ? AND sale_id = ?`, [p.id, saleId]).v }));
 
-    res.json({ ...sale, items });
+    res.json({ ...sale, items, payments });
   }));
 
   // 6. Purchase & Stock-In API (Restricted to Admin & Staff)
@@ -3464,6 +3695,28 @@ async function startServer() {
     const sale = queryOne<any>("SELECT * FROM sales_headers WHERE id = ?", [saleId]);
     if (!sale) return res.status(404).json({ error: 'Invoice not found' });
 
+    // Phase 7 Batch 2b (P5, interim until Batch 4's safe void):
+    //  - an invoice that received any payment AFTER the sale (or advance applied to it) cannot be voided here;
+    //  - money taken at the sale is kept as history and reversed (OUT records), never deleted.
+    const atSalePayments = queryAll<any>("SELECT * FROM payments WHERE direction = 'IN' AND kind IN ('SALE_TENDER', 'CARRIED_OVER_SALE') AND (sale_id = ? OR legacy_sale_id = ?)", [saleId, saleId]);
+    const atSaleIds = new Set(atSalePayments.map((p) => p.id));
+    const later = queryAll<any>(`SELECT a.payment_id, SUM(CASE a.kind WHEN 'APPLY' THEN a.amount ELSE -a.amount END) AS amt FROM payment_allocations a
+        WHERE a.target = 'SALE' AND a.sale_id = ? GROUP BY a.payment_id HAVING amt > 0.005`, [saleId]).filter((r) => !atSaleIds.has(r.payment_id));
+    const spreadElsewhere = atSalePayments.filter((p) => queryOne<any>(`SELECT COALESCE(SUM(CASE kind WHEN 'APPLY' THEN amount ELSE -amount END), 0) v FROM payment_allocations
+        WHERE payment_id = ? AND NOT (target = 'SALE' AND sale_id = ?)`, [p.id, saleId]).v > 0.005);
+    if (later.length || spreadElsewhere.length) {
+      return res.status(409).json({ code: 'VOID_HAS_PAYMENTS', error: `Invoice #${sale.invoice_number} has payments recorded after the sale (or its payment also settled other items). It cannot be voided until the safe void (Phase 7 Batch 4). Reverse those payments first if they were entered by mistake.`, payment_ids: [...later.map((r) => r.payment_id), ...spreadElsewhere.map((p) => p.id)] });
+    }
+    const reversals: number[] = [];
+    for (const p of atSalePayments) {
+      if (Pay.isReversed(db, p.id)) continue; // already reversed: never a second reversal
+      const r = Pay.reversePayment(db, { paymentId: p.id, reason: `Invoice #${sale.invoice_number} voided`, clientTxnId: `void-${saleId}-p${p.id}-${crypto.randomUUID().slice(0, 8)}`,
+        actor: { id: req.user!.id, name: req.user?.fullName || '' }, audit: (a, d, t, id) => logAudit(req.user?.id, req.user?.fullName, a, d, t, id ?? undefined, req),
+        affectsCustomerBalance: false, allowWalkInSaleTender: true, source: 'SALES_REGISTER' });
+      reversals.push(r.reversalId);
+    }
+    const dueNow = Number(sale.balance_due ?? sale.amount_due) || 0;
+
     // 1. Restore stock into the exact batches the units came from (Phase 6). Sales recorded before
     //    batches existed have no allocation: their units go into a VOID_RESTORE batch built from the line.
     const items = queryAll<any>("SELECT * FROM sale_items WHERE sale_id = ?", [saleId]);
@@ -3479,11 +3732,12 @@ async function startServer() {
       }
     }
 
-    // 2. Reverse customer balance
+    // 2. Reverse customer balance by what the invoice still owed (Phase 7: no longer clamped at 0 - the clamp
+    //    left balances that no record explains)
     if (sale.customer_id) {
-      const dueAmt = sale.amount_due || 0;
+      const dueAmt = dueNow;
       if (dueAmt > 0) {
-        db.run("UPDATE customers SET current_balance = MAX(0, current_balance - ?) WHERE id = ?", [dueAmt, sale.customer_id]);
+        db.run("UPDATE customers SET current_balance = current_balance - ? WHERE id = ?", [dueAmt, sale.customer_id]);
       }
       db.run(`
         INSERT INTO customer_ledger (customer_id, type, reference, debit, credit, balance_after, notes)
@@ -3498,7 +3752,7 @@ async function startServer() {
 
     logAudit(req.user?.id, req.user?.fullName, 'SALE_DELETE', `Voided and deleted Invoice #${sale.invoice_number} (Amount: Rs. ${sale.grand_total}). Restored item stock.`, 'SALE', saleId, req);
 
-    res.json({ message: `Invoice #${sale.invoice_number} successfully voided and stock restored.` });
+    res.json({ message: `Invoice #${sale.invoice_number} successfully voided and stock restored.`, payment_reversals: reversals });
   }));
 
   // 10. Restricted Customer Portal API

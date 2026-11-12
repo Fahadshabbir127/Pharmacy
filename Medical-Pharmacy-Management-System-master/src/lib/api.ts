@@ -2,6 +2,11 @@ import { User, Product, Category, Customer, LedgerEntry, SaleHeader, CartItem, S
 
 const API_BASE = '/api';
 
+/** A new transaction id for one financial operation (sale, payment). */
+export function newClientTxnId(): string {
+  return typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
 /** The host's price calculation for a cart (Phase 7, Batch 1). */
 export interface SaleQuote {
   lines: { product_id: number; product_name: string; unit: string; quantity: number; unit_price: number; discount_percent: number; gross: number; discount_amount: number; gst_percent: number; gst_amount: number; subtotal: number }[];
@@ -320,10 +325,11 @@ export const api = {
     }),
   getCustomerLedger: (customerId: number) =>
     request<{ customer: Customer; ledger: LedgerEntry[] }>(`/customers/${customerId}/ledger`),
-  recordCustomerPayment: (customerId: number, amount: number, payment_mode: string, notes?: string) =>
+  /** Phase 7 Batch 2b: every payment carries a transaction id (pass the same one when retrying the same payment). */
+  recordCustomerPayment: (customerId: number, amount: number, payment_mode: string, notes?: string, clientTxnId?: string) =>
     request<{ message: string; newBalance: number }>(`/customers/${customerId}/payment`, {
       method: 'POST',
-      body: JSON.stringify({ amount, payment_mode, notes }),
+      body: JSON.stringify({ amount, payment_mode, notes, client_txn_id: clientTxnId || newClientTxnId() }),
     }),
   sendUdharReminder: (customerId: number, message?: string) =>
     request<{ message: string }>(`/customers/${customerId}/remind`, {

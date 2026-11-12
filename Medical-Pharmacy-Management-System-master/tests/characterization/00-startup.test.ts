@@ -21,7 +21,7 @@ describe('startup on an empty data directory', () => {
   it('creates all 17 legacy tables plus schema_migrations, paired_clients, idempotency_keys, the Phase 6 batch tables, the Phase 7 payment tables and uses WAL', async () => {
     const db = await openReadOnly(srv.dbFile);
     expect(tableNames(db)).toEqual([
-      'audit_logs', 'categories', 'customer_ledger', 'customers', 'email_queue', 'idempotency_keys', 'inventory_migration_issues', 'otp_verifications',
+      'audit_logs', 'categories', 'customer_carried_over_balances', 'customer_ledger', 'customers', 'email_queue', 'idempotency_keys', 'inventory_migration_issues', 'otp_verifications',
       'paired_clients', 'payment_allocations', 'payment_migration_issues', 'payments',
       'product_batches', 'products', 'purchase_headers', 'purchase_items', 'sale_item_batches', 'sale_items', 'sales_headers', 'schema_migrations', 'settings',
       'sms_queue', 'stock_adjustments', 'suppliers', 'tenants', 'users',

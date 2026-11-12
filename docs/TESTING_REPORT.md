@@ -4,6 +4,40 @@ This report contains only results that were actually executed. Anything not exec
 
 ---
 
+## Phase 7, Batch 2b: payment module and APIs, Q1 carried-over balances
+
+| | |
+|---|---|
+| Date | 2026-11-12 |
+| Environment | Linux container (no Windows), Node 22.23.4, Electron 45.2.3 under `xvfb-run` |
+| Commands | `npm run lint`, `npm run audit:db-callsites`, `npm test`, `xvfb-run -a npm run test:e2e` (run twice) |
+| Result | **Unit/backend: 23 files, 341 tests, all passing. Desktop end-to-end: 2 files, 26 tests, all passing on two consecutive runs (64.6 s, 62.6 s).** Lint clean; DB call-site audit clean. No screen changes (Batch 2c); API protocol 4. |
+
+### New tests
+| File | Tests | Covers |
+|---|---|---|
+| `tests/characterization/12-payments.test.ts` | 15 | Split payments at the sale (cash + card with change from cash only; wallet + Udhar for a customer), 8 refused inputs with **nothing written**; several payments on one invoice, overpayment refused with nothing written, at-sale snapshot kept, ledger rows linked, audit; customer payments opening → oldest invoices → advance, **advance applied to the next credit sale in the same transaction**; transaction-id replay and reuse across operations refused; **20 simultaneous payments on one invoice: exactly 16 accepted, never overpaid**; **10 simultaneous retries of one payment: recorded once**; reversals (ADMIN only, reason, release, ledger, audit, once; **5 simultaneous reversals: exactly one**; a reversal cannot be reversed; walk-in tender only via void); interim void (refused with later payments; checkout-only void keeps payments + reversals; no second reversal; customer balance reduced exactly, no clamp); **3 injected failures after the allocation was written → complete rollback**; Q1 on a database produced by the original app (review list, ADMIN only, reason, stale-difference check, negative difference refused, single confirmation, replay, audit with administrator/time/amount/discrepancy/reason, stored balance unchanged, payments settle the item). |
+| `tests/unit/payment-service.test.ts` | 10 | Amount, method and transaction-id validation; allocation order opening → carried-over → invoices; P3 advance; reversal releases everything once (service and database unique index); **requested checks:** original history preserved after 0008 + 0009 on 4 legacy databases; the invoice-link exception (only `sale_id → NULL`, never with another field); carried-over items append-only and unique; 0009 rebuild keeps every allocation row; 0009 catch-up of a 2a-build sale and ledger payment. |
+
+### Legacy tests changed on purpose
+| Test | Before | After |
+|---|---|---|
+| C3 same sale posted twice | (legacy) two sales | **recorded once** (replay); a sale without a transaction id → 400 `TXN_ID_REQUIRED` |
+| Customer payment without a transaction id | accepted | **400 `TXN_ID_REQUIRED`, nothing written** (condition 1); the happy-path test now sends an id |
+| Customer overpayment | "balance negative, no guard" | balance negative **and the extra recorded as advance** (E5) |
+| Startup report after a new sale | sale reported as untracked (2a gap) | tracked, nothing reported |
+| Protocol | 3 | 4 |
+| E2E direct sale calls | no transaction id | transaction id added (the app's own screens already send one) |
+
+### Not executed (Batch 2b)
+| Area | Status |
+|---|---|
+| **Windows hardware** | Not executed. All results are Linux. |
+| Payment screens | Not built yet (Batch 2c); the existing Customers screen only gained an automatic transaction id in `src/lib/api.ts` |
+| Host + client payment E2E | Planned with the screens in 2c; this batch tests the host API directly (including concurrency) |
+
+---
+
 ## Phase 7, Batch 2a: payment records migration (0008), append-only protection, reconciliation
 
 | | |

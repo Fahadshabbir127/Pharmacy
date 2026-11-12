@@ -90,7 +90,7 @@ describe('Electron security boundaries', () => {
 
   it('API traffic goes through the pinned HTTPS proxy (backend is not reachable over plain HTTP)', async () => {
     const h = await apiFromRenderer(inst.win, 'GET', '/health');
-    expect(h.body).toMatchObject({ status: 'ok', mode: 'standalone', apiProtocol: 3 });
+    expect(h.body).toMatchObject({ status: 'ok', mode: 'standalone', apiProtocol: 4 });
     const state = await inst.win.evaluate(() => (window as any).braintech.getConnectionState());
     expect(state).toMatchObject({ status: 'CONNECTED', isLocal: true });
   });
@@ -221,7 +221,7 @@ describe('Phase 6: batches through the real UI (pharmacy date 2026-06-01)', () =
     await inst.win.click('h4:has-text("E2E Last Units")');
     expect(await cartQty().inputValue()).toBe('2');
     const p = (await apiFromRenderer(inst.win, 'GET', '/inventory')).body.find((x: any) => x.id === lastId);
-    const other = await apiFromRenderer(inst.win, 'POST', '/sales', { items: [{ product: p, quantity: 1, unit_price: 80, discount_percent: 0, discount_amount: 0, gst_amount: 0, subtotal: 80 }], total_amount: 80, discount_percent: 0, discount_amount: 0, net_amount: 80, total_gst: 0, grand_total: 80, payment_method: 'CASH', amount_paid: 80 });
+    const other = await apiFromRenderer(inst.win, 'POST', '/sales', { items: [{ product: p, quantity: 1, unit_price: 80, discount_percent: 0, discount_amount: 0, gst_amount: 0, subtotal: 80 }], total_amount: 80, discount_percent: 0, discount_amount: 0, net_amount: 80, total_gst: 0, grand_total: 80, payment_method: 'CASH', amount_paid: 80, client_txn_id: 'e2e-other-counter-0001' });
     expect(other.status).toBe(200);
 
     // Phase 7: the payment screen asks the server first, so the shortage is caught before any money is taken

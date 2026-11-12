@@ -10,6 +10,7 @@ import { spawn, ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import net from 'node:net';
 import { pathToFileURL } from 'node:url';
 import { createRequire } from 'node:module';
@@ -203,6 +204,8 @@ export function salePayload(items: any[], extra: Record<string, unknown> = {}) {
     grand_total,
     payment_method: 'CASH',
     amount_paid: grand_total,
+    // Phase 7 Batch 2b: every sale carries a transaction id (a new one per payload unless the test sets one)
+    client_txn_id: crypto.randomUUID(),
     ...extra,
   };
 }

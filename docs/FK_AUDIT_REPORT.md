@@ -152,3 +152,13 @@ All new links are declared in the schema and enforced (enforcement is ON since F
 | `payment_allocations.customer_id → customers.id`, `releases_allocation_id → payment_allocations.id`, `created_by_user_id → users.id` | yes | |
 
 `foreign_key_check` is empty after 0008 on all 9 legacy fixtures (tested).
+
+## 8. Phase 7 Batch 2b: migration `0009_carried_over_balances`
+
+| Relationship | Declared | Notes |
+|---|---|---|
+| `customer_carried_over_balances.customer_id → customers.id`, `confirmed_by_user_id → users.id`, `migration_issue_id → payment_migration_issues.id` | yes | append-only; customers with such items are archived, never deleted |
+| `payment_allocations.carried_over_id → customer_carried_over_balances.id` | yes | table rebuilt in 0009 with the same rows; all FKs of 0008 kept |
+| `customer_ledger.payment_id → payments.id` | yes (nullable, added by ALTER) | links new ledger rows to their payment |
+
+`foreign_key_check` is empty after 0009 on all 9 legacy fixtures (tested).

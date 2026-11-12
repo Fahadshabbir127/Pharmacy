@@ -176,8 +176,17 @@ describe('customers & udhar ledger', () => {
     expect((await admin.post('/customers', { name: 'Dup', phone: '0300 123-4567' })).status).toBe(400);
   });
 
-  it('record payment reduces balance, writes PAYMENT ledger row, queues email+SMS', async () => {
+  // Phase 7 Batch 2b (condition 1): a payment without a transaction id is refused; nothing is written
+  it('[CHANGED Phase 7] a customer payment without a transaction id is refused (400) and nothing is recorded', async () => {
     const r = await admin.post('/customers/1/payment', { amount: 450, payment_mode: 'Cash' });
+    expect([r.status, r.body.code]).toEqual([400, 'TXN_ID_REQUIRED']);
+    const db = await openReadOnly(srv.dbFile);
+    expect(one(db, "SELECT COUNT(*) n FROM customer_ledger WHERE type = 'PAYMENT'")).toEqual({ n: 0 });
+    expect(one(db, 'SELECT current_balance b FROM customers WHERE id = 1')).toEqual({ b: 2450 });
+  });
+
+  it('record payment reduces balance, writes PAYMENT ledger row, queues email+SMS', async () => {
+    const r = await admin.post('/customers/1/payment', { amount: 450, payment_mode: 'Cash', client_txn_id: 'cust-pay-test-0001' });
     expect(r.status).toBe(200);
     expect(r.body.newBalance).toBe(2000);
     const db = await openReadOnly(srv.dbFile);
@@ -185,9 +194,10 @@ describe('customers & udhar ledger', () => {
     expect(one(db, "SELECT COUNT(*) n FROM email_queue WHERE type='PAYMENT_CONFIRMATION'")).toEqual({ n: 1 });
   });
 
-  it('overpayment makes the balance negative (no guard)', async () => {
-    const r = await admin.post('/customers/3/payment', { amount: 100 });
-    expect(r.body.newBalance).toBe(-100);
+  // E5: the extra is kept as the customer's advance (never lost); the stored balance goes negative as before
+  it('[CHANGED Phase 7] an overpayment is kept as advance; the balance goes negative', async () => {
+    const r = await admin.post('/customers/3/payment', { amount: 100, client_txn_id: 'cust-pay-test-0002' });
+    expect(r.body).toMatchObject({ newBalance: -100, allocations: [], advance_remaining: 100 });
   });
 
   it('cannot delete a customer with a positive balance', async () => {
