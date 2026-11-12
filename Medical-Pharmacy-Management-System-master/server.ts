@@ -26,6 +26,7 @@ import { createBatch, takeFromBatch, addToBatch, batchesFor, inventoryInvariantI
 import { normalizeExpiry } from './server/inventory/expiry';
 import { priceBill, sameMoney, validPercent, round2, PricedBill } from './shared/pricing';
 import { DiscountAuthorizations, discountLimits } from './server/pos/discountAuth';
+import { reconcilePayments, PaymentReconciliation } from './server/payments/reconcile';
 
 const PORT = Number(process.env.PHARMACY_PORT) || 3000;
 // C8: per-installation secret (set in startServer). The original public fallback secret is gone.
@@ -120,7 +121,16 @@ function checkInventoryAtStartup() {
   if (issues.length) console.error(`[INVENTORY] ${issues.length} inventory consistency problem(s) found (nothing was changed): ${JSON.stringify(issues.slice(0, 20))}`);
   if (migrationIssues) console.warn(`[INVENTORY] ${migrationIssues} item(s) were recorded during the batch upgrade (see inventory_migration_issues / audit log).`);
   inventoryStartupReport = { checkedAt: new Date().toISOString(), issues, migrationIssues, testDateOverride: override };
+
+  // Phase 7 Batch 2a: customer balances vs payment records (reported, never repaired)
+  paymentStartupReport = reconcilePayments(db);
+  const pr = paymentStartupReport;
+  if (pr.mismatches.length) console.warn(`[PAYMENTS] ${pr.mismatches.length} customer balance(s) differ from what invoices and payments explain (nothing was changed): ${JSON.stringify(pr.mismatches.slice(0, 20))}`);
+  if (pr.untrackedSales) console.warn(`[PAYMENTS] ${pr.untrackedSales} invoice(s) have money recorded at the sale but no payment record.`);
+  if (pr.walkInSalesWithDue) console.warn(`[PAYMENTS] ${pr.walkInSalesWithDue} walk-in invoice(s) still show money owed.`);
+  if (pr.migrationIssues) console.warn(`[PAYMENTS] ${pr.migrationIssues} item(s) were recorded while carrying over payment history (see payment_migration_issues / audit log).`);
 }
+let paymentStartupReport: PaymentReconciliation | null = null;
 
 // Query helpers (delegate to the DB adapter).
 function queryAll<T = any>(sql: string, params: any[] = []): T[] {
@@ -399,6 +409,7 @@ async function startServer() {
       lastBackup: backups.length ? backups[backups.length - 1] : null,
       needsSetup: needsSetup(),
       inventory: inventoryStartupReport,
+      payments: paymentStartupReport,
     });
   });
   app.post('/api/local/pairing/rotate', requireLocal, (req, res) => { pairing.rotate(); res.json(pairing.current()); });

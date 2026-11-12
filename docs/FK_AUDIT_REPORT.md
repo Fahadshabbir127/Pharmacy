@@ -138,3 +138,17 @@ All new links are declared in the schema and enforced (enforcement is ON since F
 | `purchase_items.batch_id → product_batches.id` | yes (nullable, added by ALTER) | Old purchase lines keep NULL. |
 | `stock_adjustments.batch_id → product_batches.id` | yes (nullable, added by ALTER) | Old adjustments keep NULL. |
 | `product_batches.tenant_id`, `created_by`, `inventory_migration_issues.product_id` | no (application-enforced, as FK4) | `inventory_migration_issues` is a report and must keep its rows even if a product is later removed. |
+
+## 7. Phase 7 Batch 2a: foreign keys added with payment records (migration `0008_payments`)
+
+| Relationship | Declared | Notes |
+|---|---|---|
+| `payments.customer_id → customers.id` | yes (nullable: walk-in) | Customers with history are archived, never deleted |
+| `payments.sale_id → sales_headers.id` | yes, `ON DELETE SET NULL` | Until Batch 4 a void still deletes the invoice; the payment stays, the link is cleared, `invoice_number` is kept. The append-only trigger allows only this one change. |
+| `payments.reverses_payment_id → payments.id` | yes | unique: one reversal per payment |
+| `payments.received_by_user_id → users.id` | yes (nullable) | users with history are archived |
+| `payment_allocations.payment_id → payments.id` | yes | |
+| `payment_allocations.sale_id → sales_headers.id` | yes, `ON DELETE SET NULL` | same rule as payments |
+| `payment_allocations.customer_id → customers.id`, `releases_allocation_id → payment_allocations.id`, `created_by_user_id → users.id` | yes | |
+
+`foreign_key_check` is empty after 0008 on all 9 legacy fixtures (tested).

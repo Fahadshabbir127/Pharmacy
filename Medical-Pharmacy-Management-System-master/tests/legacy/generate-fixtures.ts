@@ -234,6 +234,47 @@ export async function generateFixtures(outDir: string, log: (m: string) => void 
     await save('inventory-edge-cases', srv.dbFile, 'Original app: negative, fractional, zero stock; month/year, ambiguous and blank expiry text; one sale.');
   }
 
+  // 6c. payment edge cases the original app allowed (input for the Phase 7 payment migration 0008).
+  //     Steps are 1.1 s apart so every event has its own timestamp (the migration replays them in date order).
+  {
+    const work = makeTempDir();
+    await withOriginal(work, async () => {});
+    const { srv } = await withOriginal(work, async (admin) => {
+      const tick = () => new Promise((r) => setTimeout(r, 1100));
+      const ok = (r: { status: number; body: any }, what: string) => { if (r.status !== 200) throw new Error(`fixture step failed: ${what}: ${r.status} ${JSON.stringify(r.body)}`); return r; };
+      const p = async (id: number) => (await admin.get('/inventory')).body.find((x: any) => x.id === id);
+      const customer = async (name: string, phone: string, opening: number) => {
+        ok(await admin.post('/customers', { name, phone, address: 'Fixture', opening_balance: opening }), `customer ${name}`);
+        return (await admin.get('/customers')).body.find((c: any) => c.name === name).id as number;
+      };
+      const sale = async (pid: number, extra: Record<string, unknown>) => ok(await admin.post('/sales', salePayload([cartItem(await p(pid), 1)], extra)), `sale ${JSON.stringify(extra)}`);
+      const pay = async (cid: number, amount: number, payment_mode: string) => ok(await admin.post(`/customers/${cid}/payment`, { amount, payment_mode }), `payment ${cid} ${amount}`);
+
+      // A: opening 500, credit sale 220, pays 200 (Cash) then 1000 (Bank Transfer) -> balance -480, then credit sale 380 -> -100
+      const a = await customer('Fixture Advance', '0300-1110001', 500); await tick();
+      await sale(1, { payment_method: 'UDHAR', customer_id: a }); await tick();
+      await pay(a, 200, 'Cash'); await tick();
+      await pay(a, 1000, 'Bank Transfer'); await tick();
+      await sale(2, { payment_method: 'UDHAR', customer_id: a }); await tick();
+      // B: credit sale 380, pays 300 (EasyPaisa), then the invoice is deleted: the original void clamps the balance at 0
+      const b = await customer('Fixture Voided', '0300-1110002', 0); await tick();
+      const sb = await sale(2, { payment_method: 'UDHAR', customer_id: b }); await tick();
+      await pay(b, 300, 'EasyPaisa'); await tick();
+      ok(await admin.del(`/sales/${sb.body.sale_id}`), 'delete invoice'); await tick();
+      // C: the demo customer with an unexplained balance pays 50 with a mode the screen never offered
+      await pay(2, 50, 'Cheque'); await tick();
+      // D: negative opening balance typed into the customer form
+      await customer('Fixture Negative', '0300-1110004', -50); await tick();
+      // E: walk-in cash sales: more money than the bill, and less than the bill (both accepted by the original app)
+      await sale(1, { payment_method: 'CASH', amount_paid: 1000 }); await tick();
+      await sale(1, { payment_method: 'CASH', amount_paid: 100 }); await tick();
+      // F: part payment at the sale, the rest paid later with JazzCash
+      await sale(3, { payment_method: 'PARTIAL', customer_id: 3, amount_paid: 100 }); await tick();
+      await pay(3, 75, 'JazzCash');
+    });
+    await save('payments-edge-cases', srv.dbFile, 'Original app: overpayment -> advance -> later credit sale, part-paid invoice deleted (balance clamped), unknown payment mode, negative opening balance, walk-in over/under payment, partial + later payment.');
+  }
+
   // 6. pre-tenant (oldest) schema, raw and after the original app migrated it
   {
     const raw = path.join(makeTempDir(), 'pre-tenant.sqlite');

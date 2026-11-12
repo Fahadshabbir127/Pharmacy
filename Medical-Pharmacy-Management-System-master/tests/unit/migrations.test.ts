@@ -60,7 +60,12 @@ describe('migrating every legacy fixture (copies only)', () => {
         for (const [t, n] of Object.entries(manifest[name].rowCounts)) {
           const cols = db.all<{ name: string }>(`PRAGMA table_info("${t}")`).map((c) => c.name);
           const placeholders = cols.includes('is_placeholder') ? db.get<{ n: number }>(`SELECT COUNT(*) n FROM "${t}" WHERE is_placeholder = 1`)!.n : 0;
-          expect(counts[t] - placeholders, `${name}.${t}`).toBe(n);
+          // the only other additions: audit rows written by the migrations themselves (user "Database upgrade")
+          const upgradeAudit = t === 'audit_logs' ? db.get<{ n: number }>("SELECT COUNT(*) n FROM audit_logs WHERE user_name = 'Database upgrade' AND user_id IS NULL")!.n : 0;
+          expect(counts[t] - placeholders - upgradeAudit, `${name}.${t}`).toBe(n);
+          if (upgradeAudit) {
+            expect(db.all<{ a: string }>("SELECT DISTINCT action_type a FROM audit_logs WHERE user_name = 'Database upgrade'").map((r) => r.a).every((a) => ['PAYMENT_MIGRATION', 'PAYMENT_MIGRATION_ISSUE', 'INVENTORY_MIGRATION_ISSUE'].includes(a)), `${name} upgrade audit types`).toBe(true);
+          }
           if (placeholders) expect(db.get<{ n: number }>(`SELECT COUNT(*) n FROM "${t}" WHERE is_placeholder = 1 AND archived_at IS NULL`)!.n, `${name}.${t} placeholders archived`).toBe(0);
         }
         // FK5: clean references and enforcement on

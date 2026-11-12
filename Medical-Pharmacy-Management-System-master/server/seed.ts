@@ -41,8 +41,11 @@ function catalog(db: DbAdapter, saleCreatorId: number) {
     'Chaudhry Muhammad Ali', '03001234567', 'House #42, Street 5, Main Bazaar, Lahore', 0, 2450.00, '03001234567'
   ]);
   db.run("INSERT INTO customers (name, phone, address, opening_balance, current_balance, login_id) VALUES (?, ?, ?, ?, ?, ?)", [
-    'Tariq Mahmood', '03219876543', 'Plaza #12, Commercial Market, Rawalpindi', 0, 1200.00, '03219876543'
+    'Tariq Mahmood', '03219876543', 'Plaza #12, Commercial Market, Rawalpindi', 1200.00, 1200.00, '03219876543'
   ]);
+  // Phase 7: the demo balance is a recorded opening balance (the original demo data had no record explaining it)
+  db.run(`INSERT INTO customer_ledger (customer_id, type, reference, debit, credit, balance_after, notes)
+    VALUES (2, 'ADJUSTMENT', 'Opening Balance', 1200, 0, 1200, 'Initial opening balance')`);
   db.run("INSERT INTO customers (name, phone, address, opening_balance, current_balance, login_id) VALUES (?, ?, ?, ?, ?, ?)", [
     'Dr. Rashid Ahmad', '03335554433', 'Civil Hospital Road, Multan', 0, 0.00, '03335554433'
   ]);
@@ -96,6 +99,12 @@ function catalog(db: DbAdapter, saleCreatorId: number) {
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [1, `${today} 10:30:00`, 'SALE', 'Invoice #INV-1001', 2650.00, 200.00, 2450.00, 'Partial cash payment Rs. 200, Udhar Rs. 2450']
   );
+
+  // Phase 7: the Rs. 200 paid at the demo sale is a payment record applied to that invoice
+  const demoPay = db.run(`INSERT INTO payments (tenant_id, customer_id, sale_id, invoice_number, direction, kind, method, amount, client_txn_id, received_by_user_id, received_at, source, notes)
+    VALUES (1, 1, 1, 'INV-1001', 'IN', 'SALE_TENDER', 'CASH', 200, 'demo-seed-inv-1001', ?, ?, 'SYSTEM', 'Demo data')`, [saleCreatorId, `${today} 10:30:00`]).lastInsertRowid;
+  db.run(`INSERT INTO payment_allocations (payment_id, customer_id, target, sale_id, invoice_number, kind, amount, source, created_by_user_id, created_at)
+    VALUES (?, 1, 'SALE', 1, 'INV-1001', 'APPLY', 200, 'SYSTEM', ?, ?)`, [demoPay, saleCreatorId, `${today} 10:30:00`]);
 
   db.run(`INSERT INTO sms_queue (customer_id, phone, message, type, status) VALUES (?, ?, ?, ?, ?)`,
     [1, '03001234567', 'Dear Chaudhry Muhammad Ali, thank you for visiting our pharmacy. Invoice #INV-1001. Amount Paid: Rs. 200. Current Udhar Balance: Rs. 2450.', 'PAYMENT_CONFIRMATION', 'PENDING']

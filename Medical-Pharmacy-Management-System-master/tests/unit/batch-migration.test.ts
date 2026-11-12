@@ -37,6 +37,7 @@ function legacyProducts(name: string) {
 
 beforeAll(async () => { manifest = await ensureFixtures(FIXTURE_DIR); }, 600_000);
 
+const LATEST = MIGRATIONS[MIGRATIONS.length - 1].version;
 const CLEAN = ['fresh-first-boot', 'after-restart', 'busy-store', 'multi-tenant', 'orphans', 'pre-tenant-raw', 'pre-tenant-migrated-by-original'];
 
 describe('0007 on every legacy database (copies; originals untouched)', () => {
@@ -47,7 +48,7 @@ describe('0007 on every legacy database (copies; originals untouched)', () => {
       const { dir, file } = copy(name);
       const { db } = await openDatabase(file, { backupDir: path.join(dir, 'b') });
       try {
-        expect(currentVersion(db)).toBe(7);
+        expect(currentVersion(db)).toBe(LATEST);
         for (const p of before.rows) {
           const now = db.get<{ stock: number }>('SELECT stock FROM products WHERE id = ?', [p.id])!;
           expect(now.stock, `product ${p.id}`).toBe(p.stock);
@@ -169,7 +170,7 @@ describe('0007 failure and crash recovery', () => {
     expect(db.all('SELECT id, stock FROM products ORDER BY id')).toEqual(stockBefore);
     expect(db.all("SELECT name FROM sqlite_master WHERE type = 'trigger'")).toEqual([]);
     await migrate(db, MIGRATIONS, { backupDir: path.join(dir, 'b') });
-    expect(currentVersion(db)).toBe(7);
+    expect(currentVersion(db)).toBe(LATEST);
     expect(db.all('SELECT id, stock FROM products ORDER BY id')).toEqual(stockBefore);
     db.close();
   });
@@ -186,11 +187,11 @@ describe('0007 failure and crash recovery', () => {
     expect(mid.tableNames()).not.toContain('product_batches');
     for (const p of before.rows) expect(mid.get<any>('SELECT stock FROM products WHERE id = ?', [p.id]).stock).toBe(p.stock);
     mid.close();
-    expect(fs.readdirSync(path.join(dir, 'data', 'backups')).some((f) => f.startsWith('pre-migration-v0-to-v7'))).toBe(true);
+    expect(fs.readdirSync(path.join(dir, 'data', 'backups')).some((f) => f.startsWith(`pre-migration-v0-to-v${LATEST}`))).toBe(true);
     const srv = await startServer({ workDir: dir });
     try {
       const db = DbAdapter.open(srv.dbFile, { readonly: true });
-      expect(currentVersion(db)).toBe(7);
+      expect(currentVersion(db)).toBe(LATEST);
       for (const p of before.rows) expect(db.get<any>('SELECT stock FROM products WHERE id = ?', [p.id]).stock).toBe(p.stock);
       expect(inventoryInvariantIssues(db)).toEqual([]);
       db.close();
