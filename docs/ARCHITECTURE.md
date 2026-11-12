@@ -246,6 +246,12 @@ sales_returns / sales_return_items (sale_item_id, batch_id, qty, restock flag, r
 | Voids | Soft-void (`status`, `voided_at`, `voided_by`, `void_reason`) that restores stock to the original batches and reverses the ledger; reports exclude voided sales |
 | Audit | Every financial, stock, security, backup and config action is written to `audit_logs` in the same transaction as the change |
 
+### As built in Phase 7, Batch 2a (payment records, database only)
+- Migration `0008_payments`: `payments` (IN money / OUT reversals; methods CASH, CARD, BANK_TRANSFER, MOBILE_WALLET, UNSPECIFIED for unmapped history; `client_txn_id` required for everything except carried-over history; one reversal per payment) and `payment_allocations` (APPLY / RELEASE against an invoice or the opening balance), both append-only by trigger. `sales_headers.balance_due` and `settlement_status` are maintained by triggers from the allocations and cannot be set directly; the at-sale columns are an immutable snapshot (trigger). Database triggers refuse allocations beyond the payment, the invoice total or the opening balance.
+- History (E9, P2–P4): one CARRIED_OVER_SALE payment per paid sale, one CARRIED_OVER_CUSTOMER payment per ledger payment (method from the stored mode text), replayed in date order: opening balance first, then oldest invoices, leftover = advance applied to the next credit invoice. Stored balances and amounts are never changed; differences go to `payment_migration_issues` and the audit log.
+- `server/payments/reconcile.ts`: at startup each customer's stored balance is compared with opening still owed + invoice balances − advance; mismatches, sales without payment records and walk-in sales with money owed are logged and shown in `/api/local/host-status` → `payments`. Nothing is repaired.
+- Until Batch 2b the API does not write payment records yet (new sales are reported as "no payment record").
+
 ### As built in Phase 7, Batch 1 (server-calculated POS)
 - `shared/pricing.ts` is the only pricing formula; the server uses it to charge, the POS uses it only for display. Per line: gross, line discount and GST each rounded to 2 decimals; bill discount after line discounts and not reducing GST (legacy rule kept, E3).
 - `POST /api/sales/quote` returns the host's figures (lines, totals, discount status) and checks stock; nothing is written. The payment screen shows these figures and cannot complete until they are confirmed.

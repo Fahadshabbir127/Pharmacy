@@ -4,6 +4,41 @@ This report contains only results that were actually executed. Anything not exec
 
 ---
 
+## Phase 7, Batch 2a: payment records migration (0008), append-only protection, reconciliation
+
+| | |
+|---|---|
+| Date | 2026-11-12 |
+| Environment | Linux container (no Windows), Node 22.23.4, Electron 45.2.3 under `xvfb-run` |
+| Commands | `npm run lint`, `npm run audit:db-callsites`, `npm test`, `xvfb-run -a npm run test:e2e` (run twice) |
+| Result | **Unit/backend: 21 files, 315 tests, all passing. Desktop end-to-end: 2 files, 26 tests, all passing on two consecutive runs (77.6 s, 61.2 s).** Lint clean; DB call-site audit clean. |
+
+Scope: database only (decisions P1–P5, P7 at database level; E9). No API or screen changes; protocol stays 3.
+
+### New test file `tests/unit/payment-migration.test.ts` (21 tests)
+- **All 9 legacy databases produced by the original app** (incl. the new `payments-edge-cases`): every at-sale payment and every ledger payment carried over exactly once for the recorded amount; **every original sale figure, customer balance and ledger row unchanged**; invoice `balance_due`/`settlement_status` equal total minus allocations, never negative; no payment over-allocated; the startup reconciliation reports exactly the mismatches the migration recorded; FK and integrity checks clean; the fixture file itself unchanged.
+- **`payments-edge-cases`, exact outcomes:** opening balance paid first, then the oldest invoice; an overpayment kept as advance and applied to the next credit invoice (P2, P3); a part-paid invoice deleted by the original void → payment kept as advance, the clamped stored balance (0 instead of −300) reported, not corrected; demo customer's unexplained Rs. 1,200 reported; unknown mode "Cheque" → UNSPECIFIED with the text kept; negative opening balance, walk-in overpayment and underpayment reported; part payment + later JazzCash payment → PAID. Six issues and one summary audit row.
+- **Database guards:** payments and allocations cannot be deleted or edited; at-sale figures cannot be changed; `balance_due`/`settlement_status` cannot be set directly; a new payment without a transaction id, with amount ≤ 0 or an unknown method is refused; duplicate transaction ids refused; allocations cannot exceed the payment, the invoice or the opening balance, or go to another customer's invoice; releases need a reason and cannot exceed what was applied; a reversal must be OUT, for the full amount, with a reason, once; a reversed payment cannot be allocated again; a new invoice starts fully due; the legacy hard void keeps payment history (invoice link cleared, number kept).
+- **Rollback / crash / backup:** an injected failure at the end of 0008 leaves version 7, no new tables, columns or triggers, all money unchanged, and the real migration then succeeds; the server **killed inside the 0008 transaction** leaves version 7 untouched, a **verified pre-migration backup (v7→v8)** exists and matches, and the next start migrates cleanly.
+- **Startup report:** a new installation with demo data reconciles cleanly; a sale made through the current (pre-2b) sale route is reported as "money recorded at the sale but no payment record".
+
+### Changed tests
+- `migrations.test.ts`: migrations may add their own audit rows (user "Database upgrade", action types limited to the migration report types); every other row count must be unchanged as before.
+- `batch-migration.test.ts`: "latest version" instead of the fixed number 7 (all 0007 checks unchanged).
+- `00-startup.test.ts`: the three new tables in the schema list. `06-legacy-fixtures.test.ts`: 9 fixtures.
+
+### Legacy defects found while building the fixture
+- The original void can leave a stored balance that no record explains (it never lets the balance go below 0).
+- After deleting an invoice, the original app re-issued its number to a different sale (R4), so ledger text "Invoice #…" can point at the wrong sale; the migration therefore links payments by invoice id, never by number text.
+
+### Not executed (Batch 2a)
+| Area | Status |
+|---|---|
+| Migration 0008 on a **real** pharmacy database, on **Windows** | Not executed (synthetic databases from the original app only) |
+| Migration time on a very large database | Not measured |
+
+---
+
 ## Phase 7, Batch 1: server-calculated POS and transaction safety
 
 | | |
