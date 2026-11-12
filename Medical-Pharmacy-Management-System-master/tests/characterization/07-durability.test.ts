@@ -9,8 +9,10 @@ import { openReadOnly, one, all, integrityCheck } from '../helpers/db';
 
 describe('crash durability (SIGKILL, no graceful shutdown)', () => {
   /**
-   * Each request carries a unique marker (unit price 1000+i; the server still stores client prices
-   * - legacy C9 - which makes every stored sale traceable to the request that created it).
+   * Each request carries a unique transaction id ("durability-req-NNNN"). The server stores it in
+   * idempotency_keys in the SAME transaction as the sale, which makes every stored sale traceable to the
+   * request that created it. (Until Phase 7 the marker was a client-supplied unit price; the server now
+   * prices every sale itself, C9.)
    * Odd requests are UDHAR sales to customer #2, so one sale touches four tables:
    * sales_headers, sale_items, customers.current_balance and customer_ledger.
    */
@@ -25,7 +27,7 @@ describe('crash durability (SIGKILL, no graceful shutdown)', () => {
     const N = 55;
     const outcome: ('ack' | 'error' | 'interrupted')[] = [];
     const send = (i: number) =>
-      admin.post('/sales', salePayload([cartItem(p, 1, { unit_price: 1000 + i })], i % 2 ? { payment_method: 'UDHAR', customer_id: 2 } : {}));
+      admin.post('/sales', salePayload([cartItem(p, 1)], { client_txn_id: `durability-req-${String(i).padStart(4, '0')}`, ...(i % 2 ? { payment_method: 'UDHAR', customer_id: 2 } : {}) }));
     for (let i = 0; i < 15; i++) {
       const r = await send(i);
       expect(r.status).toBe(200);
@@ -54,10 +56,13 @@ describe('crash durability (SIGKILL, no graceful shutdown)', () => {
       const db = await openReadOnly(srv.dbFile);
       expect(integrityCheck(db)).toEqual([]);
       const rows = all<{ id: number; marker: number; items: number; grand_total: number; amount_due: number; method: string; ledger: number }>(db, `
-        SELECT h.id, MIN(i.sale_price) - 1000 AS marker, COUNT(i.id) AS items, h.grand_total, h.amount_due, h.payment_method AS method,
+        SELECT h.id, CAST(substr(k.key, 16) AS INTEGER) AS marker, COUNT(i.id) AS items, h.grand_total, h.amount_due, h.payment_method AS method,
                (SELECT COUNT(*) FROM customer_ledger l WHERE l.sale_id = h.id) AS ledger
         FROM sales_headers h LEFT JOIN sale_items i ON i.sale_id = h.id
+        LEFT JOIN idempotency_keys k ON k.route = 'POST /api/sales' AND json_extract(k.response, '$.sale_id') = h.id
         WHERE h.invoice_number LIKE 'INV-1-%' GROUP BY h.id`);
+      // every stored sale is traceable to exactly one request (its transaction id was stored with it)
+      for (const r of rows) expect(r.marker, `sale ${r.id} has no transaction id`).not.toBeNull();
       const byMarker = new Map<number, typeof rows>();
       for (const r of rows) byMarker.set(r.marker, [...(byMarker.get(r.marker) ?? []), r]);
 
@@ -65,7 +70,7 @@ describe('crash durability (SIGKILL, no graceful shutdown)', () => {
       expect(one(db, 'SELECT COUNT(*) n FROM sale_items i WHERE NOT EXISTS (SELECT 1 FROM sales_headers h WHERE h.id = i.sale_id)')).toEqual({ n: 0 });
       for (const r of rows) {
         expect(r.items, `sale ${r.id} items`).toBe(1);
-        expect(r.grand_total, `sale ${r.id} total`).toBe(1000 + r.marker);
+        expect(r.grand_total, `sale ${r.id} total`).toBe(175); // Brufen, priced by the server
         expect(r.ledger, `sale ${r.id} ledger rows`).toBe(r.method === 'UDHAR' ? 1 : 0);
       }
       // no duplicates: every request produced at most one sale
@@ -104,7 +109,7 @@ describe('crash durability (SIGKILL, no graceful shutdown)', () => {
       const p = (await admin.get('/inventory')).body.find((x: any) => x.id === 3);
       const before = (await admin.get('/customers')).body.find((c: any) => c.id === 2).current_balance;
       let answered = false;
-      await admin.post('/sales', salePayload([cartItem(p, 4, { unit_price: 777 })], { payment_method: 'UDHAR', customer_id: 2 }))
+      await admin.post('/sales', salePayload([cartItem(p, 4)], { payment_method: 'UDHAR', customer_id: 2, client_txn_id: 'crash-point-sale-0001' }))
         .then(() => { answered = true; }, () => { /* connection dropped */ });
       await srv.kill();
       expect(answered).toBe(false);
@@ -112,15 +117,15 @@ describe('crash durability (SIGKILL, no graceful shutdown)', () => {
       const again = await startServer({ workDir });
       try {
         const db = await openReadOnly(again.dbFile);
-        const sales = all<{ id: number }>(db, 'SELECT h.id FROM sales_headers h JOIN sale_items i ON i.sale_id = h.id WHERE i.sale_price = 777');
-        const ledger = one<{ n: number }>(db, 'SELECT COUNT(*) n FROM customer_ledger WHERE debit = 3108')!.n;
+        const sales = all<{ id: number }>(db, "SELECT h.id FROM sales_headers h JOIN idempotency_keys k ON json_extract(k.response, '$.sale_id') = h.id WHERE k.key = 'crash-point-sale-0001'");
+        const ledger = one<{ n: number }>(db, 'SELECT COUNT(*) n FROM customer_ledger WHERE debit = 700')!.n; // 4 x Rs. 175
         const balance = one<{ b: number }>(db, 'SELECT current_balance b FROM customers WHERE id = 2')!.b;
         const stock = one<{ s: number }>(db, 'SELECT stock s FROM products WHERE id = 3')!.s;
         const audit = one<{ n: number }>(db, "SELECT COUNT(*) n FROM audit_logs WHERE action_type = 'CREATE_SALE'")!.n;
         if (point === 'before-commit') {
           expect({ sales: sales.length, ledger, balance, stock, audit }).toEqual({ sales: 0, ledger: 0, balance: before, stock: 80, audit: 0 });
         } else {
-          expect({ sales: sales.length, ledger, balance, stock, audit }).toEqual({ sales: 1, ledger: 1, balance: before + 3108, stock: 76, audit: 1 });
+          expect({ sales: sales.length, ledger, balance, stock, audit }).toEqual({ sales: 1, ledger: 1, balance: before + 700, stock: 76, audit: 1 });
         }
         expect(one(db, 'SELECT COUNT(*) n FROM sale_items i WHERE NOT EXISTS (SELECT 1 FROM sales_headers h WHERE h.id = i.sale_id)')).toEqual({ n: 0 });
         expect(integrityCheck(db)).toEqual([]);

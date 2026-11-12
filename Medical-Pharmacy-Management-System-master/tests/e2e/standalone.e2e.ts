@@ -90,7 +90,7 @@ describe('Electron security boundaries', () => {
 
   it('API traffic goes through the pinned HTTPS proxy (backend is not reachable over plain HTTP)', async () => {
     const h = await apiFromRenderer(inst.win, 'GET', '/health');
-    expect(h.body).toMatchObject({ status: 'ok', mode: 'standalone', apiProtocol: 2 });
+    expect(h.body).toMatchObject({ status: 'ok', mode: 'standalone', apiProtocol: 3 });
     const state = await inst.win.evaluate(() => (window as any).braintech.getConnectionState());
     expect(state).toMatchObject({ status: 'CONNECTED', isLocal: true });
   });
@@ -224,7 +224,8 @@ describe('Phase 6: batches through the real UI (pharmacy date 2026-06-01)', () =
     const other = await apiFromRenderer(inst.win, 'POST', '/sales', { items: [{ product: p, quantity: 1, unit_price: 80, discount_percent: 0, discount_amount: 0, gst_amount: 0, subtotal: 80 }], total_amount: 80, discount_percent: 0, discount_amount: 0, net_amount: 80, total_gst: 0, grand_total: 80, payment_method: 'CASH', amount_paid: 80 });
     expect(other.status).toBe(200);
 
-    await completeCashSale();
+    // Phase 7: the payment screen asks the server first, so the shortage is caught before any money is taken
+    await inst.win.click('button:has-text("CASH")');
     await refusal.waitFor({ timeout: 15_000 });
     const msg = await refusal.innerText();
     expect(msg).toMatch(/Sale not saved/);
@@ -279,6 +280,85 @@ describe('Phase 6: inventory screen (batches panel, expiry tracker, write-off pe
   }, 120_000);
 });
 
+describe('Phase 7 Batch 1: the host prices every sale (real UI)', () => {
+  const reload = async () => {
+    await inst.win.goto('app://braintech/index.html');
+    await loginUi(inst.win, ADMIN.user, ADMIN.password);
+    await printOff(inst.win);
+  };
+  const latestSale = async () => {
+    const hist = (await apiFromRenderer(inst.win, 'GET', '/sales/history')).body;
+    return hist.reduce((a: any, b: any) => (a.id > b.id ? a : b));
+  };
+
+  it('a price changed on the host while the cart is open: the payment screen shows the server total and the sale is charged at it', async () => {
+    await reload();
+    const search = inst.win.locator('input[placeholder^="Scan Barcode or Search Medicine"]');
+    await search.fill('BF-109'); // Brufen, Rs. 175 when the POS loaded its list
+    await search.press('Enter');
+    await inst.win.waitForSelector('input[title="Click to type quantity manually"]');
+    const p = (await apiFromRenderer(inst.win, 'GET', '/inventory')).body.find((x: any) => x.batch_number === 'BF-109');
+    expect((await apiFromRenderer(inst.win, 'PUT', `/inventory/${p.id}`, { ...p, sale_price: 180 })).status).toBe(200);
+
+    await inst.win.click('button:has-text("CASH")');
+    await inst.win.waitForSelector('[data-testid="price-notice"]', { timeout: 15_000 });
+    expect(await inst.win.locator('[data-testid="server-grand-total"]').innerText()).toBe('Rs. 180.00');
+    await inst.win.screenshot({ path: path.join(base, '10-server-total-price-changed.png') });
+    await inst.win.click('button:has-text("Complete Sale & Print Receipt")');
+    await inst.win.waitForSelector('text=Invoice / Thermal Receipt', { timeout: 30_000 });
+    await inst.win.click('button:has-text("Close")');
+    const s = await latestSale();
+    expect(s).toMatchObject({ grand_total: 180, amount_paid: 180, payment_status: 'PAID' });
+  }, 120_000);
+
+  it('a staff cashier needs an administrator to authorize a discount; the sale is charged the server figure', async () => {
+    const created = await apiFromRenderer(inst.win, 'POST', '/users', { username: 'counter1', password: 'Counter123', fullName: 'Counter One', role: 'STAFF' });
+    expect(created.status).toBe(200);
+    // sign in as the staff cashier
+    const login = await apiFromRenderer(inst.win, 'POST', '/auth/login', { username: 'counter1', password: 'Counter123' });
+    expect(login.status).toBe(200);
+    await inst.win.evaluate((b: any) => { localStorage.setItem('khushi_token', b.token); localStorage.setItem('khushi_user', JSON.stringify(b.user)); }, login.body);
+    await inst.win.goto('app://braintech/index.html');
+    await loginUi(inst.win, 'counter1', 'Counter123');
+    await printOff(inst.win);
+
+    const search = inst.win.locator('input[placeholder^="Scan Barcode or Search Medicine"]');
+    await search.fill('RK-221'); // Risek, Rs. 310
+    await search.press('Enter');
+    await inst.win.waitForSelector('input[title="Click to type quantity manually"]');
+    await inst.win.fill('input[title^="Discounts above the staff limit"]', '10');
+    await inst.win.click('button:has-text("CASH")');
+    const box = inst.win.locator('[data-testid="discount-approval"]');
+    await box.waitFor({ timeout: 15_000 });
+    expect(await box.innerText()).toMatch(/above the staff limit \(0%\)/);
+    expect(await inst.win.locator('button:has-text("Complete Sale & Print Receipt")').isDisabled()).toBe(true);
+
+    await inst.win.fill('input[aria-label="Discount reason"]', 'regular customer');
+    await inst.win.fill('input[aria-label="Administrator username"]', ADMIN.user);
+    await inst.win.fill('input[aria-label="Administrator password"]', 'wrong-password1');
+    await inst.win.click('button:has-text("Authorize discount")');
+    await inst.win.waitForSelector('text=Administrator name or password is wrong', { timeout: 15_000 });
+    await inst.win.fill('input[aria-label="Administrator password"]', ADMIN.password);
+    await inst.win.click('button:has-text("Authorize discount")');
+    await inst.win.waitForSelector(`text=Authorized by ${ADMIN.owner}`, { timeout: 15_000 });
+    expect(await inst.win.locator('[data-testid="server-grand-total"]').innerText()).toBe('Rs. 279.00');
+    await inst.win.screenshot({ path: path.join(base, '11-discount-authorized.png') });
+    await inst.win.click('button:has-text("Complete Sale & Print Receipt")');
+    await inst.win.waitForSelector('text=Invoice / Thermal Receipt', { timeout: 30_000 });
+    await inst.win.click('button:has-text("Close")');
+    expect(await latestSale()).toMatchObject({ grand_total: 279, discount_percent: 10, discount_amount: 31 });
+
+    // back to the owner for the remaining tests
+    await inst.win.evaluate(() => { localStorage.removeItem('khushi_token'); localStorage.removeItem('khushi_user'); });
+    await inst.win.goto('app://braintech/index.html');
+    await loginUi(inst.win, ADMIN.user, ADMIN.password);
+    const auditRows = (await apiFromRenderer(inst.win, 'GET', '/audit-logs?limit=50')).body;
+    const rows = Array.isArray(auditRows) ? auditRows : auditRows.logs || [];
+    expect(rows.some((r: any) => r.action_type === 'DISCOUNT_OVERRIDE' && /Authorized by .*Reason: regular customer/.test(r.description))).toBe(true);
+    expect(rows.some((r: any) => r.action_type === 'DISCOUNT_AUTH_FAILED')).toBe(true);
+  }, 180_000);
+});
+
 describe('restart', () => {
   it('after closing and reopening, the app opens the pharmacy directly and all data is still there', async () => {
     await quit(inst);
@@ -287,7 +367,7 @@ describe('restart', () => {
     await loginUi(inst.win, ADMIN.user, ADMIN.password);
     await inst.win.waitForSelector('input[placeholder^="Scan Barcode or Search Medicine"]', { timeout: 30_000 });
     const hist = (await apiFromRenderer(inst.win, 'GET', '/sales/history')).body;
-    expect(hist).toHaveLength(6); // demo + POS + retry + multi-batch + other counter + final
+    expect(hist).toHaveLength(8); // demo + POS + retry + multi-batch + other counter + final + price-changed + staff discount
     const p = (await apiFromRenderer(inst.win, 'GET', '/inventory')).body.find((x: any) => x.batch_number === 'B-8910');
     expect(p.stock).toBe(117);
     const b = (await apiFromRenderer(inst.win, 'GET', `/inventory/${p.id}/batches?include_empty=true`)).body.batches;

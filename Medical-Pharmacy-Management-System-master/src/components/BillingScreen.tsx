@@ -2,7 +2,8 @@ import { PRODUCT_NAME, storeNameOf } from '../lib/branding';
 import React, { useState, useEffect, useRef } from 'react';
 import { Html5Qrcode } from 'html5-qrcode';
 import { Product, Category, Customer, CartItem, SaleHeader, SystemSettings } from '../types';
-import { api, ApiError, saveDraftCart, loadDraftCart, clearDraftCart } from '../lib/api';
+import { api, ApiError, saveDraftCart, loadDraftCart, clearDraftCart, getCurrentUser, SaleQuote } from '../lib/api';
+import { priceBill, priceLine, sameMoney } from '../../shared/pricing';
 import { ThermalReceiptModal } from './ThermalReceiptModal';
 import { 
   Search, 
@@ -409,13 +410,9 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
     }
   };
 
-  const calculateItemSubtotal = (qty: number, price: number, discPercent: number, gstPercent: number) => {
-    const rawTotal = qty * price;
-    const discAmount = (rawTotal * discPercent) / 100;
-    const afterDisc = rawTotal - discAmount;
-    const gstAmt = (afterDisc * gstPercent) / 100;
-    return afterDisc + gstAmt;
-  };
+  // Phase 7: the same formula as the server (shared/pricing.ts); the server's figures are final
+  const calculateItemSubtotal = (qty: number, price: number, discPercent: number, gstPercent: number) =>
+    priceLine({ quantity: qty, unitPrice: price, discountPercent: discPercent || 0, gstPercent: gstPercent || 0 }).subtotal;
 
   const updateCartQuantity = (productId: number, delta: number) => {
     setCart(prev => {
@@ -473,27 +470,104 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
 
   // Cart Calculations
   const { cartSubtotal, cartItemDiscounts, cartGstTotal, overallDiscountAmount, grandTotal } = React.useMemo(() => {
-    const subtotal = cart.reduce((acc, item) => acc + (item.quantity * item.unit_price), 0);
-    const itemDiscounts = cart.reduce((acc, item) => {
-      const raw = item.quantity * item.unit_price;
-      return acc + ((raw * item.discount_percent) / 100);
-    }, 0);
-    const gstTotal = cart.reduce((acc, item) => {
-      const raw = item.quantity * item.unit_price;
-      const afterDisc = raw - ((raw * item.discount_percent) / 100);
-      return acc + ((afterDisc * item.gst_percent) / 100);
-    }, 0);
-    const discAmount = ((subtotal - itemDiscounts) * overallDiscountPercent) / 100;
-    const gTotal = Math.max(0, (subtotal - itemDiscounts - discAmount) + gstTotal);
-
+    const b = priceBill(cart.map((item) => ({ quantity: item.quantity, unitPrice: item.unit_price, discountPercent: item.discount_percent || 0, gstPercent: item.gst_percent || 0 })), overallDiscountPercent || 0);
     return {
-      cartSubtotal: subtotal,
-      cartItemDiscounts: itemDiscounts,
-      cartGstTotal: gstTotal,
-      overallDiscountAmount: discAmount,
-      grandTotal: gTotal
+      cartSubtotal: b.total_amount,
+      cartItemDiscounts: b.item_discount_amount,
+      cartGstTotal: b.total_gst,
+      overallDiscountAmount: b.bill_discount_amount,
+      grandTotal: b.grand_total
     };
   }, [cart, overallDiscountPercent]);
+
+  // ---- Phase 7 Batch 1: the host's figures (quote) are shown before payment and sent with the sale ----
+  const currentUser = getCurrentUser();
+  const isAdminUser = currentUser?.role === 'ADMIN';
+  const [quote, setQuote] = useState<SaleQuote | null>(null);
+  const [quoteState, setQuoteState] = useState<'idle' | 'loading' | 'ok' | 'error'>('idle');
+  const [quoteError, setQuoteError] = useState<string | null>(null);
+  const [priceNotice, setPriceNotice] = useState<string | null>(null);
+  const [paymentError, setPaymentError] = useState<string | null>(null);
+  const [discountReason, setDiscountReason] = useState<string>('');
+  const [discountGrant, setDiscountGrant] = useState<{ token: string; by: string; max: number } | null>(null);
+  const [authForm, setAuthForm] = useState({ username: '', password: '' });
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+  const quoteSeq = useRef(0);
+
+  /** Apply the host's prices to the cart (only when they differ, so this cannot loop). */
+  const applyServerPrices = (q: SaleQuote) => {
+    const changed = q.lines.some((l, i) => cart[i] && cart[i].product.id === l.product_id && (!sameMoney(cart[i].unit_price, l.unit_price) || (cart[i].gst_percent || 0) !== l.gst_percent));
+    if (!changed) return false;
+    setCart((prev) => prev.map((it, i) => {
+      const l = q.lines[i];
+      if (!l || l.product_id !== it.product.id) return it;
+      return { ...it, unit_price: l.unit_price, gst_percent: l.gst_percent, product: { ...it.product, sale_price: l.unit_price, gst_rate: l.gst_percent }, subtotal: l.subtotal };
+    }));
+    return true;
+  };
+
+  const isStockRefusal = (err: any) => err instanceof ApiError && err.status === 409 && (err.code === 'INSUFFICIENT_STOCK' || err.code === 'EXPIRED_STOCK');
+  /** Phase 6 behaviour: close the payment screen, explain, keep the cart, refresh stock figures. */
+  const showStockRefusal = async (err: ApiError) => {
+    setShowPaymentModal(false);
+    setStockRefusal(`Sale not saved. ${err.message} Adjust the quantity in the cart and try again.`);
+    try {
+      const fresh = await api.getInventory();
+      setProducts(fresh);
+      setCart((prev) => prev.map((it) => ({ ...it, product: fresh.find((p) => p.id === it.product.id) || it.product })));
+    } catch { /* the figures refresh on the next load */ }
+  };
+
+  const refreshQuote = async () => {
+    if (!cart.length) return;
+    const seq = ++quoteSeq.current;
+    setQuoteState('loading');
+    setQuoteError(null);
+    try {
+      const q = await api.quoteSale({
+        items: cart.map((it) => ({ product: { id: it.product.id }, quantity: it.quantity, discount_percent: it.discount_percent || 0 })),
+        discount_percent: overallDiscountPercent || 0,
+        discount_authorization: discountGrant?.token,
+      });
+      if (seq !== quoteSeq.current) return; // a newer request is on its way
+      if (applyServerPrices(q)) setPriceNotice('Prices were updated from the pharmacy server. Please check the total with the customer.');
+      setQuote(q);
+      setQuoteState('ok');
+      if (paymentMethod === 'CASH') setAmountPaidInput((v) => (v === '' || sameMoney(Number(v), grandTotal) ? String(q.grand_total) : v));
+    } catch (err: any) {
+      if (seq !== quoteSeq.current) return;
+      setQuote(null);
+      if (isStockRefusal(err)) { setQuoteState('idle'); await showStockRefusal(err); return; }
+      setQuoteState('error');
+      setQuoteError(err?.message || 'Could not get the bill total from the server.');
+    }
+  };
+
+  useEffect(() => {
+    if (showPaymentModal) void refreshQuote();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showPaymentModal, cart, overallDiscountPercent, discountGrant]);
+
+  const authorizeDiscount = async () => {
+    if (!quote) return;
+    setAuthBusy(true);
+    setAuthError(null);
+    try {
+      const g = await api.authorizeDiscount({ username: authForm.username.trim(), password: authForm.password, max_percent: quote.discount.max_percent_used, reason: discountReason.trim() });
+      setDiscountGrant({ token: g.token, by: g.authorized_by, max: g.max_percent });
+      setAuthForm({ username: '', password: '' });
+    } catch (err: any) {
+      setAuthError(err?.message || 'Authorization failed');
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  const serverTotal = quote ? quote.grand_total : null;
+  const reasonMissing = !!quote?.discount.reason_required && !discountReason.trim() && !discountGrant;
+  const authMissing = !!quote?.discount.authorization_required;
+  const canComplete = quoteState === 'ok' && !!quote && !reasonMissing && !authMissing;
 
   // Handle Quick Add Customer
   const handleQuickAddCustomer = async (e: React.FormEvent) => {
@@ -594,6 +668,12 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
     // Clear Cart & Draft
     setCart([]);
     clearDraftCart();
+    setDiscountGrant(null);
+    setDiscountReason('');
+    setOverallDiscountPercent(0);
+    setQuote(null);
+    setPriceNotice(null);
+    setPaymentError(null);
     setShowPaymentModal(false);
     // Show the confirmed sale in the receipt modal
     setCompletedSale(saleDetail);
@@ -612,16 +692,23 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
       if (err instanceof ApiError && err.outcome === 'UNKNOWN') {
         // The server may or may not have saved it. Keep the cart and the SAME transaction id.
         setUnconfirmed({ txnId: pending.id, message: err.message });
-      } else if (err instanceof ApiError && err.status === 409 && (err.code === 'INSUFFICIENT_STOCK' || err.code === 'EXPIRED_STOCK')) {
+      } else if (err instanceof ApiError && err.code === 'PRICE_MISMATCH') {
+        // Definite refusal: nothing was saved. Show the server's figures and let the cashier confirm again.
+        pendingTxnRef.current = null;
+        if (err.details?.quote) {
+          applyServerPrices(err.details.quote);
+          setQuote(err.details.quote);
+        }
+        setPriceNotice(`Sale not saved. ${err.message}`);
+        void refreshQuote();
+      } else if (err instanceof ApiError && (err.status === 400 || err.status === 403) && err.outcome === 'FAILED' && /DISCOUNT|PAYMENT|INVALID/.test(err.code || '')) {
+        pendingTxnRef.current = null;
+        if (err.code === 'DISCOUNT_AUTH_USED' || err.code === 'DISCOUNT_AUTH_EXPIRED' || err.code === 'DISCOUNT_AUTH_INVALID') setDiscountGrant(null);
+        setPaymentError(`Sale not saved. ${err.message}`);
+      } else if (isStockRefusal(err)) {
         // Definite refusal (Phase 6): nothing was saved. Keep the cart, show why, refresh the stock figures.
         pendingTxnRef.current = null;
-        setShowPaymentModal(false);
-        setStockRefusal(`Sale not saved. ${err.message} Adjust the quantity in the cart and try again.`);
-        try {
-          const fresh = await api.getInventory();
-          setProducts(fresh);
-          setCart((prev) => prev.map((it) => ({ ...it, product: fresh.find((p) => p.id === it.product.id) || it.product })));
-        } catch { /* the figures refresh on the next load */ }
+        await showStockRefusal(err);
       } else {
         // Definite failure: nothing was saved. The next attempt gets a new transaction id.
         pendingTxnRef.current = null;
@@ -640,19 +727,28 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
       return;
     }
 
-    const numericAmountPaid = paymentMethod === 'UDHAR' ? 0 : Number(amountPaidInput || grandTotal);
+    if (!quote || quoteState !== 'ok') {
+      setPaymentError('Wait for the server total before completing the sale.');
+      return;
+    }
+    setPaymentError(null);
+    const numericAmountPaid = paymentMethod === 'UDHAR' ? 0 : Number(amountPaidInput || quote.grand_total);
 
+    // Phase 7: the server prices the sale; grand_total is the figure the cashier showed the customer, and the
+    // server refuses the sale if its own total differs (PRICE_MISMATCH).
     const salePayload = {
       customer_id: selectedCustomer?.id,
       items: cart,
-      total_amount: cartSubtotal,
+      total_amount: quote.total_amount,
       discount_percent: overallDiscountPercent,
-      discount_amount: cartItemDiscounts + overallDiscountAmount,
-      net_amount: cartSubtotal - (cartItemDiscounts + overallDiscountAmount),
-      total_gst: cartGstTotal,
-      grand_total: grandTotal,
+      discount_amount: quote.discount_amount,
+      net_amount: quote.net_amount,
+      total_gst: quote.total_gst,
+      grand_total: quote.grand_total,
       payment_method: paymentMethod,
-      amount_paid: numericAmountPaid
+      amount_paid: numericAmountPaid,
+      discount_reason: discountReason.trim() || undefined,
+      discount_authorization: discountGrant?.token
     };
     pendingTxnRef.current = { id: newTxnId(), payload: salePayload };
     await submitPendingSale();
@@ -1181,7 +1277,8 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
                   min="0"
                   max="100"
                   value={overallDiscountPercent || ''}
-                  onChange={(e) => setOverallDiscountPercent(Number(e.target.value) || 0)}
+                  onChange={(e) => setOverallDiscountPercent(Math.min(100, Math.max(0, Number(e.target.value) || 0)))}
+                  title={isAdminUser ? 'Discounts need a reason (recorded in the audit log)' : 'Discounts above the staff limit need an administrator'}
                   className="w-14 bg-slate-800 text-right text-emerald-300 font-bold px-1 py-0.5 rounded border border-slate-700 focus:outline-none focus:border-emerald-500 text-xs"
                   placeholder="0"
                 />
@@ -1248,7 +1345,7 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
             
             <div className="flex items-center justify-between pb-3 border-b border-slate-800">
               <h3 className="font-bold text-lg text-white">Payment & Billing Options</h3>
-              <button onClick={() => setShowPaymentModal(false)} className="text-slate-400 hover:text-white">
+              <button onClick={() => { setShowPaymentModal(false); setPriceNotice(null); setPaymentError(null); }} className="text-slate-400 hover:text-white" aria-label="Close payment">
                 <X className="w-5 h-5" />
               </button>
             </div>
@@ -1321,20 +1418,43 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
                 </div>
               )}
 
-              {/* Udhar Calculation Preview */}
-              <div className="bg-slate-800/80 p-3 rounded-xl border border-slate-700 space-y-1.5">
+              {/* Phase 7: totals calculated by the pharmacy server */}
+              <div className="bg-slate-800/80 p-3 rounded-xl border border-slate-700 space-y-1.5" data-testid="server-totals">
+                <div className="flex justify-between items-center text-[10px] uppercase tracking-wide text-slate-400">
+                  <span>Calculated by the pharmacy server</span>
+                  {quoteState === 'loading' && <span className="flex items-center gap-1 text-slate-300"><RefreshCw className="w-3 h-3 animate-spin" /> checking...</span>}
+                  {quoteState === 'ok' && <span className="text-emerald-400 font-bold">confirmed</span>}
+                </div>
+                {quoteState === 'error' && (
+                  <div role="alert" className="text-rose-300 bg-rose-950/60 border border-rose-800 rounded p-2 flex justify-between items-center gap-2">
+                    <span>{quoteError}</span>
+                    <button type="button" onClick={() => void refreshQuote()} className="px-2 py-1 rounded bg-slate-700 text-white font-bold">Retry</button>
+                  </div>
+                )}
+                {quote && (
+                  <>
+                    <div className="flex justify-between text-slate-300"><span>Subtotal:</span><span>Rs. {quote.total_amount.toFixed(2)}</span></div>
+                    {quote.discount_amount > 0 && <div className="flex justify-between text-amber-300"><span>Discount:</span><span>- Rs. {quote.discount_amount.toFixed(2)}</span></div>}
+                    {quote.total_gst > 0 && <div className="flex justify-between text-slate-300"><span>GST:</span><span>+ Rs. {quote.total_gst.toFixed(2)}</span></div>}
+                  </>
+                )}
                 <div className="flex justify-between">
                   <span>Bill Grand Total:</span>
-                  <span className="font-bold text-white">Rs. {(Number(grandTotal) || 0).toFixed(2)}</span>
+                  <span className="font-bold text-white" data-testid="server-grand-total">{serverTotal === null ? '...' : `Rs. ${serverTotal.toFixed(2)}`}</span>
                 </div>
                 <div className="flex justify-between text-emerald-400">
-                  <span>Amount Paid:</span>
+                  <span>{paymentMethod === 'CASH' ? 'Cash Received:' : 'Amount Paid:'}</span>
                   <span>Rs. {Number(amountPaidInput || 0).toFixed(2)}</span>
                 </div>
-                <div className="flex justify-between text-rose-400 font-bold border-t pt-1 border-slate-700">
-                  <span>Remaining Udhar (ادھار):</span>
-                  <span>Rs. {Math.max(0, grandTotal - Number(amountPaidInput || 0)).toFixed(2)}</span>
-                </div>
+                {paymentMethod === 'CASH' && serverTotal !== null && Number(amountPaidInput || 0) > serverTotal && (
+                  <div className="flex justify-between text-sky-300 font-bold"><span>Change to return:</span><span>Rs. {(Number(amountPaidInput) - serverTotal).toFixed(2)}</span></div>
+                )}
+                {paymentMethod !== 'CASH' && (
+                  <div className="flex justify-between text-rose-400 font-bold border-t pt-1 border-slate-700">
+                    <span>Remaining Udhar (ادھار):</span>
+                    <span>Rs. {Math.max(0, (serverTotal ?? grandTotal) - Number(amountPaidInput || 0)).toFixed(2)}</span>
+                  </div>
+                )}
 
                 {selectedCustomer && (
                   <div className="text-[11px] text-slate-400 pt-1 border-t border-slate-700/50">
@@ -1342,6 +1462,48 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
                   </div>
                 )}
               </div>
+
+              {priceNotice && (
+                <div role="alert" data-testid="price-notice" className="p-2.5 rounded-xl bg-amber-950/70 border border-amber-700 text-amber-200">{priceNotice}</div>
+              )}
+
+              {quote?.discount.reason_required && (
+                <div className="p-2.5 rounded-xl bg-slate-800/60 border border-amber-800/70 space-y-2" data-testid="discount-approval">
+                  <div className="font-semibold text-amber-300">
+                    Discount {quote.discount.max_percent_used}% is above the staff limit ({quote.discount.staff_limit_percent}%).
+                  </div>
+                  <input
+                    type="text"
+                    aria-label="Discount reason"
+                    placeholder="Reason for the discount (required)"
+                    value={discountReason}
+                    disabled={!!discountGrant}
+                    onChange={(e) => setDiscountReason(e.target.value)}
+                    className="w-full bg-slate-900 text-white p-2 rounded-lg border border-slate-700 focus:outline-none focus:border-emerald-500"
+                  />
+                  {discountGrant ? (
+                    <div className="text-emerald-400 font-semibold">Authorized by {discountGrant.by} (up to {discountGrant.max}%).</div>
+                  ) : quote.discount.authorization_required ? (
+                    <div className="space-y-2">
+                      <div className="text-slate-300">An administrator must authorize this discount:</div>
+                      <div className="grid grid-cols-2 gap-2">
+                        <input type="text" aria-label="Administrator username" placeholder="Administrator username" value={authForm.username} onChange={(e) => setAuthForm({ ...authForm, username: e.target.value })} className="bg-slate-900 text-white p-2 rounded-lg border border-slate-700" autoComplete="off" />
+                        <input type="password" aria-label="Administrator password" placeholder="Password" value={authForm.password} onChange={(e) => setAuthForm({ ...authForm, password: e.target.value })} className="bg-slate-900 text-white p-2 rounded-lg border border-slate-700" autoComplete="off" />
+                      </div>
+                      {authError && <div role="alert" className="text-rose-300">{authError}</div>}
+                      <button type="button" disabled={authBusy || !authForm.username || !authForm.password || !discountReason.trim()} onClick={() => void authorizeDiscount()} className="w-full py-2 rounded-lg bg-amber-600 hover:bg-amber-500 text-white font-bold disabled:opacity-50">
+                        {authBusy ? 'Checking...' : 'Authorize discount'}
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="text-slate-400">{isAdminUser ? 'As an administrator you can give this discount; the reason is recorded in the audit log.' : ''}</div>
+                  )}
+                </div>
+              )}
+
+              {paymentError && (
+                <div role="alert" data-testid="payment-error" className="p-2.5 rounded-xl bg-rose-950/70 border border-rose-800 text-rose-200">{paymentError}</div>
+              )}
 
               {/* Print on Save Quick Checkbox */}
               <div className="flex items-center justify-between p-2.5 bg-slate-800/60 rounded-xl border border-slate-700/80">
@@ -1359,9 +1521,9 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
               </div>
 
               <button
-                disabled={submittingSale}
+                disabled={submittingSale || !canComplete}
                 onClick={handleProcessSale}
-                className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 rounded-xl flex items-center justify-center space-x-2 transition-all shadow-lg shadow-emerald-950/60"
+                className="w-full bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-3 rounded-xl flex items-center justify-center space-x-2 transition-all shadow-lg shadow-emerald-950/60 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {submittingSale ? (
                   <>

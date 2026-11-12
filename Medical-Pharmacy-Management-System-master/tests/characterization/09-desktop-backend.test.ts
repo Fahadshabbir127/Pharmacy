@@ -76,7 +76,7 @@ describe('health and idempotent sales (C3)', () => {
   it('/api/health is public and reveals no secrets', async () => {
     const r = await new Api().get('/health');
     expect(r.status).toBe(200);
-    expect(r.body).toMatchObject({ status: 'ok', apiProtocol: 2, mode: 'legacy', db: { ok: true } });
+    expect(r.body).toMatchObject({ status: 'ok', apiProtocol: 3, mode: 'legacy', db: { ok: true } });
     expect(Object.keys(r.body).sort()).toEqual(['apiProtocol', 'appVersion', 'db', 'mode', 'serverTime', 'status']);
   });
 

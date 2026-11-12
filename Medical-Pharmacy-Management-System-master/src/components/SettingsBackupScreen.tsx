@@ -399,6 +399,36 @@ export const SettingsBackupScreen: React.FC<SettingsBackupScreenProps> = ({ curr
             </form>
           </div>
 
+          {/* Phase 7: POS discount limits (store-wide, on the host) */}
+          {currentUser?.role === 'ADMIN' && (
+            <div className="pt-4 border-t border-slate-800 space-y-4">
+              <h3 className="font-bold text-white text-sm pb-1">POS Discount Limits</h3>
+              <p className="text-[11px] text-slate-400">
+                Staff can give discounts up to the staff limit. Anything higher needs an administrator to authorize it at the counter, with a reason. No one can go above the administrator limit. Every discount above the staff limit is recorded in the audit log.
+              </p>
+              <form onSubmit={handleSaveSettings} className="space-y-3 text-xs">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <label className="block text-slate-300 font-semibold">Staff maximum discount (%):
+                    <input type="number" min="0" max="100" step="0.5" aria-label="Staff maximum discount"
+                      value={(settings as any).pos_staff_max_discount_percent ?? '0'}
+                      onChange={(e) => setSettings({ ...settings, pos_staff_max_discount_percent: e.target.value } as any)}
+                      className="mt-1 w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500" />
+                  </label>
+                  <label className="block text-slate-300 font-semibold">Administrator maximum discount (%):
+                    <input type="number" min="0" max="100" step="0.5" aria-label="Administrator maximum discount"
+                      value={(settings as any).pos_admin_max_discount_percent ?? '100'}
+                      onChange={(e) => setSettings({ ...settings, pos_admin_max_discount_percent: e.target.value } as any)}
+                      className="mt-1 w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500" />
+                  </label>
+                </div>
+                <button type="submit" disabled={saving} className="bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2.5 px-5 rounded-xl flex items-center space-x-2 text-xs shadow-lg shadow-emerald-950/50">
+                  {saving ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Save className="w-4 h-4" />}
+                  <span>Save Discount Limits</span>
+                </button>
+              </form>
+            </div>
+          )}
+
           {/* Prewritten Messaging Templates - Only for Super Admin */}
           {currentUser?.role === 'SUPER_ADMIN' && (
             <div className="pt-4 border-t border-slate-800 space-y-4">

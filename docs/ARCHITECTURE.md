@@ -246,6 +246,13 @@ sales_returns / sales_return_items (sale_item_id, batch_id, qty, restock flag, r
 | Voids | Soft-void (`status`, `voided_at`, `voided_by`, `void_reason`) that restores stock to the original batches and reverses the ledger; reports exclude voided sales |
 | Audit | Every financial, stock, security, backup and config action is written to `audit_logs` in the same transaction as the change |
 
+### As built in Phase 7, Batch 1 (server-calculated POS)
+- `shared/pricing.ts` is the only pricing formula; the server uses it to charge, the POS uses it only for display. Per line: gross, line discount and GST each rounded to 2 decimals; bill discount after line discounts and not reducing GST (legacy rule kept, E3).
+- `POST /api/sales/quote` returns the host's figures (lines, totals, discount status) and checks stock; nothing is written. The payment screen shows these figures and cannot complete until they are confirmed.
+- `POST /api/sales` re-validates everything in `prepareSale()` before the first write: products (price and GST rate from the host, E1), quantities, discounts 0–100 %, discount limits, payment method and amounts, FEFO stock plan. A client `grand_total` that differs from the server's by half a paisa or more → 409 `PRICE_MISMATCH` with the server figures. CASH must cover the bill (change returned); PARTIAL cannot exceed it.
+- Discounts (E2): settings `pos_staff_max_discount_percent` (default 0) and `pos_admin_max_discount_percent` (default 100), ADMIN-only, validated, changes audited. Above the staff limit: ADMIN sellers give a reason; STAFF need `POST /api/sales/discount-authorization` (an administrator's username and password entered at the counter, a maximum % and a reason) which returns a single-use grant bound to that cashier, valid 10 minutes, held in host memory only (`server/pos/discountAuth.ts`). 5 wrong passwords lock it for 10 minutes. Every such sale writes a `DISCOUNT_OVERRIDE` audit row (cashier, authorizer, percentages, amount, reason).
+- `API_PROTOCOL` = 3.
+
 ## 12. Backups
 
 - **Engine:** better-sqlite3 `backup()` (online, consistent while writes continue) writes to a temp file. The file is then encrypted (AES-256-GCM, scrypt N=2^15 with a random 16-byte salt per file, header with format version and app version) and atomically renamed.

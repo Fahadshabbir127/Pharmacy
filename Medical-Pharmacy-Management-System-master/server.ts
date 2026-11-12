@@ -24,6 +24,8 @@ import { today, addDays, isExpired, batchStatus, parseExpiryInput, parseMfgInput
 import { planFefo, weightedCost, fefoOrder, LineRequest } from './server/inventory/fefo';
 import { createBatch, takeFromBatch, addToBatch, batchesFor, inventoryInvariantIssues, StockConflictError } from './server/inventory/batches';
 import { normalizeExpiry } from './server/inventory/expiry';
+import { priceBill, sameMoney, validPercent, round2, PricedBill } from './shared/pricing';
+import { DiscountAuthorizations, discountLimits } from './server/pos/discountAuth';
 
 const PORT = Number(process.env.PHARMACY_PORT) || 3000;
 // C8: per-installation secret (set in startServer). The original public fallback secret is gone.
@@ -2002,21 +2004,179 @@ async function startServer() {
   }));
 
   // 5. Billing & Sales API
-  app.post('/api/sales', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
-    const userTenantId = req.user?.role === 'SUPER_ADMIN' && req.body.tenant_id ? Number(req.body.tenant_id) : (req.user?.tenant_id || 1);
-    const {
-      customer_id,
-      items,
-      total_amount,
-      discount_percent,
-      discount_amount,
-      net_amount,
-      total_gst,
-      grand_total,
-      payment_method, // 'CASH', 'PARTIAL', 'UDHAR'
-      amount_paid
-    } = req.body;
+  // Phase 7 Batch 1: the host calculates every price, discount, tax and total (E1-E3). Client figures are
+  // never stored; a client total that differs from the server's is refused (409 PRICE_MISMATCH) so the
+  // cashier sees the real amount before taking money.
+  const discountAuth = new DiscountAuthorizations();
+  const settingValue = (key: string) => queryOne<{ value: string }>("SELECT value FROM settings WHERE key = ?", [key])?.value;
+  const PAYMENT_METHODS = ['CASH', 'PARTIAL', 'UDHAR'];
 
+  type SaleFail = { ok: false; status: number; body: any };
+  type SalePrep = {
+    ok: true; tenantId: number; method: string; customerId: number | null;
+    lineRequests: LineRequest[]; lineProducts: any[]; plan: any; bill: PricedBill; quote: any;
+    paid: number; due: number; tendered: number; change: number;
+    discount: { maxUsed: number; aboveStaff: boolean; reason: string; token: string | null; grant: any; limits: { staff: number; admin: number } };
+  };
+
+  function quoteBody(bill: PricedBill, lineProducts: any[], d: { maxUsed: number; limits: { staff: number; admin: number }; authorized: boolean; isAdmin: boolean }) {
+    return {
+      lines: bill.lines.map((l, i) => ({
+        product_id: lineProducts[i].id, product_name: lineProducts[i].name, unit: lineProducts[i].unit,
+        quantity: l.quantity, unit_price: l.unit_price, discount_percent: l.discount_percent, gross: l.gross,
+        discount_amount: l.discount_amount, gst_percent: l.gst_percent, gst_amount: l.gst_amount, subtotal: l.subtotal,
+      })),
+      total_amount: bill.total_amount, item_discount_amount: bill.item_discount_amount,
+      bill_discount_percent: bill.bill_discount_percent, bill_discount_amount: bill.bill_discount_amount,
+      discount_amount: bill.discount_amount, net_amount: bill.net_amount, total_gst: bill.total_gst, grand_total: bill.grand_total,
+      discount: {
+        max_percent_used: d.maxUsed, staff_limit_percent: d.limits.staff, admin_limit_percent: d.limits.admin,
+        authorization_required: d.maxUsed > d.limits.staff && !d.isAdmin && !d.authorized,
+        reason_required: d.maxUsed > d.limits.staff,
+      },
+    };
+  }
+
+  /** Validate a sale request and price it on the server. Writes NOTHING (a 4xx answer commits in tx()). */
+  function prepareSale(req: AuthRequest, opts: { forQuote: boolean }): SaleFail | SalePrep {
+    const fail = (status: number, body: any): SaleFail => ({ ok: false, status, body });
+    const b = req.body || {};
+    const tenantId = req.user?.role === 'SUPER_ADMIN' && b.tenant_id ? Number(b.tenant_id) : (req.user?.tenant_id || 1);
+    const items = b.items;
+    if (!items || !Array.isArray(items) || items.length === 0) return fail(400, { error: 'Cart must contain at least one item' });
+    if (items.length > 500) return fail(400, { error: 'Too many lines in one sale (maximum 500).' });
+
+    const method = b.payment_method === undefined || b.payment_method === null || b.payment_method === '' ? 'CASH' : String(b.payment_method);
+    if (!PAYMENT_METHODS.includes(method)) return fail(400, { code: 'INVALID_PAYMENT_METHOD', error: `Payment method must be one of ${PAYMENT_METHODS.join(', ')}.` });
+    const customerId = b.customer_id ? Number(b.customer_id) : null;
+    if ((method === 'PARTIAL' || method === 'UDHAR') && !customerId) return fail(400, { error: 'Customer selection is required for Udhar/Partial payment' });
+
+    // lines: product, quantity and discount; the PRICE and GST RATE come from the host database (E1)
+    const lineRequests: LineRequest[] = [];
+    const lineProducts: any[] = [];
+    const lineDiscounts: number[] = [];
+    for (const [i, item] of items.entries()) {
+      const qty = Number(item?.quantity);
+      if (!Number.isInteger(qty) || qty <= 0) return fail(400, { code: 'INVALID_QUANTITY', error: `Line ${i + 1}: quantity must be a whole number greater than zero.` });
+      const product = item?.product?.id ? queryOne<any>("SELECT id, name, unit, tenant_id, archived_at, sale_price, gst_rate FROM products WHERE id = ?", [Number(item.product.id)]) : null;
+      if (!product) return fail(400, { code: 'PRODUCT_NOT_FOUND', error: `Line ${i + 1}: this product does not exist.` });
+      if (req.user?.role !== 'SUPER_ADMIN' && product.tenant_id && product.tenant_id !== tenantId) return fail(403, { error: `Line ${i + 1}: product belongs to another store.` });
+      if (product.archived_at) return fail(400, { code: 'PRODUCT_ARCHIVED', error: `"${product.name}" has been removed from the product list and cannot be sold.` });
+      const price = Number(product.sale_price);
+      if (!Number.isFinite(price) || price < 0) return fail(400, { code: 'INVALID_PRICE', error: `"${product.name}" has no valid sale price on the server. Correct the product before selling it.` });
+      const gst = Number(product.gst_rate || 0);
+      if (!Number.isFinite(gst) || gst < 0 || gst > 100) return fail(400, { code: 'INVALID_TAX_RATE', error: `"${product.name}" has an invalid GST rate on the server. Correct the product before selling it.` });
+      const dp = item.discount_percent === undefined || item.discount_percent === null || item.discount_percent === '' ? 0 : Number(item.discount_percent);
+      if (!validPercent(dp)) return fail(400, { code: 'INVALID_DISCOUNT', error: `Line ${i + 1}: discount must be between 0 and 100%.` });
+      lineRequests.push({ line: i, productId: product.id, quantity: qty });
+      lineProducts.push(product);
+      lineDiscounts.push(dp);
+    }
+    const billDisc = b.discount_percent === undefined || b.discount_percent === null || b.discount_percent === '' ? 0 : Number(b.discount_percent);
+    if (!validPercent(billDisc)) return fail(400, { code: 'INVALID_DISCOUNT', error: 'Bill discount must be between 0 and 100%.' });
+
+    // discount limits (E2)
+    const limits = discountLimits(settingValue);
+    const maxUsed = Math.max(billDisc, ...lineDiscounts);
+    const isAdmin = req.user?.role === 'ADMIN';
+    if (maxUsed > limits.admin) return fail(403, { code: 'DISCOUNT_LIMIT', error: `The store allows at most ${limits.admin}% discount.`, max_percent: limits.admin });
+    const aboveStaff = maxUsed > limits.staff;
+    let token: string | null = null;
+    let grant: any = null;
+    if (aboveStaff && !isAdmin) {
+      if (b.discount_authorization) {
+        const c = discountAuth.check(b.discount_authorization, req.user!.id, tenantId, maxUsed);
+        if (c.ok === false) return fail(403, { code: c.code, error: c.error });
+        token = String(b.discount_authorization);
+        grant = c.grant;
+      } else if (!opts.forQuote) {
+        return fail(403, { code: 'DISCOUNT_AUTH_REQUIRED', error: `Discounts above ${limits.staff}% need an administrator's authorization.`, staff_limit_percent: limits.staff });
+      }
+    }
+    const reason = sanitizeInput(b.discount_reason || '') || grant?.reason || '';
+    if (aboveStaff && !reason && !opts.forQuote) return fail(400, { code: 'DISCOUNT_REASON_REQUIRED', error: 'A reason is required for this discount.' });
+
+    // server pricing (E1-E3)
+    const bill = priceBill(lineProducts.map((p, i) => ({ quantity: lineRequests[i].quantity, unitPrice: Number(p.sale_price), discountPercent: lineDiscounts[i], gstPercent: Number(p.gst_rate || 0) })), billDisc);
+    const quote = quoteBody(bill, lineProducts, { maxUsed, limits, authorized: !!grant, isAdmin });
+    if (!opts.forQuote && b.grand_total !== undefined && b.grand_total !== null && b.grand_total !== '') {
+      const clientTotal = Number(b.grand_total);
+      if (!Number.isFinite(clientTotal) || !sameMoney(clientTotal, bill.grand_total)) {
+        return fail(409, { code: 'PRICE_MISMATCH', error: `The bill total changed: the server calculates Rs. ${bill.grand_total.toFixed(2)}, your screen showed Rs. ${Number.isFinite(clientTotal) ? clientTotal.toFixed(2) : String(b.grand_total)}. Prices may have been updated. Check the bill and try again.`, server_grand_total: bill.grand_total, client_grand_total: b.grand_total, quote });
+      }
+    }
+
+    // stock (Phase 6 FEFO plan, unchanged)
+    const plan = planFefo(lineRequests, batchesFor(db, lineRequests.map((l) => l.productId)), today());
+    if (!plan.ok) {
+      const sh = (plan as Extract<typeof plan, { ok: false }>).shortage;
+      const name = lineProducts.find((p) => p.id === sh.productId)?.name || `#${sh.productId}`;
+      const why = sh.code === 'EXPIRED_STOCK'
+        ? `All remaining stock of "${name}" has expired (${sh.expired} unit(s)) and cannot be sold.`
+        : `Not enough stock of "${name}": ${sh.requested} requested, ${sh.sellable} available to sell${sh.expired ? ` (${sh.expired} more unit(s) are expired and cannot be sold)` : ''}.`;
+      return fail(409, { code: sh.code, error: why, product_id: sh.productId, product_name: name, requested: sh.requested, available: sh.sellable, expired: sh.expired });
+    }
+
+    // payment amounts (validated against the SERVER total)
+    let paid = 0, tendered = 0, change = 0;
+    if (!opts.forQuote) {
+      const raw = b.amount_paid;
+      const given = raw === undefined || raw === null || raw === '' ? null : Number(raw);
+      if (given !== null && (!Number.isFinite(given) || given < 0)) return fail(400, { code: 'INVALID_PAYMENT', error: 'Amount paid must be zero or more.' });
+      if (method === 'CASH') {
+        tendered = given === null ? bill.grand_total : round2(given);
+        if (tendered + 0.005 < bill.grand_total) return fail(400, { code: 'INSUFFICIENT_PAYMENT', error: `Cash received (Rs. ${tendered.toFixed(2)}) is less than the bill (Rs. ${bill.grand_total.toFixed(2)}). Use PARTIAL with a customer for part payment.` });
+        paid = bill.grand_total;
+        change = round2(tendered - bill.grand_total);
+      } else if (method === 'PARTIAL') {
+        paid = given === null ? 0 : round2(given);
+        if (paid > bill.grand_total + 0.005) return fail(400, { code: 'OVERPAYMENT', error: `Amount paid (Rs. ${paid.toFixed(2)}) is more than the bill (Rs. ${bill.grand_total.toFixed(2)}).` });
+        tendered = paid;
+      }
+    }
+    const due = round2(bill.grand_total - paid);
+    return { ok: true, tenantId, method, customerId, lineRequests, lineProducts, plan, bill, quote, paid, due, tendered, change, discount: { maxUsed, aboveStaff, reason, token, grant, limits } };
+  }
+
+  /** Price preview for the payment screen: the same validation and calculation as a sale, nothing written. */
+  app.post('/api/sales/quote', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+    const prep = prepareSale(req, { forQuote: true });
+    if (prep.ok === false) return res.status(prep.status).json(prep.body);
+    res.json(prep.quote);
+  });
+
+  /** An ADMIN authorizes a discount above the staff limit at the cashier's counter (E2). */
+  const discountAuthFails = new Map<number, { n: number; reset: number }>();
+  app.post('/api/sales/discount-authorization', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
+    const cashierId = req.user!.id;
+    const tenantId = req.user?.tenant_id || 1;
+    const now = Date.now();
+    const f = discountAuthFails.get(cashierId);
+    if (f && f.reset > now && f.n >= 5) return res.status(429).json({ error: 'Too many failed authorization attempts. Wait 10 minutes.' });
+    const pct = Number(req.body?.max_percent);
+    if (!validPercent(pct) || pct <= 0) return res.status(400).json({ code: 'INVALID_DISCOUNT', error: 'Enter the maximum discount % being authorized (1-100).' });
+    const reason = sanitizeInput(req.body?.reason || '');
+    if (!reason) return res.status(400).json({ code: 'DISCOUNT_REASON_REQUIRED', error: 'A reason is required for this discount.' });
+    const limits = discountLimits(settingValue);
+    if (pct > limits.admin) return res.status(403).json({ code: 'DISCOUNT_LIMIT', error: `The store allows at most ${limits.admin}% discount.`, max_percent: limits.admin });
+    const username = String(req.body?.username || '').trim();
+    const admin = username ? queryOne<any>("SELECT id, username, full_name, password_hash, role, status, tenant_id FROM users WHERE username = ? AND archived_at IS NULL", [username]) : null;
+    const valid = !!admin && admin.role === 'ADMIN' && (!admin.status || admin.status === 'APPROVED') && (admin.tenant_id || 1) === tenantId
+      && typeof req.body?.password === 'string' && bcrypt.compareSync(req.body.password, admin.password_hash);
+    if (!valid) {
+      const e = f && f.reset > now ? f : { n: 0, reset: now + 10 * 60_000 };
+      e.n++;
+      discountAuthFails.set(cashierId, e);
+      logAudit(cashierId, req.user?.fullName, 'DISCOUNT_AUTH_FAILED', `Failed discount authorization attempt (${pct}%) with administrator name "${username.slice(0, 50)}"`, 'USER', cashierId, req);
+      return res.status(401).json({ code: 'DISCOUNT_AUTH_FAILED', error: 'Administrator name or password is wrong, or that account is not an administrator of this store.' });
+    }
+    discountAuthFails.delete(cashierId);
+    const issued = discountAuth.issue({ cashierUserId: cashierId, authorizedByUserId: admin.id, authorizedByName: admin.full_name || admin.username, tenantId, maxPercent: pct, reason });
+    logAudit(admin.id, admin.full_name || admin.username, 'DISCOUNT_AUTH_GRANTED', `Authorized up to ${pct}% discount for cashier ${req.user?.fullName || req.user?.username || '#' + cashierId} (single use, 10 minutes). Reason: ${reason}`, 'USER', cashierId, req);
+    res.json({ token: issued.token, expires_at: issued.expiresAt, max_percent: pct, authorized_by: admin.full_name || admin.username, reason });
+  }));
+
+  app.post('/api/sales', authenticateToken, requireRoles(['ADMIN', 'STAFF']), tx((req: AuthRequest, res) => {
     // C3 idempotency: the POS sends one client_txn_id per checkout and re-sends the SAME id on retry.
     // A retry of a committed sale returns the original result instead of recording the sale twice.
     const clientTxnId = req.body.client_txn_id === undefined ? null : String(req.body.client_txn_id);
@@ -2028,43 +2188,18 @@ async function startServer() {
       if (prior) return res.json({ ...JSON.parse(prior.response), replayed: true });
     }
 
-    if (!items || !Array.isArray(items) || items.length === 0) {
-      return res.status(400).json({ error: 'Cart must contain at least one item' });
-    }
-
-    if ((payment_method === 'PARTIAL' || payment_method === 'UDHAR') && !customer_id) {
-      return res.status(400).json({ error: 'Customer selection is required for Udhar/Partial payment' });
-    }
-
-    // Phase 6: every line is validated and the FEFO plan is computed BEFORE anything is written.
-    // (4xx answers commit in tx(), so nothing may be written before these checks.)
-    const lineRequests: LineRequest[] = [];
-    const lineProducts: any[] = [];
-    for (const [i, item] of items.entries()) {
-      const qty = Number(item?.quantity);
-      if (!Number.isInteger(qty) || qty <= 0) return res.status(400).json({ code: 'INVALID_QUANTITY', error: `Line ${i + 1}: quantity must be a whole number greater than zero.` });
-      const product = item?.product?.id ? queryOne<any>("SELECT id, name, unit, tenant_id, archived_at FROM products WHERE id = ?", [Number(item.product.id)]) : null;
-      if (!product) return res.status(400).json({ code: 'PRODUCT_NOT_FOUND', error: `Line ${i + 1}: this product does not exist.` });
-      if (req.user?.role !== 'SUPER_ADMIN' && product.tenant_id && product.tenant_id !== userTenantId) return res.status(403).json({ error: `Line ${i + 1}: product belongs to another store.` });
-      if (product.archived_at) return res.status(400).json({ code: 'PRODUCT_ARCHIVED', error: `"${product.name}" has been removed from the product list and cannot be sold.` });
-      lineRequests.push({ line: i, productId: product.id, quantity: qty });
-      lineProducts.push(product);
-    }
-    const plan = planFefo(lineRequests, batchesFor(db, lineRequests.map((l) => l.productId)), today());
-    if (!plan.ok) {
-      const sh = (plan as Extract<typeof plan, { ok: false }>).shortage;
-      const name = lineProducts.find((p) => p.id === sh.productId)?.name || `#${sh.productId}`;
-      const why = sh.code === 'EXPIRED_STOCK'
-        ? `All remaining stock of "${name}" has expired (${sh.expired} unit(s)) and cannot be sold.`
-        : `Not enough stock of "${name}": ${sh.requested} requested, ${sh.sellable} available to sell${sh.expired ? ` (${sh.expired} more unit(s) are expired and cannot be sold)` : ''}.`;
-      return res.status(409).json({ code: sh.code, error: why, product_id: sh.productId, product_name: name, requested: sh.requested, available: sh.sellable, expired: sh.expired });
-    }
+    // every check (lines, prices, discounts, stock, payment) runs BEFORE anything is written
+    const prep = prepareSale(req, { forQuote: false });
+    if (prep.ok === false) return res.status(prep.status).json(prep.body);
+    const { tenantId: userTenantId, method: payment_method, customerId: customer_id, lineRequests, lineProducts, plan, bill } = prep;
+    const grand_total = bill.grand_total;
+    if (prep.discount.token) discountAuth.consume(prep.discount.token); // single use (a rolled-back sale also uses it up)
 
     const invCountRes = queryOne<any>("SELECT COUNT(*) as cnt FROM sales_headers WHERE tenant_id = ?", [userTenantId]);
     const nextInvNum = `INV-${userTenantId}-${1001 + (invCountRes ? invCountRes.cnt : 0)}`;
 
-    const paidAmt = payment_method === 'UDHAR' ? 0 : Number(amount_paid || 0);
-    const dueAmt = grand_total - paidAmt;
+    const paidAmt = prep.paid;
+    const dueAmt = prep.due;
     let paymentStatus: 'PAID' | 'PARTIAL' | 'UNPAID' = 'PAID';
     if (dueAmt > 0 && paidAmt > 0) paymentStatus = 'PARTIAL';
     else if (dueAmt > 0 && paidAmt === 0) paymentStatus = 'UNPAID';
@@ -2092,12 +2227,12 @@ async function startServer() {
       `, [
         nextInvNum,
         customer_id ? Number(customer_id) : null,
-        Number(total_amount),
-        Number(discount_percent || 0),
-        Number(discount_amount || 0),
-        Number(net_amount),
-        Number(total_gst || 0),
-        Number(grand_total),
+        bill.total_amount,
+        bill.bill_discount_percent,
+        bill.discount_amount,
+        bill.net_amount,
+        bill.total_gst,
+        bill.grand_total,
         payment_method,
         paidAmt,
         dueAmt,
@@ -2111,8 +2246,9 @@ async function startServer() {
       // Process each cart item: record the line, then take the units from the planned batches (FEFO).
       // Price charged is the POS price as before (D2); cost is the real batch cost (D6).
       const allocationSummary: any[] = [];
-      for (const [i, item] of items.entries()) {
+      for (const [i] of lineRequests.entries()) {
         const allocs = plan.lines.get(i)!;
+        const priced = bill.lines[i];
         const product = lineProducts[i];
         const batchNumbers = [...new Set(allocs.map((a) => a.batchNumber).filter(Boolean))].join(', ');
         const earliestExpiry = allocs.map((a) => a.expiryDate).filter(Boolean).sort()[0] || '';
@@ -2124,28 +2260,30 @@ async function startServer() {
           saleId,
           product.id,
           lineRequests[i].quantity,
-          product.unit || item.product?.unit || 'Pack',
-          item.unit_price,
+          product.unit || 'Pack',
+          priced.unit_price,
           weightedCost(allocs),
-          item.discount_percent || 0,
-          item.discount_amount || 0,
-          item.gst_amount || 0,
+          priced.discount_percent,
+          priced.discount_amount,
+          priced.gst_amount,
           batchNumbers,
           earliestExpiry,
-          item.subtotal
+          priced.subtotal
         ]).lastInsertRowid;
 
         for (const a of allocs) {
           takeFromBatch(db, a.batchId, a.quantity); // guarded: never below 0, else the whole sale rolls back
           db.run("INSERT INTO sale_item_batches (sale_item_id, batch_id, quantity, unit_cost) VALUES (?, ?, ?, ?)", [saleItemId, a.batchId, a.quantity, a.unitCost]);
         }
+        // Test hook (tests only; unset in normal use): fail after the first line was fully written, to prove the rollback
+        if (process.env.PHARMACY_TEST_THROW === 'sale-after-line-1' && i === 0) throw new Error('test: injected failure after line 1');
         allocationSummary.push({ line: i, product_id: product.id, batches: allocs.map((a) => ({ batch_id: a.batchId, batch_number: a.batchNumber, expiry_date: a.expiryDate, quantity: a.quantity })) });
       }
 
       // Update Customer Ledger if customer is selected
       if (customer_id && customerObj) {
         const ledgerRef = `Invoice #${nextInvNum}`;
-        const itemSummaryList = items.map((it: any) => `${it.product.name} (${it.quantity} ${it.product.unit || 'Pack'} x Rs.${it.unit_price} = Rs.${it.subtotal})`).join(', ');
+        const itemSummaryList = bill.lines.map((l, i) => `${lineProducts[i].name} (${l.quantity} ${lineProducts[i].unit || 'Pack'} x Rs.${l.unit_price} = Rs.${l.subtotal})`).join(', ');
 
         db.run(`
           INSERT INTO customer_ledger (customer_id, type, reference, debit, credit, balance_after, notes, sale_id)
@@ -2184,6 +2322,13 @@ async function startServer() {
       }
 
       logAudit(req.user?.id, req.user?.fullName, 'CREATE_SALE', `Completed sale invoice #${nextInvNum} (Grand Total: Rs. ${grand_total})`, 'SALE', saleId, req);
+      if (prep.discount.aboveStaff) {
+        const d = prep.discount;
+        const pcts = [`bill ${bill.bill_discount_percent}%`, ...bill.lines.map((l, i) => (l.discount_percent ? `${lineProducts[i].name} ${l.discount_percent}%` : '')).filter(Boolean)].join(', ');
+        logAudit(req.user?.id, req.user?.fullName, 'DISCOUNT_OVERRIDE',
+          `Invoice #${nextInvNum}: discount above the staff limit (${d.limits.staff}%): ${pcts}; total discount Rs. ${bill.discount_amount.toFixed(2)}. ` +
+          `${d.grant ? `Authorized by ${d.grant.authorizedByName} (#${d.grant.authorizedByUserId}).` : `Given by administrator ${req.user?.fullName || ''}.`} Reason: ${d.reason}`, 'SALE', saleId, req);
+      }
 
       // Return created invoice details (stored with the transaction id in the same DB transaction)
       const saleResult = {
@@ -2193,6 +2338,9 @@ async function startServer() {
         grand_total,
         amount_paid: paidAmt,
         amount_due: dueAmt,
+        amount_tendered: prep.tendered,
+        change_due: prep.change,
+        totals: { total_amount: bill.total_amount, discount_amount: bill.discount_amount, net_amount: bill.net_amount, total_gst: bill.total_gst, grand_total: bill.grand_total },
         previous_balance: prevBal,
         new_balance: newBal,
         client_txn_id: clientTxnId,
@@ -2797,6 +2945,20 @@ async function startServer() {
 
   app.post('/api/settings', authenticateToken, requireRoles(['ADMIN']), tx((req: AuthRequest, res) => {
     const settingsObj = req.body;
+    // Phase 7 (E2): discount limits are validated and every change is audited
+    const LIMIT_KEYS = ['pos_staff_max_discount_percent', 'pos_admin_max_discount_percent'];
+    if (LIMIT_KEYS.some((k) => k in settingsObj)) {
+      for (const k of LIMIT_KEYS) {
+        if (k in settingsObj && !validPercent(Number(settingsObj[k]))) return res.status(400).json({ code: 'INVALID_DISCOUNT', error: 'Discount limits must be between 0 and 100%.' });
+      }
+      const before = discountLimits(settingValue);
+      const staff = 'pos_staff_max_discount_percent' in settingsObj ? Number(settingsObj.pos_staff_max_discount_percent) : before.staff;
+      const admin = 'pos_admin_max_discount_percent' in settingsObj ? Number(settingsObj.pos_admin_max_discount_percent) : before.admin;
+      if (staff > admin) return res.status(400).json({ code: 'INVALID_DISCOUNT', error: 'The staff discount limit cannot be higher than the administrator limit.' });
+      if (staff !== before.staff || admin !== before.admin) {
+        logAudit(req.user?.id, req.user?.fullName, 'DISCOUNT_LIMITS_CHANGED', `Discount limits changed: staff ${before.staff}% -> ${staff}%, administrator ${before.admin}% -> ${admin}%`, 'SETTINGS', undefined, req);
+      }
+    }
     for (const key of Object.keys(settingsObj)) {
       db.run("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", [key, String(settingsObj[key])]);
     }

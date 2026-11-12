@@ -333,7 +333,7 @@ describe('concurrency over HTTPS (host mode, several paired clients)', () => {
       expect(p.stock).toBe(12);
       // the startup inventory check is shown on the host status (nothing to report on a clean database)
       const hs = (await pinnedJson(url('/local/host-status'), cert.fingerprint, { headers: { 'x-local-token': LOCAL } })).body;
-      expect(hs.apiProtocol).toBe(2);
+      expect(hs.apiProtocol).toBe(3);
       expect(hs.inventory).toMatchObject({ issues: [], migrationIssues: 0, testDateOverride: '2026-06-01' });
 
       const qty = (i: number) => 1 + (i % 3); // 1,2,3,1,2,3,... asks for ~100 units in total
