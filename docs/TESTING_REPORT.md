@@ -4,6 +4,53 @@ This report contains only results that were actually executed. Anything not exec
 
 ---
 
+## Phase 7, Batch 1: server-calculated POS and transaction safety
+
+| | |
+|---|---|
+| Date | 2026-11-12 |
+| Environment | Linux container (no Windows), Node 22.23.4, Electron 45.2.3 under `xvfb-run`, Playwright's Electron driver |
+| Commands | `npm run lint`, `npm run audit:db-callsites`, `npm test`, `xvfb-run -a npm run test:e2e` (run twice) |
+| Result | **Unit/backend: 20 files, 294 tests, all passing. Desktop end-to-end: 2 files, 26 tests, all passing on two consecutive runs (63.2 s and 61.5 s).** Lint clean; DB call-site audit: no problems. |
+
+Decisions applied: E1 (price from the host's product record), E2 as modified (staff limit default 0 %, administrator limit a store setting up to 100 %, administrator authorization + reason above the staff limit, audited), E3 (round each line to 2 decimals; GST formula unchanged). No database migration in this batch.
+
+### New tests
+| File | Tests | Covers |
+|---|---|---|
+| `tests/unit/pricing-discounts.test.ts` | 11 | Shared formula: plain line; GST after line discount with per-line rounding; bill discount does not reduce GST (legacy rule); agreement with the old POS formula on 3 carts (within rounding); 100 % discount → 0; helpers. Discount limits (defaults, clamping, staff ≤ admin). Authorization grants: bound to cashier and store, maximum %, single use, expiry, malformed tokens. |
+| `tests/characterization/11-server-pricing.test.ts` | 11 | Quote and sale priced from the host (tampered client price/GST ignored, GST 17 % with rounding, change returned); price changed on the host → **409 `PRICE_MISMATCH`** with server figures, **nothing written** (sales, lines, ledger, stock, idempotency keys); bill + line discount rule; 9 invalid inputs (discount −1/101/text/150 %, payment method, negative amount, cash below total, PARTIAL overpayment, non-numeric total) all refused with nothing written; CASH/PARTIAL/UDHAR amounts; staff discount without authorization → 403; administrator authorization (wrong password, non-admin authorizer, reason required, too-low %, single use, audited with authorizer and reason); administrator discount needs a reason; store limits validated, ADMIN-only, audited, store maximum binds everyone; lock after 5 wrong passwords; idempotent replay after the grant is used. |
+
+### Legacy tests changed on purpose
+| Test | Before | After |
+|---|---|---|
+| C9/S6 client prices | client unit price, cost and total stored | **Refused with 409 `PRICE_MISMATCH`** when the client total differs; without a client total the sale is priced from the host (Rs. 220 x 5 = 1100) |
+| Durability (55-request burst, crash points) | traced each request by a client-supplied price marker (only possible because of C9) | traced by its transaction id, stored in the same transaction as the sale; same checks (no partial rows, no duplicates, acknowledged sales present) |
+| Atomicity (mid-sale failure) | malformed line → 500 | malformed lines are 400 before any write; the mid-way failure is injected by a test-only hook (`PHARMACY_TEST_THROW=sale-after-line-1`) after line 1 is fully written → 500, complete rollback |
+| Protocol in `09-desktop-backend`, `10-batch-inventory`, standalone E2E | 2 | 3 |
+
+### Desktop end-to-end additions (real UI)
+- Standalone: a price changed on the host while the cart is open → the payment screen shows "Prices were updated" and the **server total (Rs. 180.00)**; the sale is charged that amount.
+- Standalone: a **staff cashier** gives 10 %; the payment screen requires a reason and an administrator; a wrong password is refused; after authorization the server total (Rs. 279.00) is charged; audit log has the override and the failed attempt.
+- Host + client: a price changed on the host while the **client's** cart is open → the client shows and charges the host price; host and client return identical sale records.
+- Phase 6 test adjusted: the "another counter sold the last unit" refusal now appears **when the payment screen opens** (the server preview checks stock), before any money is taken; the cart is kept as before.
+
+### Defect found and fixed during Batch 1
+| Defect | Found by | Status |
+|---|---|---|
+| The new price preview also checks stock; a shortage first appeared as a preview error instead of the Phase 6 refusal dialog | Phase 6 E2E regression | Fixed: a stock refusal at preview closes the payment screen with the same dialog, keeps the cart and refreshes stock |
+| Legacy (found while implementing): CASH with less money than the bill was stored as a part-paid sale with no customer (the debt was lost); more money than the bill made the amount due negative | review | CASH must cover the bill (change returned, `change_due`); PARTIAL cannot exceed the bill |
+
+### Not executed / limits (Batch 1)
+| Area | Status |
+|---|---|
+| **Windows hardware** | **Not executed for Batch 1.** All results above are Linux. |
+| Two physical computers | Host/client E2E ran on one machine over 127.0.0.1 |
+| Discount authorizations after a host restart | By design they are kept in memory only and lost on restart (the cashier asks again); not tested on Windows |
+| A grant used by a sale that then fails with 500 | The grant is used up (documented); the cashier asks again. Not E2E-tested. |
+
+---
+
 ## Phase 6: batch inventory, FEFO, no overselling, expiry rules
 
 | | |

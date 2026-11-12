@@ -95,15 +95,22 @@ describe('known defects in the sale path', () => {
   });
 
   // Phase 6 (D6): cost now comes from the batch on the server; prices/totals are still trusted until Phase 7 (C9)
-  it('[LEGACY-SECURITY C9/S6] server trusts client-supplied prices and totals (cost is now the batch cost, D6)', async () => {
+  // Phase 7 Batch 1 fix of C9/S6 (was: the server stored client prices, cost and totals)
+  it('[FIXED C9/S6] client prices and totals are never stored: a different total is refused, the server prices the sale', async () => {
     const p = await product(1);
-    const tampered = { ...p, purchase_price: 0 };
+    const tampered = { ...p, purchase_price: 0, sale_price: 1 };
     const item = cartItem(tampered, 5, { unit_price: 1 });
-    const r = await admin.post('/sales', salePayload([item], { grand_total: 5, amount_paid: 5 }));
+    const refused = await admin.post('/sales', salePayload([item], { grand_total: 5, amount_paid: 5 }));
+    expect(refused.status).toBe(409);
+    expect(refused.body).toMatchObject({ code: 'PRICE_MISMATCH', server_grand_total: 1100 });
+    // without a client total the sale is priced from the host database
+    const { grand_total: _g, total_amount: _t, net_amount: _n, ...noTotals } = salePayload([item]) as any;
+    const r = await admin.post('/sales', { ...noTotals, amount_paid: undefined });
     expect(r.status).toBe(200);
+    expect(r.body.grand_total).toBe(1100);
     const d = await admin.get(`/sales/${r.body.sale_id}`);
-    expect(d.body.grand_total).toBe(5);
-    expect(d.body.items[0]).toMatchObject({ sale_price: 1, cost_price: 180 });
+    expect(d.body).toMatchObject({ grand_total: 1100, total_amount: 1100, amount_paid: 1100 });
+    expect(d.body.items[0]).toMatchObject({ sale_price: 220, cost_price: 180, subtotal: 1100 });
   });
 
   it('[LEGACY-BUG C3] posting the same sale twice creates two sales (no idempotency)', async () => {
@@ -169,12 +176,16 @@ describe('atomicity', () => {
     const p = await product(1);
     const before = (await admin.get('/customers')).body.find((c: any) => c.id === 1).current_balance;
     const good = cartItem(p, 4);
-    // Phase 6: a line without a product is now refused by validation before any write (400);
-    // a mid-way failure is produced with a value SQLite cannot store in the 2nd line's INSERT.
+    // Phase 6/7: malformed lines are refused by validation before any write (400). A mid-way failure is
+    // injected by a test-only hook that throws after line 1 was fully written (stock taken, allocations stored).
     expect((await admin.post('/sales', salePayload([good, { quantity: 1, unit_price: 1, subtotal: 1 } as any]))).status).toBe(400);
-    const broken = { ...cartItem(await product(2), 1), discount_percent: { not: 'a number' } };
-    const r = await admin.post('/sales', salePayload([good, broken as any], { payment_method: 'UDHAR', customer_id: 1 }));
+    expect((await admin.post('/sales', salePayload([good, { ...cartItem(await product(2), 1), discount_percent: { not: 'a number' } } as any]))).status).toBe(400);
+    await srv.stop();
+    srv = await startServer({ workDir: srv.workDir, env: { PHARMACY_TEST_THROW: 'sale-after-line-1' } });
+    await admin.login('admin', 'admin123');
+    const r = await admin.post('/sales', salePayload([good, cartItem(await product(2), 1)], { payment_method: 'UDHAR', customer_id: 1 }));
     expect(r.status).toBe(500);
+    expect(r.body.error).toMatch(/injected failure after line 1/);
     expect((await product(1)).stock).toBe(120);
     expect((await product(2)).stock).toBe(45);
     expect((await admin.get('/customers')).body.find((c: any) => c.id === 1).current_balance).toBe(before);

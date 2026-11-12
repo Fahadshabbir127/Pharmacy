@@ -200,7 +200,7 @@ Batch inventory and FEFO · supplier returns · customer returns/refunds · conf
 | C6 purchases keep batches | **Done (Phase 6).** Each purchase line is its own batch (batch, mfg date, expiry, cost, sale price). |
 | C7 BrainTech branding, pharmacy's own name/logo | **Done** for names, receipts, purchase orders, messages and file names. Logo upload is not built yet. |
 | C8 per-install token secret, re-login | **Done** (plus: the role is read from the database, not the token) |
-| C9 server-side totals | Not yet (Phase 7) |
+| C9 server-side totals | **Done (Phase 7, Batch 1).** The host prices every sale; a different client total is refused with the server figures; the payment screen shows the server total before money is taken. |
 | C10 "Mark as sent (manual dispatch)" label | Not yet (Phase 10) |
 | C11 no invented barcodes | **Done** (existing barcodes untouched) |
 | FK1–FK5 | **Done** (see `FK_AUDIT_REPORT.md` §5) |
@@ -211,6 +211,11 @@ Features verified in the **desktop app** by automated end-to-end tests on Linux 
 - persistence across restart;
 - data shared between host and client;
 - Phase 6: stock deducted per batch by FEFO and refused when short or expired (P19), receipt with batch lines (P16), purchase entry with batch/mfg/expiry (PU1), inventory batches panel, expiry tracker and per-batch write-off (I1, I4).
+
+**Phase 7 Batch 1 changes to existing behaviour (approved E1–E3):**
+- P8/P9: discounts above the staff limit (default **0 %**) need an administrator's authorization at the counter and a reason; administrators selling directly give a reason. Limits are store settings (Settings → POS Discount Limits).
+- P10: CASH must cover the bill (change is shown and returned); PARTIAL cannot exceed the bill. Previously a short cash payment was silently stored as part-paid without a customer.
+- P21: the server calculates all totals (C9). If a price changed on the host, the payment screen shows the new total before completing.
 
 **Phase 6 changes to existing behaviour (approved D1–D7):**
 - I2: the product form sets **opening** stock, batch and expiry only when a product is created; when editing, stock is read-only (D1) and batches are edited in the Batches panel.

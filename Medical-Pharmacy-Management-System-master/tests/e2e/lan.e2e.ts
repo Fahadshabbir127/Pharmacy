@@ -155,6 +155,39 @@ describe('Phase 6: batches across host and client', () => {
   }, 60_000);
 });
 
+describe('Phase 7 Batch 1: the host prices sales made on a client', () => {
+  it('a price changed on the host while the client cart is open: the client shows and charges the host price; both computers agree', async () => {
+    await client.win.goto('app://braintech/index.html');
+    await loginUi(client.win, ADMIN.user, ADMIN.password);
+    await printOff(client.win);
+    const search = client.win.locator('input[placeholder^="Scan Barcode or Search Medicine"]');
+    await search.fill('AG-442'); // Augmentin, Rs. 380 in the client's loaded list
+    await search.press('Enter');
+    await client.win.waitForSelector('input[title="Click to type quantity manually"]');
+    const p = (await apiFromRenderer(host.win, 'GET', '/inventory')).body.find((x: any) => x.batch_number === 'AG-442');
+    expect((await apiFromRenderer(host.win, 'PUT', `/inventory/${p.id}`, { ...p, sale_price: 400 })).status).toBe(200);
+
+    await client.win.click('button:has-text("CASH")');
+    await client.win.waitForSelector('[data-testid="price-notice"]', { timeout: 15_000 });
+    expect(await client.win.locator('[data-testid="server-grand-total"]').innerText()).toBe('Rs. 400.00');
+    await client.win.click('button:has-text("Complete Sale & Print Receipt")');
+    await client.win.waitForSelector('text=Invoice / Thermal Receipt', { timeout: 30_000 });
+    await client.win.click('button:text-is("Close")');
+
+    const latest = async (i: Instance) => {
+      const hist = (await apiFromRenderer(i.win, 'GET', '/sales/history')).body;
+      const s = hist.reduce((a: any, b: any) => (a.id > b.id ? a : b));
+      return (await apiFromRenderer(i.win, 'GET', `/sales/${s.id}`)).body;
+    };
+    const onHost = await latest(host);
+    expect(onHost).toMatchObject({ grand_total: 400, amount_paid: 400, payment_status: 'PAID' });
+    expect(onHost.items[0]).toMatchObject({ sale_price: 400, subtotal: 400 });
+    const onClient = await latest(client);
+    expect({ id: onClient.id, total: onClient.grand_total, items: onClient.items.map((i: any) => [i.product_id, i.sale_price, i.subtotal]) })
+      .toEqual({ id: onHost.id, total: onHost.grand_total, items: onHost.items.map((i: any) => [i.product_id, i.sale_price, i.subtotal]) });
+  }, 120_000);
+});
+
 describe('host crash after saving a sale, before answering (the hardest case)', () => {
   it('the client shows SALE NOT CONFIRMED, keeps the cart; "Check status" finds the saved sale exactly once', async () => {
     fs.rmSync(crashMarker); // arm the one-shot crash: the host backend dies right after COMMIT of the next sale
@@ -179,7 +212,7 @@ describe('host crash after saving a sale, before answering (the hardest case)', 
     const after = (await apiFromRenderer(host.win, 'GET', '/inventory')).body.find((p: any) => p.batch_number === 'HY-908').stock;
     expect(after).toBe(before - 1); // recorded exactly once
     const sales = (await apiFromRenderer(host.win, 'GET', '/sales/history')).body;
-    expect(sales.length).toBe(5); // demo + client sale + client multi-batch sale + last-unit race winner + this one
+    expect(sales.length).toBe(6); // demo + client sale + client multi-batch sale + last-unit race winner + host-priced client sale + this one
   }, 180_000);
 });
 

@@ -2,6 +2,14 @@ import { User, Product, Category, Customer, LedgerEntry, SaleHeader, CartItem, S
 
 const API_BASE = '/api';
 
+/** The host's price calculation for a cart (Phase 7, Batch 1). */
+export interface SaleQuote {
+  lines: { product_id: number; product_name: string; unit: string; quantity: number; unit_price: number; discount_percent: number; gross: number; discount_amount: number; gst_percent: number; gst_amount: number; subtotal: number }[];
+  total_amount: number; item_discount_amount: number; bill_discount_percent: number; bill_discount_amount: number;
+  discount_amount: number; net_amount: number; total_gst: number; grand_total: number;
+  discount: { max_percent_used: number; staff_limit_percent: number; admin_limit_percent: number; authorization_required: boolean; reason_required: boolean };
+}
+
 /** Error from the API, with enough detail to tell "failed" from "outcome unknown". */
 export class ApiError extends Error {
   /** the full JSON error body (e.g. product_id / requested / available for 409 INSUFFICIENT_STOCK) */
@@ -324,6 +332,12 @@ export const api = {
     }),
 
   // Sales & POS
+  /** Phase 7: the host's price calculation for a cart (nothing is saved). */
+  quoteSale: (data: { items: { product: { id: number }; quantity: number; discount_percent?: number }[]; discount_percent?: number; discount_authorization?: string }) =>
+    request<SaleQuote>('/sales/quote', { method: 'POST', body: JSON.stringify(data) }),
+  /** Phase 7 (E2): an administrator authorizes a discount above the staff limit at this counter. */
+  authorizeDiscount: (data: { username: string; password: string; max_percent: number; reason: string }) =>
+    request<{ token: string; expires_at: string; max_percent: number; authorized_by: string; reason: string }>('/sales/discount-authorization', { method: 'POST', body: JSON.stringify(data) }),
   createSale: (saleData: {
     customer_id?: number;
     items: CartItem[];
@@ -336,6 +350,8 @@ export const api = {
     payment_method: 'CASH' | 'PARTIAL' | 'UDHAR';
     amount_paid: number;
     client_txn_id?: string;
+    discount_reason?: string;
+    discount_authorization?: string;
   }) =>
     request<{
       message: string;
