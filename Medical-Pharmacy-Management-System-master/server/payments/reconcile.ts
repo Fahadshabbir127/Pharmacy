@@ -13,7 +13,7 @@ import type { DbAdapter } from '../db/adapter';
 const TOL = 0.005;
 const r2 = (x: number) => Math.round((x + Number.EPSILON) * 100) / 100;
 
-export interface CustomerReconciliation { customerId: number; name: string; stored: number; expected: number; difference: number; openingDue: number; invoicesDue: number; advance: number }
+export interface CustomerReconciliation { customerId: number; name: string; stored: number; expected: number; difference: number; openingDue: number; carriedOverDue: number; invoicesDue: number; advance: number }
 export interface PaymentReconciliation {
   checkedAt: string;
   customersChecked: number;
@@ -28,12 +28,17 @@ export function customerPosition(db: DbAdapter, customerId: number): Omit<Custom
   const opening = Number(c?.opening_balance) || 0;
   const openingApplied = db.get<{ s: number }>(`SELECT COALESCE(SUM(CASE kind WHEN 'APPLY' THEN amount ELSE -amount END), 0) s FROM payment_allocations WHERE target = 'OPENING_BALANCE' AND customer_id = ?`, [customerId])!.s;
   const openingDue = r2(Math.max(opening, 0) - openingApplied);
+  // Q1: administrator-confirmed carried-over balances (table exists from migration 0009)
+  const hasCob = !!db.get("SELECT 1 AS x FROM sqlite_master WHERE type = 'table' AND name = 'customer_carried_over_balances'");
+  const carriedOverDue = hasCob ? r2(db.get<{ s: number }>('SELECT COALESCE(SUM(amount), 0) s FROM customer_carried_over_balances WHERE customer_id = ?', [customerId])!.s
+    - db.get<{ s: number }>(`SELECT COALESCE(SUM(CASE kind WHEN 'APPLY' THEN amount ELSE -amount END), 0) s FROM payment_allocations WHERE target = 'CARRIED_OVER_BALANCE' AND customer_id = ?`, [customerId])!.s) : 0;
   const invoicesDue = r2(db.get<{ s: number }>('SELECT COALESCE(SUM(balance_due), 0) s FROM sales_headers WHERE customer_id = ? AND balance_due IS NOT NULL', [customerId])!.s);
-  const money = db.get<{ s: number }>(`SELECT COALESCE(SUM(CASE direction WHEN 'IN' THEN amount ELSE -amount END), 0) s FROM payments WHERE customer_id = ?`, [customerId])!.s;
-  const allocated = db.get<{ s: number }>(`SELECT COALESCE(SUM(CASE kind WHEN 'APPLY' THEN amount ELSE -amount END), 0) s FROM payment_allocations WHERE customer_id = ?`, [customerId])!.s;
-  const advance = r2(money - allocated);
-  const expected = r2(openingDue + invoicesDue - advance + (opening < -TOL ? opening : 0));
-  return { customerId, openingDue, invoicesDue, advance, expected };
+  // advance = money of the customer's payments that are not reversed and not allocated (a reversal returns the
+  // money AND releases its allocations, so reversed payments contribute nothing)
+  const advance = r2(db.get<{ s: number }>(`SELECT COALESCE(SUM(p.amount - COALESCE((SELECT SUM(CASE a.kind WHEN 'APPLY' THEN a.amount ELSE -a.amount END) FROM payment_allocations a WHERE a.payment_id = p.id), 0)), 0) s
+      FROM payments p WHERE p.customer_id = ? AND p.direction = 'IN' AND NOT EXISTS (SELECT 1 FROM payments r WHERE r.reverses_payment_id = p.id)`, [customerId])!.s);
+  const expected = r2(openingDue + carriedOverDue + invoicesDue - advance + (opening < -TOL ? opening : 0));
+  return { customerId, openingDue, carriedOverDue, invoicesDue, advance, expected };
 }
 
 export function reconcilePayments(db: DbAdapter): PaymentReconciliation {

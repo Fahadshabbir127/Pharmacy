@@ -156,10 +156,28 @@ export const ThermalReceiptModal: React.FC<ThermalReceiptModalProps> = ({ sale, 
                     <span>Payment Method:</span>
                     <span className="bg-slate-200 px-1.5 py-0.5 rounded uppercase">{sale.payment_method || 'CASH'}</span>
                   </div>
+                  {/* Phase 7 Batch 2c: each payment taken at the sale (split payments), cash received and change */}
+                  {Array.isArray((sale as any).payments) && (sale as any).payments.filter((p: any) => p.kind === 'SALE_TENDER' && p.direction === 'IN').length > 0 ? (
+                    <div data-testid="receipt-payments" className="space-y-0.5">
+                      {(sale as any).payments.filter((p: any) => p.kind === 'SALE_TENDER' && p.direction === 'IN').map((p: any) => (
+                        <div key={p.id}>
+                          <div className="flex justify-between"><span>{p.method === 'MOBILE_WALLET' ? (p.method_detail || 'Mobile Wallet') : p.method === 'BANK_TRANSFER' ? 'Bank Transfer' : p.method === 'CARD' ? 'Card' : 'Cash'}{p.reference ? ` (${p.reference})` : ''}:</span><span className="font-bold text-emerald-700">Rs. {Number(p.amount).toFixed(2)}</span></div>
+                          {p.method === 'CASH' && p.cash_tendered !== null && p.cash_tendered !== undefined && (
+                            <>
+                              <div className="flex justify-between text-slate-600 pl-2"><span>Cash received:</span><span>Rs. {Number(p.cash_tendered).toFixed(2)}</span></div>
+                              <div className="flex justify-between text-slate-600 pl-2"><span>Change:</span><span>Rs. {Number(p.change_given || 0).toFixed(2)}</span></div>
+                            </>
+                          )}
+                        </div>
+                      ))}
+                      <div className="flex justify-between border-t pt-0.5 border-slate-200"><span>Total paid:</span><span className="font-bold text-emerald-700">Rs. {amountPaid.toFixed(2)}</span></div>
+                    </div>
+                  ) : (
                   <div className="flex justify-between">
                     <span>Amount Paid Now (نقد):</span>
                     <span className="font-bold text-emerald-700">Rs. {amountPaid.toFixed(2)}</span>
                   </div>
+                  )}
 
                   {amountDue > 0 && (
                     <div className="flex justify-between text-rose-700 font-bold border-t pt-1 border-slate-200">

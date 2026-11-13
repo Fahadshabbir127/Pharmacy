@@ -18,6 +18,7 @@ import { payments as paymentsMigration, PAYMENT_GUARD } from '../../server/db/mi
 import { reconcilePayments, customerPosition } from '../../server/payments/reconcile';
 
 const FIXTURE_DIR = path.join(PROJECT_ROOT, 'tests', '.fixtures', 'legacy');
+const LATEST = MIGRATIONS[MIGRATIONS.length - 1].version;
 const ALL = ['fresh-first-boot', 'after-restart', 'busy-store', 'multi-tenant', 'orphans', 'pre-tenant-raw', 'pre-tenant-migrated-by-original', 'inventory-edge-cases', 'payments-edge-cases'];
 const sha = (f: string) => crypto.createHash('sha256').update(fs.readFileSync(f)).digest('hex');
 
@@ -42,7 +43,8 @@ function legacyMoney(file: string) {
 const money = (db: DbAdapter) => ({
   sales: db.all('SELECT id, invoice_number, customer_id, sale_date, total_amount, discount_amount, net_amount, total_gst, grand_total, payment_method, amount_paid, amount_due, payment_status FROM sales_headers WHERE is_placeholder = 0 ORDER BY id'),
   customers: db.all('SELECT id, opening_balance, current_balance FROM customers WHERE is_placeholder = 0 ORDER BY id'),
-  ledger: db.all('SELECT * FROM customer_ledger ORDER BY id'),
+  // existing ledger columns (0009 adds an empty payment_id link column)
+  ledger: db.all('SELECT id, customer_id, transaction_date, type, reference, debit, credit, balance_after, notes, sale_id FROM customer_ledger ORDER BY id'),
 });
 const guard = (fn: () => unknown) => expect(fn).toThrow(new RegExp(PAYMENT_GUARD));
 
@@ -57,7 +59,7 @@ describe('0008 on every legacy database (copies; originals untouched)', () => {
       const { dir, file } = copy(name);
       const { db } = await openDatabase(file, { backupDir: path.join(dir, 'b') });
       try {
-        expect(currentVersion(db)).toBe(8);
+        expect(currentVersion(db)).toBe(LATEST);
         // condition 4: every existing financial record and balance is exactly as before
         // (compared on the original columns: the oldest schema had no customer_ledger.sale_id, which 0001 adds empty)
         const now = money(db);
@@ -260,7 +262,7 @@ describe('rollback, crash recovery and verified backup', () => {
     expect(db.all("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")).toEqual(triggersBefore);
     expect(money(db)).toEqual(before);
     await migrate(db, MIGRATIONS, { backupDir: path.join(dir, 'b') });
-    expect(currentVersion(db)).toBe(8);
+    expect(currentVersion(db)).toBe(LATEST);
     expect(money(db)).toEqual(before);
     db.close();
   });
@@ -281,7 +283,7 @@ describe('rollback, crash recovery and verified backup', () => {
     expect(money(mid)).toEqual(before);
     mid.close();
     // the pre-migration backup was written and verified before 0008 started
-    const backups = fs.readdirSync(path.join(dataDir, 'backups')).filter((f) => f.startsWith('pre-migration-v7-to-v8') && f.endsWith('.sqlite'));
+    const backups = fs.readdirSync(path.join(dataDir, 'backups')).filter((f) => f.startsWith(`pre-migration-v7-to-v${LATEST}`) && f.endsWith('.sqlite'));
     expect(backups.length).toBeGreaterThanOrEqual(1);
     const bk = DbAdapter.open(path.join(dataDir, 'backups', backups[0]), { readonly: true });
     expect(bk.integrityCheck()).toEqual([]);
@@ -291,7 +293,7 @@ describe('rollback, crash recovery and verified backup', () => {
     const srv = await startServer({ workDir: dir });
     try {
       const db = DbAdapter.open(srv.dbFile, { readonly: true });
-      expect(currentVersion(db)).toBe(8);
+      expect(currentVersion(db)).toBe(LATEST);
       expect(money(db)).toEqual(before);
       expect(db.get<any>('SELECT COUNT(*) n FROM payments').n).toBe(9);
       db.close();
@@ -304,7 +306,7 @@ describe('rollback, crash recovery and verified backup', () => {
 });
 
 describe('startup report on a running server', () => {
-  it('a new installation with demo data reconciles cleanly; a sale made before Batch 2b records payments is reported as untracked', async () => {
+  it('a new installation with demo data reconciles cleanly, and still does after a sale (Batch 2b records its payment)', async () => {
     const srv = await startServer();
     let workDir = srv.workDir;
     try {
@@ -313,7 +315,7 @@ describe('startup report on a running server', () => {
       expect(reconcilePayments(db)).toMatchObject({ mismatches: [], untrackedSales: 0, walkInSalesWithDue: 0, migrationIssues: 0 });
       expect(db.get<any>('SELECT balance_due, settlement_status FROM sales_headers WHERE id = 1')).toEqual({ balance_due: 2450, settlement_status: 'PARTIAL' });
       db.close();
-      // Batch 2a gap (closed in 2b): the current sale route does not write payment records yet
+      // Batch 2b: the sale route writes payment records, so a new sale is tracked
       const { Api, cartItem, salePayload } = await import('../helpers/server');
       const admin = new Api();
       await admin.login('admin', 'admin123');
@@ -324,7 +326,7 @@ describe('startup report on a running server', () => {
     }
     const again = await startServer({ workDir });
     try {
-      expect(again.logs()).toMatch(/\[PAYMENTS\] 1 invoice\(s\) have money recorded at the sale but no payment record/);
+      expect(again.logs()).not.toMatch(/\[PAYMENTS\]/);
     } finally {
       await again.stop();
     }

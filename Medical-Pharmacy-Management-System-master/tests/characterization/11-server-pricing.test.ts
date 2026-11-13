@@ -56,7 +56,7 @@ describe('the host prices every sale (E1, E3)', () => {
     expect(q.body).toMatchObject({ total_amount: 299.97, discount_amount: 22.5, net_amount: 277.47, total_gst: 47.17, grand_total: 324.64 });
     expect(q.body.discount).toMatchObject({ max_percent_used: 7.5, staff_limit_percent: 0, admin_limit_percent: 100, authorization_required: false, reason_required: true });
 
-    const r = await admin.post('/sales', { items, discount_percent: 0, discount_reason: 'damaged box', payment_method: 'CASH', amount_paid: 400, grand_total: q.body.grand_total });
+    const r = await admin.post('/sales', { items, discount_percent: 0, discount_reason: 'damaged box', payment_method: 'CASH', amount_paid: 400, grand_total: q.body.grand_total, client_txn_id: crypto.randomUUID() });
     expect(r.status).toBe(200);
     expect(r.body).toMatchObject({ grand_total: 324.64, amount_paid: 324.64, amount_due: 0, amount_tendered: 400, change_due: 75.36 });
     const d = (await admin.get(`/sales/${r.body.sale_id}`)).body;

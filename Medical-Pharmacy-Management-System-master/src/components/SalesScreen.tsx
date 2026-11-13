@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { api } from '../lib/api';
 import { SaleHeader, User } from '../types';
 import { Search, Calendar, RefreshCw, ShoppingCart, DollarSign, Package, Printer, FileText, Download } from 'lucide-react';
+import { InvoicePaymentsPanel } from './payments/InvoicePaymentsPanel';
 
 interface SalesScreenProps {
   currentUser?: User;
@@ -256,7 +257,7 @@ export const SalesScreen: React.FC<SalesScreenProps> = ({ currentUser }) => {
                   sale.payment_status === 'PAID' ? 'bg-emerald-100 text-emerald-800' :
                   sale.payment_status === 'PARTIAL' ? 'bg-amber-100 text-amber-800' : 'bg-rose-100 text-rose-800'
                 }`}>
-                  {sale.payment_status}
+                  At sale: {sale.payment_status}
                 </span>
               </div>
               <div className="flex items-center gap-4 text-xs font-semibold">
@@ -297,6 +298,8 @@ export const SalesScreen: React.FC<SalesScreenProps> = ({ currentUser }) => {
                 </tbody>
               </table>
             </div>
+            {/* Phase 7 Batch 2c: current balance, payments, record payment, admin reversal */}
+            <InvoicePaymentsPanel sale={sale as any} isAdmin={currentUser?.role === 'ADMIN'} onChanged={() => void fetchSales()} />
           </div>
         ))}
 

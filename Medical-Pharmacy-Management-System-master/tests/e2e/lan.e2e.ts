@@ -144,7 +144,7 @@ describe('Phase 6: batches across host and client', () => {
     await apiFromRenderer(host.win, 'POST', '/inventory/adjust', { product_id: c.body.id, adjustment_type: 'ADD', quantity: 1, reason: 'E2E', reason_code: 'COUNT_CORRECTION', batch_number: 'V-1', expiry_date: '2027-06-30' });
     const p = (await apiFromRenderer(host.win, 'GET', '/inventory')).body.find((x: any) => x.id === c.body.id);
     const sale = { items: [{ product: p, quantity: 1, unit_price: 150, discount_percent: 0, discount_amount: 0, gst_amount: 0, subtotal: 150 }], total_amount: 150, discount_percent: 0, discount_amount: 0, net_amount: 150, total_gst: 0, grand_total: 150, payment_method: 'CASH', amount_paid: 150 };
-    const [a, b] = await Promise.all([apiFromRenderer(host.win, 'POST', '/sales', sale), apiFromRenderer(client.win, 'POST', '/sales', sale)]);
+    const [a, b] = await Promise.all([apiFromRenderer(host.win, 'POST', '/sales', { ...sale, client_txn_id: 'e2e-race-host-0001' }), apiFromRenderer(client.win, 'POST', '/sales', { ...sale, client_txn_id: 'e2e-race-client-0001' })]);
     expect([a.status, b.status].sort()).toEqual([200, 409]);
     const refused = a.status === 409 ? a : b;
     expect(refused.body).toMatchObject({ code: 'INSUFFICIENT_STOCK', requested: 1, available: 0 });
@@ -185,6 +185,50 @@ describe('Phase 7 Batch 1: the host prices sales made on a client', () => {
     const onClient = await latest(client);
     expect({ id: onClient.id, total: onClient.grand_total, items: onClient.items.map((i: any) => [i.product_id, i.sale_price, i.subtotal]) })
       .toEqual({ id: onHost.id, total: onHost.grand_total, items: onHost.items.map((i: any) => [i.product_id, i.sale_price, i.subtotal]) });
+  }, 120_000);
+});
+
+describe('Phase 7 Batch 2c: payments between host and client', () => {
+  it('a payment recorded in the client UI is on the host at once; a host payment is seen in the client UI; a simultaneous double payment of the same balance is accepted once', async () => {
+    await client.win.goto('app://braintech/index.html');
+    await loginUi(client.win, ADMIN.user, ADMIN.password);
+    await printOff(client.win);
+    await client.win.click('button:has-text("Customers & Udhar")');
+    await client.win.click('text=Chaudhry Muhammad Ali >> visible=true'); // owes 2450 on INV-1001
+    await client.win.click('button:has-text("Receive Payment")');
+    await client.win.fill('input[aria-label="Payment amount"]', '450');
+    await client.win.click('[data-testid="record-payment"]');
+    await client.win.waitForSelector('[data-testid="payment-new-balance"]:has-text("Rs. 2000.00")', { timeout: 15_000 });
+    await client.win.screenshot({ path: path.join(clientBase, '06-client-customer-payment.png') });
+    await client.win.click('button:has-text("Done")');
+
+    const cust = (await apiFromRenderer(host.win, 'GET', '/customers')).body.find((c: any) => c.name === 'Chaudhry Muhammad Ali');
+    expect(cust.current_balance).toBe(2000);
+    const onHost = (await apiFromRenderer(host.win, 'GET', `/customers/${cust.id}/payments`)).body;
+    // (order-independent: the demo sale is stamped 10:30 of the setup day)
+    expect(onHost.map((p: any) => [p.kind, p.amount, p.allocations.map((a: any) => a.invoice_number)]).sort()).toEqual([['CUSTOMER_PAYMENT', 450, ['INV-1001']], ['SALE_TENDER', 200, ['INV-1001']]]);
+
+    // the host records an invoice payment; the client's Sales Register shows it
+    const sale = (await apiFromRenderer(host.win, 'GET', '/sales/history')).body.find((s: any) => s.invoice_number === 'INV-1001');
+    expect((await apiFromRenderer(host.win, 'POST', `/sales/${sale.id}/payments`, { amount: 300, method: 'CARD', client_txn_id: 'e2e-host-inv-pay-0001' })).status).toBe(200);
+    await client.win.click('button:has-text("Sales Register")');
+    const panel = client.win.locator('[data-testid="invoice-payments-INV-1001"]');
+    await expect.poll(async () => panel.locator('[data-testid="balance-due"]').innerText(), { timeout: 15_000 }).toBe('Rs. 1700.00');
+    await client.win.screenshot({ path: path.join(clientBase, '07-client-sales-register-after-host-payment.png') });
+
+    // host and client pay the remaining 1700 at the same moment: exactly one is accepted
+    const [a, b] = await Promise.all([
+      apiFromRenderer(host.win, 'POST', `/sales/${sale.id}/payments`, { amount: 1700, method: 'CASH', client_txn_id: 'e2e-race-pay-host-01' }),
+      apiFromRenderer(client.win, 'POST', `/sales/${sale.id}/payments`, { amount: 1700, method: 'CASH', client_txn_id: 'e2e-race-pay-client-01' }),
+    ]);
+    expect([a.status, b.status].sort()).toEqual([200, 400]);
+    expect((a.status === 400 ? a : b).body.code).toBe('OVERPAYMENT');
+    for (const i of [host, client]) {
+      const d = (await apiFromRenderer(i.win, 'GET', `/sales/${sale.id}`)).body;
+      expect(d).toMatchObject({ balance_due: 0, settlement_status: 'PAID' });
+      expect((await apiFromRenderer(i.win, 'GET', '/customers')).body.find((c: any) => c.id === cust.id).current_balance).toBe(0);
+    }
+    await client.win.click('button:has-text("Billing / POS")');
   }, 120_000);
 });
 

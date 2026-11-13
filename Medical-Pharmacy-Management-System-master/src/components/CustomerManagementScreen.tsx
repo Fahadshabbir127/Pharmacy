@@ -3,6 +3,8 @@ import React, { useState, useEffect } from 'react';
 import { Customer, LedgerEntry } from '../types';
 import { api } from '../lib/api';
 import { User } from '../types';
+import { CustomerPaymentModal } from './payments/CustomerPaymentModal';
+import { OpenInvoicesTab, PaymentHistoryTab, BalanceReviewModal } from './payments/CustomerAccount';
 import { 
   Users, 
   Search, 
@@ -41,6 +43,11 @@ export const CustomerManagementScreen: React.FC<{ currentUser?: User }> = ({ cur
   const [payAmount, setPayAmount] = useState<string>('');
   const [payMode, setPayMode] = useState<string>('Cash');
   const [payNotes, setPayNotes] = useState<string>('');
+  // Phase 7 Batch 2c: account tabs and the administrator's balance review
+  const [accountTab, setAccountTab] = useState<'LEDGER' | 'OPEN' | 'PAYMENTS'>('LEDGER');
+  const [accountRefresh, setAccountRefresh] = useState<number>(0);
+  const [showBalanceReview, setShowBalanceReview] = useState<boolean>(false);
+  const isAdmin = currentUser?.role === 'ADMIN';
 
   // Add Customer Modal
   const [showAddModal, setShowAddModal] = useState<boolean>(false);
@@ -526,6 +533,16 @@ export const CustomerManagementScreen: React.FC<{ currentUser?: User }> = ({ cur
                     <span>Delete</span>
                   </button>
 
+                  {isAdmin && (
+                    <button
+                      onClick={() => setShowBalanceReview(true)}
+                      className="bg-amber-950/60 hover:bg-amber-900/70 text-amber-200 border border-amber-800/80 text-xs font-bold px-3 py-2 rounded-xl transition-all"
+                      title="Review balances that the records do not explain (administrator)"
+                    >
+                      Balance review
+                    </button>
+                  )}
+
                   <button
                     onClick={() => {
                       setPayAmount(String(selectedCustomer.current_balance));
@@ -547,8 +564,18 @@ export const CustomerManagementScreen: React.FC<{ currentUser?: User }> = ({ cur
                 </span>
               </div>
 
+              {/* Phase 7 Batch 2c: account tabs */}
+              <div className="flex gap-1 text-xs" role="tablist">
+                {([['LEDGER', 'Ledger (کھاتہ)'], ['OPEN', 'Open invoices'], ['PAYMENTS', 'Payment history']] as const).map(([k, label]) => (
+                  <button key={k} type="button" role="tab" aria-selected={accountTab === k} onClick={() => setAccountTab(k)}
+                    className={`px-3 py-1.5 rounded-lg font-semibold border ${accountTab === k ? 'bg-emerald-700 border-emerald-600 text-white' : 'bg-slate-800 border-slate-700 text-slate-300 hover:text-white'}`}>{label}</button>
+                ))}
+              </div>
+              {accountTab === 'OPEN' && <div className="max-h-[380px] overflow-y-auto"><OpenInvoicesTab customerId={selectedCustomer.id} refreshKey={accountRefresh} /></div>}
+              {accountTab === 'PAYMENTS' && <div className="max-h-[380px] overflow-y-auto rounded-xl border border-slate-800"><PaymentHistoryTab customerId={selectedCustomer.id} canReverse={isAdmin} refreshKey={accountRefresh} onChanged={() => { setAccountRefresh((n) => n + 1); fetchCustomers(selectedCustomer.id); }} /></div>}
+
               {/* Statement Ledger Table */}
-              <div className="max-h-[380px] overflow-y-auto rounded-xl border border-slate-800">
+              {accountTab === 'LEDGER' && <div className="max-h-[380px] overflow-y-auto rounded-xl border border-slate-800">
                 {loadingLedger ? (
                   <div className="py-12 text-center text-slate-400">Loading Ledger Statement...</div>
                 ) : ledgerEntries.length === 0 ? (
@@ -617,7 +644,7 @@ export const CustomerManagementScreen: React.FC<{ currentUser?: User }> = ({ cur
                     </tbody>
                   </table>
                 )}
-              </div>
+              </div>}
             </>
           ) : (
             <div className="py-20 text-center text-slate-500 space-y-2">
@@ -629,74 +656,17 @@ export const CustomerManagementScreen: React.FC<{ currentUser?: User }> = ({ cur
 
       </div>
 
-      {/* RECEIVE PAYMENT MODAL */}
+      {/* RECEIVE PAYMENT MODAL (Phase 7 Batch 2c: server preview, method/reference, retry-safe transaction id) */}
       {showPaymentModal && selectedCustomer && (
-        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <form onSubmit={handleRecordPayment} className="bg-slate-900 border border-slate-800 text-slate-100 rounded-2xl max-w-md w-full p-6 space-y-4 shadow-2xl">
-            <h3 className="font-bold text-base text-white">Record Udhar Debt Payment</h3>
-            <div className="text-xs text-slate-300 bg-slate-800 p-3 rounded-xl">
-              Customer: <span className="font-bold text-white">{selectedCustomer.name}</span><br />
-              Current Udhar Balance: <span className="font-bold text-rose-400">Rs. {(Number(selectedCustomer.current_balance) || 0).toFixed(2)}</span>
-            </div>
-
-            <div className="space-y-3 text-xs">
-              <div>
-                <label className="block text-slate-300 font-semibold mb-1">Amount Received (Rs.)*:</label>
-                <input
-                  type="number"
-                  required
-                  min="1"
-                  max={selectedCustomer.current_balance}
-                  value={payAmount}
-                  onChange={(e) => setPayAmount(e.target.value)}
-                  className="w-full bg-slate-800 text-white font-bold text-base p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500"
-                />
-              </div>
-
-              <div>
-                <label className="block text-slate-300 font-semibold mb-1">Payment Mode:</label>
-                <select
-                  value={payMode}
-                  onChange={(e) => setPayMode(e.target.value)}
-                  className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500"
-                >
-                  <option value="Cash">Cash (نقد)</option>
-                  <option value="EasyPaisa">EasyPaisa</option>
-                  <option value="JazzCash">JazzCash</option>
-                  <option value="Bank Transfer">Bank Transfer</option>
-                </select>
-              </div>
-
-              <div>
-                <label className="block text-slate-300 font-semibold mb-1">Notes / Receipt Reference:</label>
-                <input
-                  type="text"
-                  value={payNotes}
-                  onChange={(e) => setPayNotes(e.target.value)}
-                  placeholder="e.g. Received by Kashif at store counter"
-                  className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500"
-                />
-              </div>
-            </div>
-
-            <div className="flex items-center space-x-2 pt-2">
-              <button
-                type="submit"
-                className="flex-1 bg-emerald-600 hover:bg-emerald-500 text-white font-bold py-2.5 rounded-xl text-xs"
-              >
-                Confirm Payment Receipt
-              </button>
-              <button
-                type="button"
-                onClick={() => setShowPaymentModal(false)}
-                className="bg-slate-800 text-slate-400 hover:text-white font-semibold py-2.5 px-4 rounded-xl text-xs"
-              >
-                Cancel
-              </button>
-            </div>
-          </form>
-        </div>
+        <CustomerPaymentModal
+          customer={selectedCustomer}
+          onClose={(changed) => {
+            setShowPaymentModal(false);
+            if (changed) { fetchCustomers(selectedCustomer.id); setAccountRefresh((n) => n + 1); }
+          }}
+        />
       )}
+      {showBalanceReview && <BalanceReviewModal onClose={() => { setShowBalanceReview(false); if (selectedCustomer) fetchCustomers(selectedCustomer.id); setAccountRefresh((n) => n + 1); }} />}
 
       {/* ADD CUSTOMER MODAL */}
       {showAddModal && (

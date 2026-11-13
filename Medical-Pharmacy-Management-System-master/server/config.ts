@@ -5,7 +5,7 @@ import net from 'node:net';
 import os from 'node:os';
 
 /** Bumped whenever the HTTP API changes incompatibly; host and clients must match. */
-export const API_PROTOCOL = 3; // 3 = Phase 7: server-calculated sale totals (409 PRICE_MISMATCH, discount authorization). 2 = Phase 6 batches
+export const API_PROTOCOL = 4; // 4 = Phase 7 Batch 2b: payment records; client_txn_id required on every sale and payment. 3 = // 3 = Phase 7: server-calculated sale totals (409 PRICE_MISMATCH, discount authorization). 2 = Phase 6 batches
 
 export const APP_VERSION = process.env.PHARMACY_APP_VERSION || '1.0.0';
 
