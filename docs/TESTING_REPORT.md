@@ -4,6 +4,40 @@ This report contains only results that were actually executed. Anything not exec
 
 ---
 
+## Phase 7, Batch 2d: verification of the payment batches (2a–2c)
+
+| | |
+|---|---|
+| Date | 2026-11-13 |
+| Environment | Linux container (no Windows), Node 22.23.4, Electron 45.2.3 under `xvfb-run` |
+| Starting point | `bdfff09`, clean, identical to GitHub |
+| Commands | `npm run lint`, `npm run audit:db-callsites`, `npm test`, `xvfb-run -a npm run test:e2e` (run twice) |
+| Result | **Unit/backend: 24 files, 350 tests, all passing. Desktop end-to-end: 3 files, 35 tests (incl. 9 LAN host/client), all passing on two consecutive runs (84.4 s, 83.2 s).** Lint clean; DB call-site audit clean. No application code was changed in 2d. |
+
+### Added verification tests
+| File | Tests | Covers |
+|---|---|---|
+| `tests/unit/payment-migration.test.ts` | +4 | **0009 and 0010**: an injected failure at the end rolls back tables, triggers, rows and balances (the 0008 guards survive the 0009 attempt); the server **killed inside** 0009 / 0010 leaves the database untouched, a **verified pre-migration backup** exists and matches, and the next start migrates cleanly (0008 had these checks since 2a) |
+| `tests/characterization/13-payment-integrity.test.ts` (new) | 2 | **Seeded sweep of 120 mixed operations** (sales cash/split/partial/credit, customer and invoice payments, refused overpayments, transaction-id replays, reversals incl. refused second reversals, voids incl. refused ones), then every invariant: invoice balance = total − allocations, status correct, payment never over-allocated, at most one reversal, reversed payments hold nothing, **each customer's stored balance = their ledger = what the records explain**, no advance while owing anything (approved order), seeded payment rows unchanged, reconciliation empty. **Protocol 3 request forms** against the protocol 4 host: older POS sale recorded correctly with a payment record; requests without a transaction id refused and nothing written |
+| `tests/e2e/payments.e2e.ts` | +1 | **Failed response (server error, nothing saved) → the same transaction id is kept for the retry**; the saved payment carries it; "Record another payment" gets a new id |
+
+### Review results
+- **Customer balances:** exactly five places change a stored balance (sale, customer payment, invoice payment, reversal, void), each in one transaction with a ledger row and an audit row. Nothing else writes `current_balance` (opening balance only at customer creation). Backup restore swaps the whole file and migrates older backups after a verified backup; it never deletes payment rows.
+- **Payment history:** no code updates or deletes `payments`, `payment_allocations` or `customer_carried_over_balances`; the database triggers refuse it (tested). The only allowed change is clearing an invoice link when the interim void deletes an invoice.
+- **Administrator-only operations** (reversal, reconciliation, carried-over confirmation, void, discount limits) are enforced by the host (403 for STAFF, tested via API and from the desktop app).
+- **Unrelated files:** Batches 2a–2d changed only payment-related server code, migrations, the POS / Customers / Sales Register / receipt screens, the API client, the demo seed (payment record for its sample sale), tests and docs.
+
+### Findings (not fixed in 2d: verification only)
+| Finding | Impact | Recommendation |
+|---|---|---|
+| **[LEGACY-BUG R4] invoice numbering after a void** (pre-existing; reproduced by the sweep: 17 of 34 sales after voids failed with a duplicate invoice number, each fully rolled back) | After an older invoice is voided, **every later sale fails** until numbering is fixed. No data corruption. | Fix with an invoice sequence (existing numbers kept) – needs approval; until then void only the most recent invoice |
+| Version-mismatch handling in the client | The blocking "Different software versions" screen stops the user, but the client's request forwarder itself does not refuse API calls in that state | The host stays safe (tested); harden the client in a later batch |
+
+### Not executed (Batch 2d)
+Windows hardware; two physical computers; real network drops; printers. See `PAYMENTS.md` §6–7.
+
+---
+
 ## Phase 7, Batch 2c: payment screens, advance priority, retry protection
 
 | | |

@@ -151,6 +151,44 @@ describe('Customers: payment with preview, advance, retry and double-click prote
   }, 60_000);
 });
 
+describe('Batch 2d: transaction id after a failed response', () => {
+  it('a failed answer (server error, nothing saved) keeps the SAME transaction id for the retry; the saved payment carries it; a new payment gets a new one', async () => {
+    await nav('Customers & Udhar');
+    await inst.win.click('text=Tariq Mahmood >> visible=true');
+    const tariq0 = await customerId('Tariq Mahmood');
+    const before = (await apiFromRenderer(inst.win, 'GET', `/customers/${tariq0}/payments`)).body.length;
+    await inst.win.click('button:has-text("Receive Payment")');
+    await inst.win.fill('input[aria-label="Payment amount"]', '25');
+    const txnText = async () => (await inst.win.locator('text=/^Transaction /').innerText()).replace('Transaction ', '').trim();
+    const firstTxn = await txnText();
+    // the next payment request is answered with a server error without reaching the host (simulated in the page)
+    await inst.win.evaluate(() => {
+      const orig = window.fetch.bind(window);
+      (window as any).__failNext = true;
+      window.fetch = (async (input: any, init?: any) => {
+        if ((window as any).__failNext && init?.method === 'POST' && String(input).includes('/payment')) {
+          (window as any).__failNext = false;
+          return new Response(JSON.stringify({ code: 'PAYMENT_FAILED', error: 'simulated server error, nothing saved' }), { status: 500, headers: { 'Content-Type': 'application/json' } });
+        }
+        return orig(input, init);
+      }) as any;
+    });
+    await inst.win.click('[data-testid="record-payment"]');
+    await inst.win.waitForSelector('[data-testid="payment-error"]', { timeout: 10_000 });
+    expect(await inst.win.locator('[data-testid="payment-error"]').innerText()).toMatch(/simulated server error/);
+    expect(await txnText()).toBe(firstTxn); // unchanged after the failure
+    expect((await apiFromRenderer(inst.win, 'GET', `/customers/${tariq0}/payments`)).body).toHaveLength(before); // nothing was saved
+    await inst.win.click('[data-testid="record-payment"]');
+    await inst.win.waitForSelector('[data-testid="payment-result"]', { timeout: 15_000 });
+    const saved = (await apiFromRenderer(inst.win, 'GET', `/customers/${tariq0}/payments`)).body;
+    expect(saved).toHaveLength(before + 1);
+    expect(saved.filter((p: any) => p.client_txn_id === firstTxn)).toHaveLength(1); // the retry used the same id
+    await inst.win.click('button:has-text("Record another payment")');
+    expect(await txnText()).not.toBe(firstTxn); // a new payment, a new id
+    await inst.win.click('[aria-label="Close payment"]');
+  }, 120_000);
+});
+
 describe('Sales Register: invoice payment and administrator reversal', () => {
   it('pay 1000 on INV-1001 (owes 2450) by bank transfer; then reverse it with a reason; the original stays', async () => {
     await nav('Sales Register');

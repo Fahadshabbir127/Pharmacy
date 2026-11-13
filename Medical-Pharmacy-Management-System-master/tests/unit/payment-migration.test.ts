@@ -332,3 +332,79 @@ describe('startup report on a running server', () => {
     }
   });
 });
+
+describe('Batch 2d: rollback, crash recovery and verified backup for 0009 and 0010', () => {
+  const paymentState = (db: DbAdapter) => ({
+    money: money(db),
+    payments: db.all('SELECT * FROM payments ORDER BY id'),
+    allocations: db.all('SELECT id, payment_id, customer_id, target, sale_id, invoice_number, kind, amount, source FROM payment_allocations ORDER BY id'),
+    sales: db.all('SELECT id, balance_due, settlement_status FROM sales_headers ORDER BY id'),
+    audit: db.get<any>('SELECT COUNT(*) n FROM audit_logs').n,
+  });
+  const triggerSql = (db: DbAdapter) => db.all("SELECT name, sql FROM sqlite_master WHERE type = 'trigger' ORDER BY name");
+  const inject = (m: Migration): Migration => ({ ...m, up: (d) => { m.up(d); throw new Error(`injected failure at the end of ${m.version}`); } });
+  /** a v8 / v9 database with a Batch 2b-style state (confirmed item next to an advance) for 0010 to act on */
+  async function atVersion(v: number) {
+    const { dir, file } = copy('payments-edge-cases');
+    const db = DbAdapter.open(file);
+    await migrate(db, MIGRATIONS.filter((m) => m.version <= v), { backupDir: path.join(dir, 'b0') });
+    if (v >= 9) {
+      db.run(`INSERT INTO customer_carried_over_balances (tenant_id, customer_id, amount, stored_balance, explained_balance, difference, discrepancy_key, reason, confirmed_by_user_id, confirmed_at, client_txn_id)
+              VALUES (1, 2, 1200, 1150, -50, 1200, 'k-2d', 'notebook', 1, '2026-11-12 10:00:00', ?)`, [crypto.randomUUID()]);
+    }
+    return { dir, file, db };
+  }
+
+  for (const version of [9, 10]) {
+    it(`a failure at the end of ${String(version).padStart(4, '0')} rolls everything back (tables, triggers, rows, balances); the real migration then succeeds`, async () => {
+      const { db } = await atVersion(version - 1);
+      const before = paymentState(db);
+      const triggers = triggerSql(db);
+      const tables = db.tableNames();
+      const target = MIGRATIONS.find((m) => m.version === version)!;
+      await expect(migrate(db, [...MIGRATIONS.filter((m) => m.version < version), inject(target)], { backupDir: path.join(os.tmpdir(), `pm-rb-${version}-${Date.now()}`) })).rejects.toThrow(/injected failure/);
+      expect(currentVersion(db)).toBe(version - 1);
+      expect(db.tableNames()).toEqual(tables);
+      expect(triggerSql(db)).toEqual(triggers); // the 0008 guards are intact even though 0009 drops and recreates them
+      expect(paymentState(db)).toEqual(before);
+      // the append-only protection still works after the rolled-back attempt
+      expect(() => db.run('DELETE FROM payments')).toThrow(new RegExp(PAYMENT_GUARD));
+      await migrate(db, MIGRATIONS, { backupDir: path.join(os.tmpdir(), `pm-ok-${version}-${Date.now()}`) });
+      expect(currentVersion(db)).toBe(LATEST);
+      expect(money(db)).toEqual(before.money);
+      db.close();
+    });
+
+    it(`the server is killed inside the ${String(version).padStart(4, '0')} transaction: nothing changes, a verified backup of v${version - 1} exists, the next start migrates cleanly`, async () => {
+      const { dir, file, db } = await atVersion(version - 1);
+      const before = paymentState(db);
+      db.close();
+      const dataDir = path.join(dir, 'data');
+      fs.renameSync(file, path.join(dataDir, 'khushi_pharmacy.sqlite'));
+      await expect(startServer({ workDir: dir, env: { PHARMACY_TEST_CRASH_MIGRATION: String(version) } })).rejects.toThrow(/exited early/);
+      const mid = DbAdapter.open(path.join(dataDir, 'khushi_pharmacy.sqlite'), { readonly: true });
+      expect(currentVersion(mid)).toBe(version - 1);
+      expect(paymentState(mid)).toEqual(before);
+      mid.close();
+      const backups = fs.readdirSync(path.join(dataDir, 'backups')).filter((f) => f.startsWith(`pre-migration-v${version - 1}-to-v${LATEST}`) && f.endsWith('.sqlite'));
+      expect(backups.length).toBeGreaterThanOrEqual(1);
+      const bk = DbAdapter.open(path.join(dataDir, 'backups', backups[0]), { readonly: true });
+      expect(bk.integrityCheck()).toEqual([]);
+      expect(currentVersion(bk)).toBe(version - 1);
+      expect(paymentState(bk)).toEqual(before);
+      bk.close();
+      const srv = await startServer({ workDir: dir });
+      try {
+        const after = DbAdapter.open(srv.dbFile, { readonly: true });
+        expect(currentVersion(after)).toBe(LATEST);
+        expect(money(after)).toEqual(before.money);
+        // from v9 (confirmed item present) 0010 applies Tariq's Rs. 50 advance to it and he agrees;
+        // from v8 nothing is confirmed, so Tariq is still reported. Customer 5 is reported either way (never corrected).
+        expect(reconcilePayments(after).mismatches.map((m) => m.customerId)).toEqual(version === 10 ? [5] : [2, 5]);
+        after.close();
+      } finally {
+        await srv.stop();
+      }
+    }, 120_000);
+  }
+});
