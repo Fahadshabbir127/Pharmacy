@@ -4,6 +4,45 @@ This report contains only results that were actually executed. Anything not exec
 
 ---
 
+## Phase 7, Batch 2e: invoice numbering fix (legacy defect R4)
+
+| | |
+|---|---|
+| Date | 2026-11-13 |
+| Platform | **Linux only** (Electron under a virtual display, xvfb). Not run on Windows. |
+| Commit | `f179128` (code, tests, docs) |
+
+### Root cause
+Invoice numbers were `INV-<store>-<1001 + number of the store's sales>`. A void deletes the invoice, so the count goes down and the next number already exists: the sale failed (UNIQUE constraint, HTTP 500, rolled back), or after voiding the newest invoice its number was issued again to a different sale.
+
+### Fix
+- `invoice_sequences` (migration 0011): one row per store holding the next number. Triggers refuse lowering or deleting it.
+- The start value is above every number found in invoices, payment records, allocations, and ledger and audit texts that still name deleted invoices, and never below the old formula.
+- `takeInvoiceNumber()` advances the sequence inside the sale transaction (`UPDATE … RETURNING`, under SQLite's write lock). It skips a number if it already exists.
+- Restoring a backup keeps the higher of the restored and the already-issued sequence, so receipts handed out after the backup are never duplicated.
+- No invoice number, payment, allocation, balance or ledger row is changed.
+
+### Results
+| Run | Backend (`npm test`) | Desktop E2E (`xvfb-run -a npm run test:e2e`, incl. LAN host + client) |
+|---|---|---|
+| 1 | 26 files, **368 passed**, 0 failed | 3 files, **36 passed**, 0 failed (standalone 18, payments 8, LAN 10) |
+| 2 | 26 files, **368 passed**, 0 failed | 3 files, **36 passed**, 0 failed |
+
+Lint (`tsc --noEmit`) is clean, and the DB call-site audit (291 call sites) finds no problems.
+
+### New and changed tests
+| File | Tests | What |
+|---|---|---|
+| `tests/characterization/14-invoice-numbers.test.ts` (new) | 5 | Void the oldest, a middle and the latest invoice, with new sales after each: INV-1001, INV-1-1002…1005, then 1006–1008, 1009–1011, 1012 (voided), then 1013–1014. No number is reused. 30 simultaneous sales get 30 different consecutive numbers. A failed sale (rolled back) does not use up a number. Numbering continues after restarts. Restoring an older backup continues after the highest number already issued (1005, not 1003). The database refuses lowering or deleting the sequence. |
+| `tests/unit/invoice-sequence-migration.test.ts` (new) | 13 | 0011 on copies of all 9 databases made by the original app: no invoice or financial record changes; each store's next number is above every number mentioned anywhere; the originals are untouched. `payments-edge-cases` (where the original app re-issued INV-1-1004) continues at 1007. `multi-tenant`: store 3, whose invoices were deleted, continues at 1004. An injected failure rolls back the table, triggers and audit row. A server killed inside 0011 leaves v10 untouched, with a verified backup, and the restart migrates cleanly and sells INV-1-1007. |
+| `tests/e2e/lan.e2e.ts` | +1 | Real desktop host and client: the administrator voids two older invoices from the client (INV-1-1002, INV-1-1004), then 3 host and 3 client sales are sent at once. They get INV-1-1007…1012, all new, and both computers list the same invoices. Run after the host's crash restart. |
+| `02-sales`, `00-startup`, `13-payment-integrity`, `migrations` | changed | R4 tests flipped to `[FIXED R4]`. The integrity sweep now requires every sale to succeed (in 2d, 17 sales failed on R4). The expected table list and the upgrade audit types were updated. |
+
+### Not executed
+Windows; two physical computers; restoring a backup taken on a different computer that issued numbers of its own (the sequence follows the restored file and this computer's own high-water mark only).
+
+---
+
 ## Phase 7, Batch 2d: verification of the payment batches (2a–2c)
 
 | | |
