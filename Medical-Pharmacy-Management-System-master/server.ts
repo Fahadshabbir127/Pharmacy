@@ -2058,7 +2058,11 @@ async function startServer() {
       // money taken at a sale did not lower the customer's stored balance separately (the sale added only the
       // due part), so reversing it raises the balance by the same amount the invoice is now owed again.
       const r = Pay.reversePayment(db, { paymentId: p.id, reason, clientTxnId: txn, actor: actorOf(req), audit: auditFor(req), affectsCustomerBalance: true, source: 'SALES_REGISTER' });
-      const result = { message: 'Payment reversed', payment_id: p.id, reversal_id: r.reversalId, amount: p.amount, released: r.released.map((a) => ({ target: a.target, sale_id: a.saleId, invoice_number: a.invoiceNumber, amount: a.amount })), new_balance: r.newBalance, client_txn_id: txn };
+      // items re-opened by the reversal are settled by any other advance the customer has (approved priority)
+      const reapplied = p.customer_id ? Pay.applyAvailableAdvance(db, p.customer_id, actorOf(req)) : [];
+      if (reapplied.length) logAudit(req.user?.id, req.user?.fullName, 'ADVANCE_APPLIED', `Customer #${p.customer_id} advance applied after reversal of payment #${p.id}: ${Pay.describeAllocations(reapplied)}`, 'CUSTOMER', p.customer_id, req);
+      const result = { message: 'Payment reversed', payment_id: p.id, reversal_id: r.reversalId, amount: p.amount, released: r.released.map((a) => ({ target: a.target, sale_id: a.saleId, invoice_number: a.invoiceNumber, amount: a.amount })),
+        advance_applied: reapplied.map((a) => ({ target: a.target, invoice_number: a.invoiceNumber, carried_over_id: a.carriedOverId, amount: a.amount })), new_balance: r.newBalance, client_txn_id: txn };
       idemStore(txn, ROUTE, req.user!.id, result);
       res.json(result);
     } catch (e: any) { return payErr(res, e); }
@@ -2074,6 +2078,16 @@ async function startServer() {
       const sum = Pay.customerSummary(db, c.id);
       res.json({ customer_id: c.id, name: c.name, stored_balance: sum.stored, explained_balance: sum.explained, difference: sum.difference, owed: sum.owed, advance: sum.advance,
         items: sum.items.map((i) => ({ target: i.target, sale_id: i.saleId, invoice_number: i.invoiceNumber, carried_over_id: i.carriedOverId, date: i.date, total: i.total, due: i.due })) });
+    } catch (e: any) { return payErr(res, e); }
+  });
+
+  /** Read-only preview for the Record payment window: what this amount would settle, and the advance left. */
+  app.get('/api/customers/:id/payment-preview', authenticateToken, requireRoles(['ADMIN', 'STAFF']), (req: AuthRequest, res) => {
+    try {
+      const c = customerForUser(req, Number(req.params.id));
+      const amount = Pay.parseAmount(req.query.amount, 'Payment amount');
+      const sum = Pay.customerSummary(db, c.id);
+      res.json({ customer_id: c.id, amount, stored_balance: sum.stored, owed: sum.owed, advance: sum.advance, ...Pay.previewCustomerPayment(db, c.id, amount), balance_after: Math.round((sum.stored - amount) * 100) / 100 });
     } catch (e: any) { return payErr(res, e); }
   });
 
@@ -2139,8 +2153,12 @@ async function startServer() {
       const id = Number(db.run(`INSERT INTO customer_carried_over_balances (tenant_id, customer_id, amount, stored_balance, explained_balance, difference, discrepancy_key, reason, confirmed_by_user_id, confirmed_at, client_txn_id, migration_issue_id)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, [c.tenant_id, c.id, sum.difference, sum.stored, sum.explained, sum.difference, key, reason, req.user!.id, at, txn, issue?.id ?? null]).lastInsertRowid);
       logAudit(req.user?.id, req.user?.fullName, 'CARRIED_OVER_BALANCE_CONFIRMED', `Administrator #${req.user!.id} confirmed Rs. ${sum.difference.toFixed(2)} as a carried-over balance for customer "${c.name}" (#${c.id}) at ${at}: stored balance Rs. ${sum.stored.toFixed(2)}, explained by records Rs. ${sum.explained.toFixed(2)}${issue ? ` (migration issue #${issue.id})` : ''}. Stored balance not changed. Reason: ${reason}`, 'CUSTOMER', c.id, req);
+      // the customer's existing advance settles the confirmed item (approved priority), permanently recorded
+      const advanceApplied = Pay.applyAvailableAdvance(db, c.id, actorOf(req));
+      if (advanceApplied.length) logAudit(req.user?.id, req.user?.fullName, 'ADVANCE_APPLIED', `Customer #${c.id} advance applied after confirming carried-over balance #${id}: ${Pay.describeAllocations(advanceApplied)}`, 'CUSTOMER', c.id, req);
       const after = Pay.customerSummary(db, c.id);
-      const result = { message: 'Carried-over balance confirmed', carried_over_id: id, customer_id: c.id, amount: sum.difference, stored_balance: sum.stored, explained_balance_before: sum.explained, difference_after: after.difference, client_txn_id: txn };
+      const result = { message: 'Carried-over balance confirmed', carried_over_id: id, customer_id: c.id, amount: sum.difference, stored_balance: sum.stored, explained_balance_before: sum.explained, difference_after: after.difference,
+        advance_applied: advanceApplied.map((a) => ({ target: a.target, carried_over_id: a.carriedOverId, invoice_number: a.invoiceNumber, amount: a.amount })), client_txn_id: txn };
       idemStore(txn, ROUTE, req.user!.id, result);
       res.json(result);
     } catch (e: any) { return payErr(res, e); }
@@ -2508,7 +2526,7 @@ async function startServer() {
       }
       let advanceApplied: any[] = [];
       if (customer_id && prep.due > 0.005) {
-        advanceApplied = Pay.applyAdvanceToSale(db, Number(customer_id), Number(saleId), actor);
+        advanceApplied = Pay.applyAvailableAdvance(db, Number(customer_id), actor);
         if (advanceApplied.length) {
           logAudit(req.user?.id, req.user?.fullName, 'ADVANCE_APPLIED', `Customer #${customer_id} advance applied to invoice #${nextInvNum}: ${Pay.describeAllocations(advanceApplied)}`, 'SALE', Number(saleId), req);
         }

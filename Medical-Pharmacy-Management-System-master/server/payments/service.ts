@@ -182,6 +182,44 @@ export function applyAdvanceToSale(db: DbAdapter, customerId: number, saleId: nu
   return out;
 }
 
+/**
+ * Approved priority (Batch 2c decision): the customer's available advance (oldest payment first) settles
+ * 1. the opening balance, 2. confirmed carried-over balances (oldest first), 3. the oldest unpaid invoices.
+ * Called whenever new debt appears for a customer who may have an advance: a new credit sale (P3), a Q1
+ * confirmation, a reversal that re-opens items. Never more than an item owes; every allocation is a permanent
+ * APPLY row with source ADVANCE.
+ */
+export function applyAvailableAdvance(db: DbAdapter, customerId: number, actor: Actor): Allocation[] {
+  const out: Allocation[] = [];
+  const credits = advancePayments(db, customerId);
+  if (!credits.length) return out;
+  for (const item of outstandingItems(db, customerId)) {
+    let due = item.due;
+    for (const c of credits) {
+      if (due <= TOL) break;
+      if (c.free <= TOL) continue;
+      const x = r2(Math.min(c.free, due));
+      out.push(applyAllocation(db, { paymentId: c.id, customerId, item, amount: x, source: 'ADVANCE', actor }));
+      c.free = r2(c.free - x);
+      due = r2(due - x);
+    }
+  }
+  return out;
+}
+
+/** Read-only: what a payment of `amount` from this customer would settle now (nothing is written). */
+export function previewCustomerPayment(db: DbAdapter, customerId: number, amount: number) {
+  let left = r2(amount);
+  const plan: { target: string; sale_id: number | null; invoice_number: string | null; carried_over_id: number | null; due: number; amount: number }[] = [];
+  for (const i of outstandingItems(db, customerId)) {
+    if (left <= TOL) break;
+    const x = r2(Math.min(left, i.due));
+    plan.push({ target: i.target, sale_id: i.saleId, invoice_number: i.invoiceNumber, carried_over_id: i.carriedOverId, due: i.due, amount: x });
+    left = r2(left - x);
+  }
+  return { allocations: plan, advance_after: left };
+}
+
 /** Release everything a payment still has applied (append-only RELEASE rows with the reason). */
 export function releaseAll(db: DbAdapter, paymentId: number, reason: string, actor: Actor): Allocation[] {
   const out: Allocation[] = [];

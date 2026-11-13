@@ -196,6 +196,18 @@ describe('reversals (P7) and the interim void (P5)', () => {
     expect(await reconciled()).toEqual([]);
   });
 
+  it('a reversal re-opens what the payment settled; another advance of the customer settles it again (approved priority)', async () => {
+    // customer 3: credit invoice 380, pays 380 (settles it), then pays 500 more (advance 500)
+    const s = await admin.post('/sales', salePayload([cartItem(await product(2), 1)], { payment_method: 'UDHAR', customer_id: 3 }));
+    const p1 = await staff.post('/customers/3/payment', { amount: 380, payment_mode: 'Cash', client_txn_id: txn() });
+    await staff.post('/customers/3/payment', { amount: 500, payment_mode: 'Card', client_txn_id: txn() });
+    const r = await admin.post(`/payments/${p1.body.payment_id}/reverse`, { reason: 'cheque bounced', client_txn_id: txn() });
+    expect(r.body).toMatchObject({ released: [{ invoice_number: s.body.invoice_number, amount: -380 }], advance_applied: [{ target: 'SALE', invoice_number: s.body.invoice_number, amount: 380 }], new_balance: -120 });
+    expect(await sale(s.body.sale_id)).toMatchObject({ balance_due: 0, settlement_status: 'PAID' });
+    expect((await admin.get('/customers/3/outstanding')).body).toMatchObject({ advance: 120, difference: 0 });
+    expect(await reconciled()).toEqual([]);
+  });
+
   it('a walk-in sale payment can only be reversed by voiding the sale', async () => {
     const s = await admin.post('/sales', salePayload([cartItem(await product(1), 1)]));
     const r = await admin.post(`/payments/${s.body.payments[0].payment_id}/reverse`, { reason: 'x', client_txn_id: txn() });
@@ -285,7 +297,8 @@ describe('Q1: administrator-confirmed carried-over balances (database from the o
     const id = txn();
     const ok = await admin.post('/customers/2/carried-over-balance', { client_txn_id: id, expected_difference: 1200, reason: 'Balance from the paper notebook before the software' });
     expect(ok.status).toBe(200);
-    expect(ok.body).toMatchObject({ amount: 1200, stored_balance: 1150, explained_balance_before: -50, difference_after: 0 });
+    expect(ok.body).toMatchObject({ amount: 1200, stored_balance: 1150, explained_balance_before: -50, difference_after: 0,
+      advance_applied: [{ target: 'CARRIED_OVER_BALANCE', amount: 50 }] }); // the existing Rs. 50 advance settles part of it (2c decision)
     expect(await balance(2)).toBe(before); // stored balance never changed
     expect((await admin.post('/customers/2/carried-over-balance', { client_txn_id: id, expected_difference: 1200, reason: 'x' })).body.replayed).toBe(true);
     expect((await confirm(2, { expected_difference: 1200, reason: 'twice' })).body.code).toBe('NO_DISCREPANCY');
@@ -296,10 +309,14 @@ describe('Q1: administrator-confirmed carried-over balances (database from the o
     });
     // the reconciliation no longer lists Tariq; the negative difference is still there, untouched
     expect((await reconciled()).map((m: any) => m.name)).toEqual(['Dr. Rashid Ahmad', 'Fixture Voided']);
-    // payments settle the carried-over item (no opening balance here); the existing Rs. 50 advance stays advance
+    expect((await q1<any>("SELECT description FROM audit_logs WHERE action_type = 'ADVANCE_APPLIED'")).description).toMatch(/after confirming carried-over balance/);
+    // the preview shows what a payment would settle, without writing anything
+    const pv = (await staff.get('/customers/2/payment-preview?amount=1000')).body;
+    expect(pv).toMatchObject({ owed: 1150, advance: 0, allocations: [{ target: 'CARRIED_OVER_BALANCE', due: 1150, amount: 1000 }], advance_after: 0, balance_after: 150 });
+    // payments settle the carried-over item (no opening balance here)
     const p = await staff.post('/customers/2/payment', { amount: 1000, payment_mode: 'Cash', client_txn_id: txn() });
     expect(p.body).toMatchObject({ newBalance: 150, allocations: [{ target: 'CARRIED_OVER_BALANCE', amount: 1000 }] });
-    expect((await admin.get('/customers/2/outstanding')).body).toMatchObject({ stored_balance: 150, explained_balance: 150, difference: 0, advance: 50, items: [{ target: 'CARRIED_OVER_BALANCE', due: 200 }] });
+    expect((await admin.get('/customers/2/outstanding')).body).toMatchObject({ stored_balance: 150, explained_balance: 150, difference: 0, advance: 0, items: [{ target: 'CARRIED_OVER_BALANCE', due: 150 }] });
     expect((await reconciled()).map((m: any) => m.name)).toEqual(['Dr. Rashid Ahmad', 'Fixture Voided']);
   }, 120_000);
 });

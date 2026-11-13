@@ -53,7 +53,14 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
   // Payment Modal State
   const [showPaymentModal, setShowPaymentModal] = useState<boolean>(false);
   const [paymentMethod, setPaymentMethod] = useState<'CASH' | 'PARTIAL' | 'UDHAR'>('CASH');
-  const [amountPaidInput, setAmountPaidInput] = useState<string>('');
+  // Phase 7 Batch 2c: split payments (P6). One row per amount and method; the server records and validates them.
+  type PayRow = { key: number; method: 'CASH' | 'CARD' | 'BANK_TRANSFER' | 'MOBILE_WALLET'; wallet: string; amount: string; reference: string };
+  const [payRows, setPayRows] = useState<PayRow[]>([]);
+  const payKey = useRef(1);
+  const newRow = (method: PayRow['method'], amount: number | string): PayRow => ({ key: payKey.current++, method, wallet: 'EasyPaisa', amount: String(amount), reference: '' });
+  const shortcutFullCash = (total: number) => { setPaymentMethod('CASH'); setPayRows([newRow('CASH', total)]); };
+  const shortcutPartial = (total: number) => { setPaymentMethod('PARTIAL'); setPayRows([newRow('CASH', Math.round(total / 2))]); };
+  const shortcutUdhar = () => { setPaymentMethod('UDHAR'); setPayRows([]); };
   const [submittingSale, setSubmittingSale] = useState<boolean>(false);
 
   // New Customer Quick Modal
@@ -534,7 +541,7 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
       if (applyServerPrices(q)) setPriceNotice('Prices were updated from the pharmacy server. Please check the total with the customer.');
       setQuote(q);
       setQuoteState('ok');
-      if (paymentMethod === 'CASH') setAmountPaidInput((v) => (v === '' || sameMoney(Number(v), grandTotal) ? String(q.grand_total) : v));
+      if (paymentMethod === 'CASH') setPayRows((rows) => (rows.length === 1 && rows[0].method === 'CASH' && (rows[0].amount === '' || sameMoney(Number(rows[0].amount), grandTotal)) ? [{ ...rows[0], amount: String(q.grand_total) }] : rows));
     } catch (err: any) {
       if (seq !== quoteSeq.current) return;
       setQuote(null);
@@ -567,7 +574,26 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
   const serverTotal = quote ? quote.grand_total : null;
   const reasonMissing = !!quote?.discount.reason_required && !discountReason.trim() && !discountGrant;
   const authMissing = !!quote?.discount.authorization_required;
-  const canComplete = quoteState === 'ok' && !!quote && !reasonMissing && !authMissing;
+  // display-only summary of the payment rows (the server repeats every check and is final)
+  const paySummary = React.useMemo(() => {
+    const total = serverTotal ?? grandTotal;
+    const errors: string[] = [];
+    let cash = 0, nonCash = 0;
+    for (const [i, r] of payRows.entries()) {
+      const n = Number(r.amount);
+      if (!(Number.isFinite(n) && n > 0 && Math.abs(n * 100 - Math.round(n * 100)) < 1e-6)) errors.push(`Payment ${i + 1}: enter an amount greater than 0 (at most 2 decimals).`);
+      else if (r.method === 'CASH') cash += n; else nonCash += n;
+    }
+    cash = Math.round(cash * 100) / 100; nonCash = Math.round(nonCash * 100) / 100;
+    if (nonCash > total + 0.004) errors.push(`Card, bank and wallet payments (Rs. ${nonCash.toFixed(2)}) are more than the bill. Only cash can be given back as change.`);
+    const cashApplied = Math.min(cash, Math.max(0, total - nonCash));
+    const change = Math.round((cash - cashApplied) * 100) / 100;
+    const paid = Math.round((nonCash + cashApplied) * 100) / 100;
+    const remaining = Math.max(0, Math.round((total - paid) * 100) / 100);
+    if (remaining > 0.004 && !selectedCustomer) errors.push(`Walk-in customer must pay the full bill (Rs. ${remaining.toFixed(2)} still unpaid). Select a customer to put the rest on Udhar.`);
+    return { cash, nonCash, change, paid, remaining, errors, label: remaining <= 0.004 ? 'CASH' : paid > 0 ? 'PARTIAL' : 'UDHAR' };
+  }, [payRows, serverTotal, grandTotal, selectedCustomer]);
+  const canComplete = quoteState === 'ok' && !!quote && !reasonMissing && !authMissing && paySummary.errors.length === 0;
 
   // Handle Quick Add Customer
   const handleQuickAddCustomer = async (e: React.FormEvent) => {
@@ -722,8 +748,8 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
   const handleProcessSale = async () => {
     if (cart.length === 0) return;
 
-    if ((paymentMethod === 'PARTIAL' || paymentMethod === 'UDHAR') && !selectedCustomer) {
-      alert('Please select a customer for Partial or Udhar payment method!');
+    if (paySummary.errors.length) {
+      setPaymentError(paySummary.errors[0]);
       return;
     }
 
@@ -732,7 +758,6 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
       return;
     }
     setPaymentError(null);
-    const numericAmountPaid = paymentMethod === 'UDHAR' ? 0 : Number(amountPaidInput || quote.grand_total);
 
     // Phase 7: the server prices the sale; grand_total is the figure the cashier showed the customer, and the
     // server refuses the sale if its own total differs (PRICE_MISMATCH).
@@ -745,8 +770,8 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
       net_amount: quote.net_amount,
       total_gst: quote.total_gst,
       grand_total: quote.grand_total,
-      payment_method: paymentMethod,
-      amount_paid: numericAmountPaid,
+      payment_method: paySummary.label as 'CASH' | 'PARTIAL' | 'UDHAR',
+      payments: payRows.map((r) => ({ method: r.method, method_detail: r.method === 'MOBILE_WALLET' ? r.wallet : undefined, amount: Number(r.amount), reference: r.reference.trim() || undefined })),
       discount_reason: discountReason.trim() || undefined,
       discount_authorization: discountGrant?.token
     };
@@ -1301,8 +1326,7 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
               <button
                 disabled={cart.length === 0}
                 onClick={() => {
-                  setPaymentMethod('CASH');
-                  setAmountPaidInput(String(grandTotal));
+                  shortcutFullCash(grandTotal);
                   setShowPaymentModal(true);
                 }}
                 className={`py-2 px-2 rounded font-bold text-xs flex items-center justify-center space-x-1 transition-all ${
@@ -1318,8 +1342,7 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
               <button
                 disabled={cart.length === 0}
                 onClick={() => {
-                  setPaymentMethod('UDHAR');
-                  setAmountPaidInput('0');
+                  shortcutUdhar();
                   setShowPaymentModal(true);
                 }}
                 className={`py-2 px-2 rounded font-bold text-xs flex items-center justify-center space-x-1 transition-all ${
@@ -1358,10 +1381,7 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
                 <div className="grid grid-cols-3 gap-2">
                   <button
                     type="button"
-                    onClick={() => {
-                      setPaymentMethod('CASH');
-                      setAmountPaidInput(String(grandTotal));
-                    }}
+                    onClick={() => shortcutFullCash(serverTotal ?? grandTotal)}
                     className={`py-2.5 px-2 rounded-xl font-bold border text-center text-xs transition-all ${
                       paymentMethod === 'CASH'
                         ? 'bg-emerald-600 border-emerald-500 text-white shadow-md'
@@ -1373,10 +1393,7 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
 
                   <button
                     type="button"
-                    onClick={() => {
-                      setPaymentMethod('PARTIAL');
-                      setAmountPaidInput(String(Math.round(grandTotal / 2)));
-                    }}
+                    onClick={() => shortcutPartial(serverTotal ?? grandTotal)}
                     className={`py-2.5 px-2 rounded-xl font-bold border text-center text-xs transition-all ${
                       paymentMethod === 'PARTIAL'
                         ? 'bg-amber-600 border-amber-500 text-white shadow-md'
@@ -1388,10 +1405,7 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
 
                   <button
                     type="button"
-                    onClick={() => {
-                      setPaymentMethod('UDHAR');
-                      setAmountPaidInput('0');
-                    }}
+                    onClick={shortcutUdhar}
                     className={`py-2.5 px-2 rounded-xl font-bold border text-center text-xs transition-all ${
                       paymentMethod === 'UDHAR'
                         ? 'bg-rose-600 border-rose-500 text-white shadow-md'
@@ -1403,20 +1417,37 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
                 </div>
               </div>
 
-              {/* Amount Paid Input */}
-              {paymentMethod !== 'UDHAR' && (
-                <div>
-                  <label className="block text-slate-300 font-semibold mb-1">
-                    Cash Paid Now by Customer (Rs.):
-                  </label>
-                  <input
-                    type="number"
-                    value={amountPaidInput}
-                    onChange={(e) => setAmountPaidInput(e.target.value)}
-                    className="w-full bg-slate-800 text-white font-bold text-base p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500"
-                  />
+              {/* Phase 7 Batch 2c: payment rows (split payments). The shortcuts above fill them in. */}
+              <div className="space-y-2" data-testid="payment-rows">
+                <div className="flex items-center justify-between">
+                  <label className="block text-slate-300 font-semibold">Payments received:</label>
+                  <button type="button" data-testid="add-payment-row" onClick={() => setPayRows((rows) => [...rows, newRow(rows.some((r) => r.method === 'CASH') ? 'CARD' : 'CASH', Math.max(0, paySummary.remaining) || '')])}
+                    className="px-2 py-1 rounded-lg bg-slate-800 border border-slate-700 text-emerald-300 font-bold hover:bg-slate-700">+ Add payment</button>
                 </div>
-              )}
+                {payRows.length === 0 && <div className="text-slate-400 bg-slate-800/50 border border-slate-700 rounded-xl p-2">No payment now: the whole bill goes on Udhar (a customer is required).</div>}
+                {payRows.map((r, i) => (
+                  <div key={r.key} className="grid grid-cols-12 gap-1.5 items-center" data-testid="payment-row">
+                    <select aria-label={`Payment ${i + 1} method`} value={r.method} onChange={(e) => setPayRows((rows) => rows.map((x) => (x.key === r.key ? { ...x, method: e.target.value as PayRow['method'] } : x)))}
+                      className="col-span-4 bg-slate-800 text-white p-2 rounded-lg border border-slate-700">
+                      <option value="CASH">Cash (نقد)</option><option value="CARD">Card</option><option value="BANK_TRANSFER">Bank Transfer</option><option value="MOBILE_WALLET">Mobile Wallet</option>
+                    </select>
+                    <input type="number" min="0.01" step="0.01" aria-label={`Payment ${i + 1} amount`} value={r.amount} onChange={(e) => setPayRows((rows) => rows.map((x) => (x.key === r.key ? { ...x, amount: e.target.value } : x)))}
+                      title={r.method === 'CASH' ? 'Cash received from the customer (change is calculated)' : 'Amount paid'}
+                      className="col-span-3 bg-slate-800 text-white font-bold p-2 rounded-lg border border-slate-700 focus:outline-none focus:border-emerald-500" />
+                    {r.method === 'MOBILE_WALLET' ? (
+                      <select aria-label={`Payment ${i + 1} wallet`} value={r.wallet} onChange={(e) => setPayRows((rows) => rows.map((x) => (x.key === r.key ? { ...x, wallet: e.target.value } : x)))} className="col-span-2 bg-slate-800 text-white p-2 rounded-lg border border-slate-700">
+                        <option>EasyPaisa</option><option>JazzCash</option>
+                      </select>
+                    ) : null}
+                    <input type="text" maxLength={100} aria-label={`Payment ${i + 1} reference`} placeholder={r.method === 'CASH' ? '' : 'Reference (optional)'} disabled={r.method === 'CASH'} value={r.reference}
+                      onChange={(e) => setPayRows((rows) => rows.map((x) => (x.key === r.key ? { ...x, reference: e.target.value } : x)))} className={`${r.method === 'MOBILE_WALLET' ? 'col-span-2' : 'col-span-4'} bg-slate-800 text-white p-2 rounded-lg border border-slate-700 disabled:opacity-40`} />
+                    <button type="button" aria-label={`Remove payment ${i + 1}`} onClick={() => setPayRows((rows) => rows.filter((x) => x.key !== r.key))} className="col-span-1 text-rose-400 hover:text-rose-300 font-bold">✕</button>
+                  </div>
+                ))}
+                {paySummary.errors.length > 0 && (
+                  <div role="alert" data-testid="payment-row-errors" className="text-rose-300 bg-rose-950/60 border border-rose-800 rounded-lg p-2 space-y-0.5">{paySummary.errors.map((e, i) => <div key={i}>{e}</div>)}</div>
+                )}
+              </div>
 
               {/* Phase 7: totals calculated by the pharmacy server */}
               <div className="bg-slate-800/80 p-3 rounded-xl border border-slate-700 space-y-1.5" data-testid="server-totals">
@@ -1442,17 +1473,19 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
                   <span>Bill Grand Total:</span>
                   <span className="font-bold text-white" data-testid="server-grand-total">{serverTotal === null ? '...' : `Rs. ${serverTotal.toFixed(2)}`}</span>
                 </div>
+                {paySummary.cash > 0 && <div className="flex justify-between text-slate-300"><span>Cash Received:</span><span>Rs. {paySummary.cash.toFixed(2)}</span></div>}
+                {paySummary.nonCash > 0 && <div className="flex justify-between text-slate-300"><span>Card / Bank / Wallet:</span><span>Rs. {paySummary.nonCash.toFixed(2)}</span></div>}
                 <div className="flex justify-between text-emerald-400">
-                  <span>{paymentMethod === 'CASH' ? 'Cash Received:' : 'Amount Paid:'}</span>
-                  <span>Rs. {Number(amountPaidInput || 0).toFixed(2)}</span>
+                  <span>Amount Paid:</span>
+                  <span data-testid="pay-total-paid">Rs. {paySummary.paid.toFixed(2)}</span>
                 </div>
-                {paymentMethod === 'CASH' && serverTotal !== null && Number(amountPaidInput || 0) > serverTotal && (
-                  <div className="flex justify-between text-sky-300 font-bold"><span>Change to return:</span><span>Rs. {(Number(amountPaidInput) - serverTotal).toFixed(2)}</span></div>
+                {paySummary.change > 0.004 && (
+                  <div className="flex justify-between text-sky-300 font-bold"><span>Change to return:</span><span data-testid="pay-change">Rs. {paySummary.change.toFixed(2)}</span></div>
                 )}
-                {paymentMethod !== 'CASH' && (
+                {paySummary.remaining > 0.004 && (
                   <div className="flex justify-between text-rose-400 font-bold border-t pt-1 border-slate-700">
                     <span>Remaining Udhar (ادھار):</span>
-                    <span>Rs. {Math.max(0, (serverTotal ?? grandTotal) - Number(amountPaidInput || 0)).toFixed(2)}</span>
+                    <span data-testid="pay-remaining">Rs. {paySummary.remaining.toFixed(2)}</span>
                   </div>
                 )}
 

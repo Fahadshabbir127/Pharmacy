@@ -83,6 +83,44 @@ describe('allocation order and advance', () => {
   });
 });
 
+describe('approved priority for advances (Batch 2c)', () => {
+  it('an available advance settles the opening balance, then carried-over balances, then the oldest invoices, never more than owed', async () => {
+    const { db } = await fresh();
+    const cid = db.get<any>("SELECT id FROM customers WHERE name = 'Fixture Advance'").id; // advance 100, nothing owed
+    db.run(`INSERT INTO customer_carried_over_balances (tenant_id, customer_id, amount, stored_balance, explained_balance, difference, discrepancy_key, reason, confirmed_by_user_id, confirmed_at, client_txn_id)
+            VALUES (1, ?, 30, 0, -30, 30, 'k-adv', 'test', 1, '2020-01-01 00:00:00', ?)`, [cid, crypto.randomUUID()]);
+    db.run(`INSERT INTO sales_headers (invoice_number, customer_id, total_amount, net_amount, grand_total, payment_method, amount_paid, amount_due, payment_status, created_by_user_id, tenant_id)
+      VALUES ('INV-T-A', ?, 200, 200, 200, 'UDHAR', 0, 200, 'UNPAID', 1, 1)`, [cid]);
+    const applied = tx(db, () => Pay.applyAvailableAdvance(db, cid, actor));
+    expect(applied.map((a) => [a.target, a.amount])).toEqual([['CARRIED_OVER_BALANCE', 30], ['SALE', 70]]);
+    expect(Pay.advancePayments(db, cid)).toEqual([]);
+    expect(Pay.outstandingItems(db, cid).map((i) => [i.target, i.due])).toEqual([['SALE', 130]]);
+    expect(tx(db, () => Pay.applyAvailableAdvance(db, cid, actor))).toEqual([]); // no advance left: nothing more
+    expect(Pay.previewCustomerPayment(db, cid, 200)).toEqual({ allocations: [{ target: 'SALE', sale_id: expect.any(Number), invoice_number: 'INV-T-A', carried_over_id: null, due: 130, amount: 130 }], advance_after: 70 });
+    db.close();
+  });
+
+  it('migration 0010 applies advances that existed before 2c; permanent records, one audit row, balances unchanged; nothing on clean history', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'p10-'));
+    const f = path.join(dir, 'p.sqlite');
+    fs.copyFileSync(path.join(FIXTURE_DIR, 'payments-edge-cases.sqlite'), f);
+    const d = DbAdapter.open(f);
+    await migrate(d, MIGRATIONS.filter((m) => m.version <= 9), { backupDir: path.join(dir, 'b') });
+    // a Batch 2b state: Tariq's Rs. 1200 confirmed while he had a Rs. 50 advance
+    d.run(`INSERT INTO customer_carried_over_balances (tenant_id, customer_id, amount, stored_balance, explained_balance, difference, discrepancy_key, reason, confirmed_by_user_id, confirmed_at, client_txn_id)
+           VALUES (1, 2, 1200, 1150, -50, 1200, 'k-2b', 'notebook', 1, '2026-11-12 10:00:00', ?)`, [crypto.randomUUID()]);
+    const balances = d.all('SELECT id, current_balance FROM customers ORDER BY id');
+    const allocBefore = d.get<any>('SELECT COUNT(*) n FROM payment_allocations').n;
+    await migrate(d, MIGRATIONS, { backupDir: path.join(dir, 'b') });
+    expect(d.all<any>("SELECT target, amount, source FROM payment_allocations WHERE id > (SELECT MAX(id) - 1 FROM payment_allocations)")).toEqual([{ target: 'CARRIED_OVER_BALANCE', amount: 50, source: 'ADVANCE' }]);
+    expect(d.get<any>('SELECT COUNT(*) n FROM payment_allocations').n).toBe(allocBefore + 1); // only Tariq had advance next to debt
+    expect(d.all('SELECT id, current_balance FROM customers ORDER BY id')).toEqual(balances);
+    expect(d.all<any>("SELECT target_id, description FROM audit_logs WHERE action_type = 'PAYMENT_ADVANCE_APPLIED'")).toEqual([{ target_id: 2, description: expect.stringMatching(/carried-over balance #\d+ Rs\. 50/) }]);
+    expect(reconcilePayments(d).mismatches.map((m) => m.customerId)).toEqual([5]); // Tariq now agrees; customer 5's unconfirmed discrepancy is not touched
+    d.close();
+  });
+});
+
 describe('reversal', () => {
   it('releases everything the payment applied, records the OUT reversal once, raises the balance; a second reversal is refused (service and database)', async () => {
     const { db } = await fresh();

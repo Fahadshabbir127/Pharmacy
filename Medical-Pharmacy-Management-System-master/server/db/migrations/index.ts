@@ -8,6 +8,7 @@ import { lanAndIdempotency } from './0006_lan_and_idempotency';
 import { batchInventory } from './0007_batch_inventory';
 import { payments } from './0008_payments';
 import { carriedOverBalances } from './0009_carried_over_balances';
+import { applyExistingAdvances } from './0010_apply_existing_advances';
 
 /** Append new migrations here. Never edit or reorder an applied one. */
-export const MIGRATIONS: Migration[] = [baseline, indexes, restoreLegacyColumns, archiveSupport, fkPlaceholders, lanAndIdempotency, batchInventory, payments, carriedOverBalances];
+export const MIGRATIONS: Migration[] = [baseline, indexes, restoreLegacyColumns, archiveSupport, fkPlaceholders, lanAndIdempotency, batchInventory, payments, carriedOverBalances, applyExistingAdvances];

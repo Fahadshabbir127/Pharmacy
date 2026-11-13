@@ -193,6 +193,10 @@ export interface SaleHeader {
   amount_paid: number;
   amount_due: number;
   payment_status: 'PAID' | 'PARTIAL' | 'UNPAID';
+  /** Phase 7: what is still owed now and its status (payment_status/amount_due are the at-sale snapshot) */
+  balance_due?: number | null;
+  settlement_status?: 'PAID' | 'PARTIAL' | 'UNPAID' | null;
+  payments?: any[];
   created_by_user_id: number;
   created_by_name?: string;
   previous_balance?: number;

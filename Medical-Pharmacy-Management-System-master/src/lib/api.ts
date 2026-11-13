@@ -7,6 +7,25 @@ export function newClientTxnId(): string {
   return typeof crypto !== 'undefined' && 'randomUUID' in crypto ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
+export interface PaymentAllocationRow { id: number; target: 'SALE' | 'OPENING_BALANCE' | 'CARRIED_OVER_BALANCE'; sale_id: number | null; invoice_number: string | null; carried_over_id: number | null; kind: 'APPLY' | 'RELEASE'; amount: number; reason: string | null; source: string; created_at: string }
+export interface PaymentRecord {
+  id: number; customer_id: number | null; sale_id: number | null; invoice_number: string | null; direction: 'IN' | 'OUT'; kind: string; method: string; method_detail: string | null;
+  amount: number; cash_tendered: number | null; change_given: number | null; reference: string | null; notes: string | null; reason: string | null; reverses_payment_id: number | null;
+  received_at: string; received_by_name?: string | null; source: string; allocations?: PaymentAllocationRow[]; reversed_by?: { id: number; amount: number; reason: string; received_at: string } | null; applied_to_this_invoice?: number;
+}
+export interface CustomerOutstanding { customer_id: number; name: string; stored_balance: number; explained_balance: number; difference: number; owed: number; advance: number; items: { target: string; sale_id: number | null; invoice_number: string | null; carried_over_id: number | null; date: string; total: number; due: number }[] }
+export interface CustomerPaymentResult { payment_id: number; amount: number; method: string; method_detail: string | null; newBalance: number; allocations: { target: string; sale_id: number | null; invoice_number: string | null; carried_over_id: number | null; amount: number }[]; advance_remaining: number; replayed?: boolean }
+export interface InvoicePaymentResult { payment_id: number; sale_id: number; invoice_number: string; amount: number; method: string; balance_due: number; settlement_status: string; new_balance: number | null; replayed?: boolean }
+export interface PaymentReconciliationReport {
+  checked_at: string; customers_checked: number;
+  mismatches: { customer_id: number; name: string; stored_balance: number; explained_balance: number; difference: number; confirmable: boolean; action: string }[];
+  untracked_sales: number; walk_in_sales_with_due: any[]; migration_issues: any[]; carried_over_balances: any[];
+}
+export const PAYMENT_METHOD_OPTIONS = [
+  { value: 'CASH', label: 'Cash (نقد)' }, { value: 'CARD', label: 'Card' }, { value: 'BANK_TRANSFER', label: 'Bank Transfer' }, { value: 'MOBILE_WALLET', label: 'Mobile Wallet' },
+] as const;
+export const methodLabel = (m: string, d?: string | null) => (m === 'MOBILE_WALLET' ? d || 'Mobile Wallet' : m === 'BANK_TRANSFER' ? 'Bank Transfer' : m === 'CARD' ? 'Card' : m === 'CASH' ? 'Cash' : d || 'Unspecified');
+
 /** The host's price calculation for a cart (Phase 7, Batch 1). */
 export interface SaleQuote {
   lines: { product_id: number; product_name: string; unit: string; quantity: number; unit_price: number; discount_percent: number; gross: number; discount_amount: number; gst_percent: number; gst_amount: number; subtotal: number }[];
@@ -325,6 +344,21 @@ export const api = {
     }),
   getCustomerLedger: (customerId: number) =>
     request<{ customer: Customer; ledger: LedgerEntry[] }>(`/customers/${customerId}/ledger`),
+  // ---- Phase 7 Batch 2c: payments (the host calculates and validates everything) ----
+  getCustomerOutstanding: (customerId: number) => request<CustomerOutstanding>(`/customers/${customerId}/outstanding`),
+  getCustomerPayments: (customerId: number) => request<PaymentRecord[]>(`/customers/${customerId}/payments`),
+  previewCustomerPayment: (customerId: number, amount: number) =>
+    request<{ amount: number; stored_balance: number; owed: number; advance: number; allocations: { target: string; sale_id: number | null; invoice_number: string | null; carried_over_id: number | null; due: number; amount: number }[]; advance_after: number; balance_after: number }>(`/customers/${customerId}/payment-preview?amount=${encodeURIComponent(String(amount))}`),
+  recordCustomerPaymentV2: (customerId: number, data: { amount: number; method: string; method_detail?: string; reference?: string; notes?: string }, clientTxnId: string) =>
+    request<CustomerPaymentResult>(`/customers/${customerId}/payment`, { method: 'POST', body: JSON.stringify({ ...data, client_txn_id: clientTxnId }) }),
+  recordInvoicePayment: (saleId: number, data: { amount: number; method: string; method_detail?: string; reference?: string; notes?: string }, clientTxnId: string) =>
+    request<InvoicePaymentResult>(`/sales/${saleId}/payments`, { method: 'POST', body: JSON.stringify({ ...data, client_txn_id: clientTxnId }) }),
+  reversePayment: (paymentId: number, reason: string, clientTxnId: string) =>
+    request<{ payment_id: number; reversal_id: number; amount: number; released: any[]; advance_applied: any[]; new_balance: number | null; replayed?: boolean }>(`/payments/${paymentId}/reverse`, { method: 'POST', body: JSON.stringify({ reason, client_txn_id: clientTxnId }) }),
+  getPaymentReconciliation: () => request<PaymentReconciliationReport>('/payments/reconciliation'),
+  confirmCarriedOverBalance: (customerId: number, expectedDifference: number, reason: string, clientTxnId: string) =>
+    request<{ carried_over_id: number; amount: number; stored_balance: number; explained_balance_before: number; difference_after: number; advance_applied: any[]; replayed?: boolean }>(`/customers/${customerId}/carried-over-balance`, { method: 'POST', body: JSON.stringify({ expected_difference: expectedDifference, reason, client_txn_id: clientTxnId }) }),
+
   /** Phase 7 Batch 2b: every payment carries a transaction id (pass the same one when retrying the same payment). */
   recordCustomerPayment: (customerId: number, amount: number, payment_mode: string, notes?: string, clientTxnId?: string) =>
     request<{ message: string; newBalance: number }>(`/customers/${customerId}/payment`, {

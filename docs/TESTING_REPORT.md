@@ -4,6 +4,38 @@ This report contains only results that were actually executed. Anything not exec
 
 ---
 
+## Phase 7, Batch 2c: payment screens, advance priority, retry protection
+
+| | |
+|---|---|
+| Date | 2026-11-13 |
+| Environment | Linux container (no Windows), Node 22.23.4, Electron 45.2.3 under `xvfb-run` |
+| Commands | `npm run lint`, `npm run audit:db-callsites`, `npm test`, `xvfb-run -a npm run test:e2e` (run three times: twice before and once after a final cosmetic change) |
+| Result | **Unit/backend: 23 files, 344 tests, all passing. Desktop end-to-end: 3 files, 34 tests, all passing on three runs (83.0 s, 82.6 s, 82.3 s).** Lint clean; DB call-site audit clean. API protocol 4 (unchanged). |
+
+Decision applied: a customer's advance settles **1. opening balance, 2. confirmed carried-over balances (oldest first), 3. oldest invoices**; the rest stays advance. Applied whenever new debt appears (credit sale, Q1 confirmation, a reversal that re-opens items) and once for existing advances by migration `0010_apply_existing_advances` (permanent allocation rows, one audit row per customer, balances unchanged, unconfirmed discrepancies untouched).
+
+### New and changed tests
+| File | Tests | Covers |
+|---|---|---|
+| `tests/e2e/payments.e2e.ts` (new, real desktop app) | 7 | POS cash 500 + card 80 on a 380 bill: change 200, receipt lists each payment with cash received and change; walk-in must pay in full (Complete disabled, message); customer payment with **server preview** (opening 1200 settled, 300 advance), **answer lost after the host saved it → "NOT CONFIRMED" → Retry with the same transaction id → "already saved earlier - not recorded twice"**, exactly one payment; **double-click records once**; Open invoices / Payment history tabs; advance settles the next credit sale; Sales Register invoice payment (more than owed blocked) and **administrator reversal with mandatory reason** (original kept, reversal row, balance restored); **staff: no Reverse, no Balance review; host refuses with 403**; Q1 balance review: unexplained Rs. 500 listed, reason required, confirmed, stored balance unchanged, item appears in Open invoices. |
+| `tests/e2e/lan.e2e.ts` | +1 | Client UI customer payment visible on the host at once; host invoice payment visible in the client's Sales Register; **host and client pay the same remaining 1700 simultaneously: one accepted, one `OVERPAYMENT`; both computers show PAID and balance 0**. |
+| `tests/characterization/12-payments.test.ts` | +1, 1 updated | Reversal re-opens items and another advance settles them again; Q1: the existing advance settles part of the confirmed balance; payment preview |
+| `tests/unit/payment-service.test.ts` | +2 | Advance priority (opening → carried-over → invoices, never more than owed); migration 0010 on a 2b-state database |
+
+### Screenshots
+The E2E runs save screenshots (POS split payment, receipt with split payments, walk-in rule, customer payment preview, NOT CONFIRMED, result after retry, payment history, invoice payment, reversal, staff view, balance review, carried-over item, client payment and client Sales Register).
+
+### Not executed (Batch 2c)
+| Area | Status |
+|---|---|
+| **Windows hardware** | Not executed. All results are Linux (Electron under a virtual display). |
+| Real network loss | Simulated in the page (request sent, answer dropped); not a real cable/Wi-Fi drop |
+| Two physical computers | Host + client ran on one machine over 127.0.0.1 |
+| Printing of split-payment receipts | Screen only (printer work is Batch 5) |
+
+---
+
 ## Phase 7, Batch 2b: payment module and APIs, Q1 carried-over balances
 
 | | |

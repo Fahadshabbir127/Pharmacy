@@ -188,6 +188,50 @@ describe('Phase 7 Batch 1: the host prices sales made on a client', () => {
   }, 120_000);
 });
 
+describe('Phase 7 Batch 2c: payments between host and client', () => {
+  it('a payment recorded in the client UI is on the host at once; a host payment is seen in the client UI; a simultaneous double payment of the same balance is accepted once', async () => {
+    await client.win.goto('app://braintech/index.html');
+    await loginUi(client.win, ADMIN.user, ADMIN.password);
+    await printOff(client.win);
+    await client.win.click('button:has-text("Customers & Udhar")');
+    await client.win.click('text=Chaudhry Muhammad Ali >> visible=true'); // owes 2450 on INV-1001
+    await client.win.click('button:has-text("Receive Payment")');
+    await client.win.fill('input[aria-label="Payment amount"]', '450');
+    await client.win.click('[data-testid="record-payment"]');
+    await client.win.waitForSelector('[data-testid="payment-new-balance"]:has-text("Rs. 2000.00")', { timeout: 15_000 });
+    await client.win.screenshot({ path: path.join(clientBase, '06-client-customer-payment.png') });
+    await client.win.click('button:has-text("Done")');
+
+    const cust = (await apiFromRenderer(host.win, 'GET', '/customers')).body.find((c: any) => c.name === 'Chaudhry Muhammad Ali');
+    expect(cust.current_balance).toBe(2000);
+    const onHost = (await apiFromRenderer(host.win, 'GET', `/customers/${cust.id}/payments`)).body;
+    // (order-independent: the demo sale is stamped 10:30 of the setup day)
+    expect(onHost.map((p: any) => [p.kind, p.amount, p.allocations.map((a: any) => a.invoice_number)]).sort()).toEqual([['CUSTOMER_PAYMENT', 450, ['INV-1001']], ['SALE_TENDER', 200, ['INV-1001']]]);
+
+    // the host records an invoice payment; the client's Sales Register shows it
+    const sale = (await apiFromRenderer(host.win, 'GET', '/sales/history')).body.find((s: any) => s.invoice_number === 'INV-1001');
+    expect((await apiFromRenderer(host.win, 'POST', `/sales/${sale.id}/payments`, { amount: 300, method: 'CARD', client_txn_id: 'e2e-host-inv-pay-0001' })).status).toBe(200);
+    await client.win.click('button:has-text("Sales Register")');
+    const panel = client.win.locator('[data-testid="invoice-payments-INV-1001"]');
+    await expect.poll(async () => panel.locator('[data-testid="balance-due"]').innerText(), { timeout: 15_000 }).toBe('Rs. 1700.00');
+    await client.win.screenshot({ path: path.join(clientBase, '07-client-sales-register-after-host-payment.png') });
+
+    // host and client pay the remaining 1700 at the same moment: exactly one is accepted
+    const [a, b] = await Promise.all([
+      apiFromRenderer(host.win, 'POST', `/sales/${sale.id}/payments`, { amount: 1700, method: 'CASH', client_txn_id: 'e2e-race-pay-host-01' }),
+      apiFromRenderer(client.win, 'POST', `/sales/${sale.id}/payments`, { amount: 1700, method: 'CASH', client_txn_id: 'e2e-race-pay-client-01' }),
+    ]);
+    expect([a.status, b.status].sort()).toEqual([200, 400]);
+    expect((a.status === 400 ? a : b).body.code).toBe('OVERPAYMENT');
+    for (const i of [host, client]) {
+      const d = (await apiFromRenderer(i.win, 'GET', `/sales/${sale.id}`)).body;
+      expect(d).toMatchObject({ balance_due: 0, settlement_status: 'PAID' });
+      expect((await apiFromRenderer(i.win, 'GET', '/customers')).body.find((c: any) => c.id === cust.id).current_balance).toBe(0);
+    }
+    await client.win.click('button:has-text("Billing / POS")');
+  }, 120_000);
+});
+
 describe('host crash after saving a sale, before answering (the hardest case)', () => {
   it('the client shows SALE NOT CONFIRMED, keeps the cart; "Check status" finds the saved sale exactly once', async () => {
     fs.rmSync(crashMarker); // arm the one-shot crash: the host backend dies right after COMMIT of the next sale
