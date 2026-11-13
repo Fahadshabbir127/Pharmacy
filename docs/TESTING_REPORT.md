@@ -30,7 +30,7 @@ This report contains only results that were actually executed. Anything not exec
 ### Findings (not fixed in 2d: verification only)
 | Finding | Impact | Recommendation |
 |---|---|---|
-| **[LEGACY-BUG R4] invoice numbering after a void** (pre-existing; reproduced by the sweep: 17 of 34 sales after voids failed with a duplicate invoice number, each fully rolled back) | After an older invoice is voided, **every later sale fails** until numbering is fixed. No data corruption. | Fix with an invoice sequence (existing numbers kept) – needs approval; until then void only the most recent invoice |
+| **[LEGACY-BUG R4] invoice numbering after a void** (pre-existing; reproduced by the sweep: 17 of 34 sales after voids failed with a duplicate invoice number, each fully rolled back) | After an older invoice is voided, **every later sale fails** until numbering is fixed. No data corruption. | **Fixed in Batch 2e** (see that section) |
 | Version-mismatch handling in the client | The blocking "Different software versions" screen stops the user, but the client's request forwarder itself does not refuse API calls in that state | The host stays safe (tested); harden the client in a later batch |
 
 ### Not executed (Batch 2d)
@@ -461,7 +461,7 @@ New items not already listed in `PROJECT_AUDIT.md` are marked **NEW**.
 |---|---|---|
 | R1 / C3 | A sale whose response is lost is queued offline and re-posted with no idempotency, so **the server records it twice**. A sale rejected with HTTP 400 stays queued and is retried forever. **Any** API error, not only network failure, prints a receipt with an `OFFLINE-…` number. | `05` |
 | C3 | Posting the same sale twice creates two invoices and deducts stock twice | `02` |
-| R4 | Deleting an older invoice makes **all later sales fail** (HTTP 500, UNIQUE constraint on invoice number). Deleting the newest invoice re-issues its number to a different sale. | `02` |
+| R4 | Deleting an older invoice makes **all later sales fail** (HTTP 500, UNIQUE constraint on invoice number). Deleting the newest invoice re-issues its number to a different sale. **Fixed in Phase 7 Batch 2e.** | `02` |
 | C2 / R5 | Overselling accepted; stock clamped to 0 | `02` |
 | C9 / S6 | Server stores client-supplied price, cost and total (Rs 1 sale of a Rs 220 item at cost 0 accepted) | `02` |
 | C6 / R6 | A purchase overwrites the product's batch, expiry and purchase price; the expiry of older stock is lost | `03` |

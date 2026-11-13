@@ -61,11 +61,9 @@ describe('financial integrity sweep (seeded, repeatable)', () => {
         else payments = [];
         const body = salePayload([cartItem(p, qty)], { customer_id: cust, payments, client_txn_id: txn() });
         const res = await who.post('/sales', body);
-        // [LEGACY-BUG R4] after a void deletes an older invoice, the next invoice number already exists and the
-        // sale fails (rolled back completely). Not a payment defect; reported in Batch 2d, fix pending approval.
-        const r4 = res.status === 500 && /UNIQUE constraint failed: sales_headers\.invoice_number/.test(res.body.error || '');
-        if (res.status >= 500) expect(r4, `unexpected sale failure: ${JSON.stringify(res.body)}`).toBe(true);
-        count(r4 ? 'sale 500 R4 duplicate invoice number' : `sale ${res.status}`);
+        // R4 (reported in 2d, fixed in 2e): voids no longer make later sales fail on a duplicate invoice number
+        expect(res.status, `sale failed: ${JSON.stringify(res.body)}`).toBeLessThan(500);
+        count(`sale ${res.status}`);
         if (res.status === 200 && r() < 0.2) usedTxns.push({ route: '/sales', body, who });
       } else if (op < 0.5) {
         const c = pick(customers);

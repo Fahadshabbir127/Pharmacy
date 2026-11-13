@@ -276,3 +276,38 @@ describe('host computer switched off', () => {
     expect((await apiFromRenderer(client.win, 'GET', '/inventory')).status).toBe(200);
   }, 180_000);
 });
+
+describe('Phase 7 Batch 2e: invoice numbers after voids (R4 fixed), across host and client', () => {
+  it('older invoices voided by the administrator on the client: new sales from both computers, at the same moment, get new unique numbers; no number is reused', async () => {
+    // the host app was restarted above; sign in again if its window needs it
+    if ((await apiFromRenderer(host.win, 'GET', '/sales/history')).status === 401) await loginUi(host.win, ADMIN.user, ADMIN.password);
+    const before: any[] = (await apiFromRenderer(client.win, 'GET', '/sales/history')).body;
+    const issued = new Set(before.map((s) => s.invoice_number));
+    // void the oldest voidable invoice and a middle one (paid in full at the sale, so no later payments)
+    const voidable = [...before].sort((a, b) => a.id - b.id).filter((s) => s.id > 1 && s.amount_due === 0);
+    expect(voidable.length).toBeGreaterThanOrEqual(3);
+    const targets = [voidable[0], voidable[Math.floor(voidable.length / 2)]];
+    for (const s of targets) {
+      const r = await apiFromRenderer(client.win, 'DELETE', `/sales/${s.id}`);
+      expect(r.status, `void ${s.invoice_number}: ${JSON.stringify(r.body)}`).toBe(200);
+    }
+    const p = (await apiFromRenderer(host.win, 'GET', '/inventory')).body.find((x: any) => x.batch_number === 'BF-109' || x.sellable_stock > 5);
+    const sale = (txn: string) => ({ items: [{ product: p, quantity: 1, unit_price: p.sale_price, discount_percent: 0, discount_amount: 0, gst_amount: 0, subtotal: p.sale_price }], total_amount: p.sale_price, discount_percent: 0, discount_amount: 0, net_amount: p.sale_price, total_gst: 0, grand_total: p.sale_price, payment_method: 'CASH', amount_paid: p.sale_price, client_txn_id: txn });
+    const res = await Promise.all([
+      ...[1, 2, 3].map((i) => apiFromRenderer(host.win, 'POST', '/sales', sale(`e2e-2e-host-${i}`))),
+      ...[1, 2, 3].map((i) => apiFromRenderer(client.win, 'POST', '/sales', sale(`e2e-2e-client-${i}`))),
+    ]);
+    expect(res.map((r) => r.status), JSON.stringify(res.map((r) => r.body))).toEqual([200, 200, 200, 200, 200, 200]);
+    const nums = res.map((r) => r.body.invoice_number as string);
+    expect(new Set(nums).size).toBe(6);
+    for (const n of nums) expect(issued.has(n), `${n} was already issued`).toBe(false);
+    const highestBefore = Math.max(...before.map((s) => Number(String(s.invoice_number).split('-').pop())));
+    expect(nums.map((n) => Number(n.split('-').pop())).sort((a, b) => a - b)).toEqual([1, 2, 3, 4, 5, 6].map((i) => highestBefore + i));
+    // both computers list the same invoices; the voided numbers are gone and were not issued again
+    const onHost = (await apiFromRenderer(host.win, 'GET', '/sales/history')).body.map((s: any) => s.invoice_number).sort();
+    const onClient = (await apiFromRenderer(client.win, 'GET', '/sales/history')).body.map((s: any) => s.invoice_number).sort();
+    expect(onClient).toEqual(onHost);
+    for (const t of targets) expect(onHost).not.toContain(t.invoice_number);
+    console.log('[2e LAN] voided', targets.map((t) => t.invoice_number).join(', '), '-> new', [...nums].sort().join(', '));
+  }, 120_000);
+});

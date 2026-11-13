@@ -1,6 +1,6 @@
-# Payments (Phase 7, Batches 1–2d)
+# Payments (Phase 7, Batches 1–2e)
 
-This document describes how BrainTech Pharmacy AI records and protects money, as built and verified up to Phase 7 Batch 2d. It covers the approved decisions E1–E9, P1–P8, Q1 and the advance-priority decision. Verification results are in `TESTING_REPORT.md`.
+This document describes how BrainTech Pharmacy AI records and protects money, as built and verified up to Phase 7 Batch 2e. It covers the approved decisions E1–E9, P1–P8, Q1 and the advance-priority decision. Verification results are in `TESTING_REPORT.md`.
 
 ## 1. Rules
 
@@ -51,8 +51,9 @@ Migrations:
 - **0008:** creates the payment tables, carries over all history (one record per paid sale and per ledger payment, replayed in date order) and reports differences.
 - **0009:** carried-over balances; rebuilds the allocations table with all rows copied; catch-up.
 - **0010:** applies advances that existed before 2c, once.
+- **0011 (Batch 2e):** invoice number sequences, one per store, starting after the highest number found anywhere (invoices, payment records, ledger and audit texts that still name deleted invoices). No invoice number or financial record is changed.
 
-Each migration runs after a **verified pre-migration backup** (`data/backups/pre-migration-v<from>-to-v<to>-<time>.sqlite`, integrity-checked and row-count-checked) and inside one transaction. Batch 2d verified that a failure, or the program being killed inside 0008, 0009 or 0010, leaves the database exactly as before and that the next start completes the migration.
+Each migration runs after a **verified pre-migration backup** (`data/backups/pre-migration-v<from>-to-v<to>-<time>.sqlite`, integrity-checked and row-count-checked) and inside one transaction. Batches 2d and 2e verified that a failure, or the program being killed inside 0008, 0009, 0010 or 0011, leaves the database exactly as before and that the next start completes the migration.
 
 ## 5. Host and client (protocol 4)
 
@@ -66,16 +67,16 @@ Each migration runs after a **verified pre-migration backup** (`data/backups/pre
 
 | Limitation | Notes |
 |---|---|
-| **Not tested on Windows** | Everything in Batches 1–2d was verified on Linux (Electron under a virtual display). See section 7. |
+| **Not tested on Windows** | Everything in Batches 1–2e was verified on Linux (Electron under a virtual display). See section 7. |
 | Two computers on one machine | Host + client tests ran on one computer over 127.0.0.1. A real LAN drop (Wi-Fi, cable) was not tested; lost answers were simulated in the page. |
 | Discount authorizations | Kept in the host's memory for 10 minutes; lost if the host restarts (the cashier asks again). A grant used by a sale that then fails is used up. |
-| Interim void (until Batch 4) | Still deletes the invoice (payments are kept with the invoice number). Invoices with later payments cannot be voided. A reversal of money taken at a sale is recorded as money returned; linking it to the cash drawer is Batch 3/4. |
+| Interim void (until Batch 4) | Still deletes the invoice (payments are kept with the invoice number; since Batch 2e its number is never issued again). Invoices with later payments cannot be voided. A reversal of money taken at a sale is recorded as money returned; linking it to the cash drawer is Batch 3/4. |
 | Walk-in payment reversal | Only possible by voiding the sale. |
 | Version mismatch | The client's blocking screen stops the user, but its request forwarder does not itself refuse requests in that state. The host stays safe (section 5). Recommended hardening for a later batch: refuse API requests in the client while the versions differ. |
 | Money stored as decimal (floating point) | Amounts are rounded to 2 decimals on every write and comparisons allow half a paisa. Very long histories can accumulate sub-paisa differences in stored balances; the reconciliation ignores differences below Rs. 0.005. |
 | Advance application | Automatic only when new debt appears (credit sale, carried-over confirmation, reversal). There is no manual "apply advance to a specific invoice" button. |
 | Printing | Receipts show split payments on screen; printer selection and thermal printing are Batch 5. |
-| **Invoice numbers after a void ([LEGACY-BUG R4], found again in Batch 2d)** | Invoice numbers are "1001 + number of sales". Voiding (deleting) an older invoice lowers that count, so **every later sale gets an existing number and fails** (HTTP 500, fully rolled back, nothing saved) until numbering is fixed. Pre-existing defect of the original app, not caused by payments; the planned fix (sequence table, existing numbers kept) needs approval. Until then: **avoid voiding invoices other than the most recent one.** |
+| Invoice numbers have gaps | Fixed in Batch 2e (R4): each store's numbers come from a sequence that only goes up (`invoice_sequences`, migration 0011). A voided number, the number of a failed sale that was rolled back, and numbers issued after a backup that is later restored are **never reused**, so the numbering can have gaps. This is intended. |
 | Same-second history | When history was carried over, events in the same second were ordered sale-before-payment. This affects only which payment was matched to which invoice, never totals. |
 
 ## 7. Windows test checklist for Phase 7 payments
@@ -83,10 +84,10 @@ Each migration runs after a **verified pre-migration backup** (`data/backups/pre
 Use a **copy** of your pharmacy data, never the original:
 1. Close the app.
 2. Copy `C:\ProgramData\BrainTechPharmacyAI` to a backup folder.
-3. On both PCs (host and clients), run `git pull`, then `git log -1 --oneline`, which must show the latest Batch 2d commit. Then run `npm install` and `npm run desktop`.
+3. On both PCs (host and clients), run `git pull`, then `git log -1 --oneline`, which must show the latest Batch 2e commit. Then run `npm install` and `npm run desktop`.
 
 Then check:
-1. **Migration:** on first start, `data\backups` contains a new `pre-migration-v…-to-v10-…sqlite`. `logs\backend.log` shows the applied migrations and any `[PAYMENTS]` report lines.
+1. **Migration:** on first start, `data\backups` contains a new `pre-migration-v…-to-v11-…sqlite`. `logs\backend.log` shows the applied migrations and any `[PAYMENTS]` report lines.
 2. **Protocol:** `https://127.0.0.1:3747/api/health` on the host shows `"apiProtocol":4`. Each client opens normally (no "Different software versions" screen).
 3. **POS split payment:** a bill paid with Cash 500 + Card 80 on Rs. 380 shows change Rs. 200. The receipt lists Card and Cash, cash received and change.
 4. **Walk-in rule:** a walk-in customer paying less than the bill gets a message, and Complete stays disabled.
@@ -97,5 +98,6 @@ Then check:
 9. **Staff:** a staff user sees no Reverse button and no Balance review.
 10. **Balance review:** if your data has unexplained balances from the old app, Customers → Balance review lists them. Confirm one positive difference with a reason, and check that the customer's balance did not change.
 11. **Two computers:** a payment made on a client appears immediately on the host and on other clients.
+12. **Invoice numbers (Batch 2e):** note the last invoice number. As administrator, void an older invoice (paid in full at the sale), then make two sales. Both get new numbers after the last one; the voided number does not appear again.
 
 Report anything unexpected with a screenshot and `logs\main.log` / `logs\backend.log`.

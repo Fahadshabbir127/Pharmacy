@@ -67,7 +67,7 @@ All rows start as `pending`.
 | P15 | Draft cart auto-save, with restore/discard after reload | `saveDraftCart` / `loadDraftCart` | pending |
 | P16 | Thermal receipt modal with print | `ThermalReceiptModal.tsx` | pending |
 | P17 | Automatic `.txt` invoice download after a sale | `downloadSaleInvoiceFile` | pending |
-| P18 | Invoice number per tenant (`INV-<tenant>-<n>`) | `POST /api/sales` | pending (**CHANGE R4 fix**: sequence table, existing numbers kept) |
+| P18 | Invoice number per tenant (`INV-<tenant>-<n>`) | `POST /api/sales` | **CHANGE R4 fixed (Phase 7 Batch 2e)**: per-store sequence (`invoice_sequences`, migration 0011) that only goes up; existing numbers kept; voided numbers never reused; tests `02`, `14`, `invoice-sequence-migration`, LAN E2E |
 | P19 | Stock deducted on sale | `POST /api/sales` | pending (**CHANGE C2**: no oversell; FEFO batches) |
 | P20 | Offline sales queue + auto sync + footer "PENDING SYNC" | `api.ts:443-503`, `App.tsx` | **CHANGE C3**: replaced by NOT CONFIRMED + idempotent retry; legacy queue entries reviewable |
 | P21 | Server accepts client totals | `POST /api/sales` | **CHANGE C9**: server recomputes |

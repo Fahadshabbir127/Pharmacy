@@ -28,6 +28,7 @@ import { priceBill, sameMoney, validPercent, round2, PricedBill } from './shared
 import { DiscountAuthorizations, discountLimits } from './server/pos/discountAuth';
 import { reconcilePayments, PaymentReconciliation } from './server/payments/reconcile';
 import * as Pay from './server/payments/service';
+import { takeInvoiceNumber, raiseSequences } from './server/sales/invoiceNumbers';
 
 const PORT = Number(process.env.PHARMACY_PORT) || 3000;
 // C8: per-installation secret (set in startServer). The original public fallback secret is gone.
@@ -2428,8 +2429,9 @@ async function startServer() {
     const grand_total = bill.grand_total;
     if (prep.discount.token) discountAuth.consume(prep.discount.token); // single use (a rolled-back sale also uses it up)
 
-    const invCountRes = queryOne<any>("SELECT COUNT(*) as cnt FROM sales_headers WHERE tenant_id = ?", [userTenantId]);
-    const nextInvNum = `INV-${userTenantId}-${1001 + (invCountRes ? invCountRes.cnt : 0)}`;
+    // Phase 7 Batch 2e (fix R4): the number comes from the store's sequence, taken inside this transaction;
+    // it never goes down, so voided numbers are never reused and two sales never get the same number.
+    const nextInvNum = takeInvoiceNumber(db, userTenantId);
 
     const paidAmt = prep.paid;
     const dueAmt = prep.due;
@@ -3421,6 +3423,9 @@ async function startServer() {
       }
       fs.mkdirSync(BACKUP_DIR, { recursive: true });
       const safetyCopy = path.join(BACKUP_DIR, `pre-restore-${stamp}.sqlite`);
+      // Phase 7 Batch 2e (R4): invoice numbers already issued on this computer are never issued again, even if
+      // the backup is older (its sequence would be lower); remember the current sequences and keep them after.
+      const issuedSequences = db.tableNames().includes('invoice_sequences') ? db.all<{ tenant_id: number; next_value: number }>('SELECT tenant_id, next_value FROM invoice_sequences') : [];
       db.close(); // checkpoints the WAL so the main file is complete
       for (const ext of ['-wal', '-shm']) fs.rmSync(`${DB_FILE}${ext}`, { force: true });
       fs.renameSync(DB_FILE, safetyCopy);
@@ -3434,7 +3439,8 @@ async function startServer() {
         return res.status(400).json({ error: `The backup could not be opened (${openErr.message}). Your previous data was put back unchanged.` });
       }
 
-      logAudit(req.user?.id, req.user?.fullName, 'BACKUP_RESTORE', 'Restored database successfully from encrypted backup file', 'BACKUP', undefined, req);
+      if (issuedSequences.length) db.transaction(() => raiseSequences(db, issuedSequences));
+      logAudit(req.user?.id, req.user?.fullName, 'BACKUP_RESTORE', `Restored database successfully from encrypted backup file${issuedSequences.length ? `; invoice numbering continues after the numbers already issued (${issuedSequences.map((x) => `store ${x.tenant_id}: next ${x.next_value}`).join(', ')})` : ''}`, 'BACKUP', undefined, req);
 
       res.json({ message: 'Database restored successfully! All data and settings have been restored.' });
     } catch (err: any) {
