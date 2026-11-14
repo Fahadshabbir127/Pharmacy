@@ -68,11 +68,17 @@ export async function pinnedRequest(url: string, pin: string, req: PinnedRequest
         // unpinned TLS connection, leaving the verified socket unused, open and without an error listener.
         createConnection: () => socket,
         rejectUnauthorized: false, // CA checks do not apply to a self-signed cert; the pin was verified in connectPinned()
-        timeout: req.timeoutMs ?? 15_000,
       },
       resolve,
     );
-    r.on('timeout', () => r.destroy(Object.assign(new Error('The pharmacy server did not answer in time.'), { code: 'ETIMEDOUT' })));
+    // Without an agent, Node does not apply a `timeout` request option to the socket (only an agent does), so the
+    // idle timeout is armed here explicitly: a server that accepts the connection but stops answering is reported.
+    r.setTimeout(req.timeoutMs ?? 15_000);
+    r.on('timeout', () => {
+      const e = Object.assign(new Error('The pharmacy server did not answer in time.'), { code: 'ETIMEDOUT' });
+      reject(e); // report the timeout itself, not the "socket hang up" that destroying the request causes
+      r.destroy(e);
+    });
     r.on('error', reject);
     if (req.body) r.write(req.body);
     r.end();
