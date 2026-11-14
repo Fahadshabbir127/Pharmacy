@@ -4,6 +4,39 @@ This report contains only results that were actually executed. Anything not exec
 
 ---
 
+## Phase 8a: server event system (server-sent events)
+
+| | |
+|---|---|
+| Date | 2026-11-14 |
+| Platform | Linux (container; desktop tests run Electron under xvfb). **Not yet run on Windows.** |
+
+### Results
+| Command | Result |
+|---|---|
+| `npm run lint` (`tsc --noEmit`) | clean |
+| `npx vitest run tests/unit/live-events.test.ts tests/characterization/16-live-events.test.ts` | 2 files, 25/25 |
+| `16-live-events` repeated three more times | 12/12 each time |
+| `npx vitest run --maxWorkers=1 --minWorkers=1` | **32 files, 420/420**, 0 unhandled errors, 0 skipped, 286 s |
+| `xvfb-run -a npm run test:e2e` (including LAN host and client) | **4 files, 44/44** |
+
+No server process was left running after any run.
+
+### New tests
+| File | Tests | What |
+|---|---|---|
+| `tests/unit/live-events.test.ts` | 13 | Payload exactly `{seq, topic, tenantId}`; seq per store from 1; ready message with boot id; new boot id per start; store isolation (SUPER_ADMIN sees all); keep-alive; limits (per user, per paired computer, total; a closed stream frees its place); re-check closes only failing streams with the reason (account, store, **pairing revocation**); revoking one computer closes only its streams; logout closes only that token's streams; re-check at token expiry; a check that throws closes the stream; shutdown closes everything and stops timers; a vanished client is removed; route-to-topic mapping (reads, login, pairing, quote and "log in as" emit nothing) |
+| `tests/characterization/16-live-events.test.ts` | 12 | Real server over HTTP: Authorization header required, token in the URL refused (400), bad token 403; events only for successful writes, in order, with no gap; refused (409) and invalid (400) requests emit nothing; a **rolled-back** sale (500) emits nothing; store 1 and store 2 see only their own events, the super admin both; suspending a store or an account ends its streams at once; the periodic re-check ends a stream whose account was disabled outside the API; token expiry ends the stream; logout ends only that token's streams; 5-stream limit per user (429) and release; keep-alive comments; new boot id and seq 0 after a restart; a backup restore sends `backups` and keeps valid streams open; graceful shutdown ends all streams (`SERVER_SHUTDOWN`) and exits with code 0 in well under the 5 s fallback. No customer data, invoice data, passwords or tokens in the stream or the server log |
+
+### Found and fixed during 8a
+The super admin's "log in as store owner" (`POST /api/superadmin/tenants/:id/login-as`) was first mapped to `users`/`settings` and emitted two events for the store. It changes no store data, so it now emits nothing. The integration test catches this by checking that a store's first event follows its stream's `ready.seq` with no gap.
+
+### Not covered (and why)
+- **Pairing revocation of a stream opened over the LAN:** covered by the unit tests only. In the test environment every request comes from this computer (loopback), and loopback requests never carry a paired-client identity. To verify on two computers in Phase 8b/8c.
+- **The desktop proxy, the backoff and the screens' live refresh:** Phase 8b/8c.
+
+---
+
 ## Phase 7, Batch 2e: invoice numbering fix (legacy defect R4)
 
 | | |

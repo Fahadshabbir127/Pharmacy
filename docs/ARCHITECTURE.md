@@ -246,6 +246,19 @@ sales_returns / sales_return_items (sale_item_id, batch_id, qty, restock flag, r
 | Voids | Soft-void (`status`, `voided_at`, `voided_by`, `void_reason`) that restores stock to the original batches and reverses the ledger; reports exclude voided sales |
 | Audit | Every financial, stock, security, backup and config action is written to `audit_logs` in the same transaction as the change |
 
+### As built in Phase 8a (server event system; desktop and screens follow in 8b/8c)
+- `server/events/liveEvents.ts`: `LiveEventHub` with a random `bootId` per server start and one sequence counter per store. A change event is exactly `{seq, topic, tenantId}`; topics are inventory, sales, customers, purchases, settings, users and backups.
+- **Emitted only after COMMIT**, from the `afterCommit` hook of `transactionalRoute`, and only for writes that answered below 400. A rolled-back transaction (an exception, or 5xx) emits nothing, and neither do refused or invalid requests. `topicsForWrite()` maps route groups to topics; login, OTP, SMS/e-mail queues, pairing, local administration, setup, the price quote and the super admin's "log in as" emit nothing.
+- **Backup restore** emits `backups` (meaning: refresh everything) to every store, then re-checks all open streams against the restored accounts.
+- `GET /api/events`:
+  - **authentication:** `Authorization: Bearer` only. A query parameter that looks like a credential is refused (400 `TOKEN_IN_URL`). Only ADMIN, STAFF and SUPER_ADMIN may subscribe.
+  - **scope:** a store user receives their own store's events; SUPER_ADMIN receives every store's.
+  - **framing:** the stream starts with `event: ready` `{bootId, tenantId, seq}` (also sent as the `X-BrainTech-Boot-Id` header). Then `event: change` frames, `: keep-alive` comments every 20 s, and `event: end` `{reason}` when the server closes it.
+- **Re-checks:** a stream is re-checked every 60 s and at its token's expiry, using the same rules as every request (`verifyAccessToken`: token, account APPROVED, store not SUSPENDED or DELETED, and pairing not revoked for LAN streams). It is also re-checked at once after any committed `users` change (account or store status). Reasons: `TOKEN_INVALID_OR_EXPIRED`, `ACCOUNT_INACTIVE`, `STORE_SUSPENDED`, `PAIRING_REVOKED`, `CHECK_FAILED`.
+- **Closing:** `POST /api/auth/logout` ends that token's streams (`LOGGED_OUT`). Access tokens stay stateless JWTs, so logout does not revoke the token itself. Revoking a paired computer ends its streams after the commit. Shutdown ends every stream before `httpServer.close()` (`SERVER_SHUTDOWN`), so a graceful stop is immediate.
+- **Limits:** 5 streams per user, 10 per paired computer, 200 in total (429 `STREAM_LIMIT`).
+- **Graceful shutdown over IPC:** the server also accepts `{type: 'shutdown'}` over a Node IPC channel when started with one. Tests use this; on Windows a signal ends the process without running shutdown code. The desktop app keeps using the utilityProcess message.
+
 ### As built in Phase 7, Batch 2c (payment screens)
 - Advance priority: opening balance → confirmed carried-over balances (oldest first) → oldest invoices (`applyAvailableAdvance`), applied on credit sales, Q1 confirmations and reversals; migration 0010 applied pre-existing advances once. `GET /api/customers/:id/payment-preview?amount=` (read-only) powers the payment preview.
 - Screens: POS payment rows (Cash, Card, Bank Transfer, Mobile Wallet EasyPaisa/JazzCash, reference; Full Cash / Partial / Udhar shortcuts; change only from cash; walk-in must pay in full); Customers: Receive Payment with server preview and advance, Open invoices and Payment history tabs, administrator Balance review (Q1); Sales Register: current balance and status, payments, Record payment, administrator reversal with reason; receipt lists each payment, cash received and change.
@@ -350,7 +363,7 @@ Every phase ends with tests, a build check, a regression check against `FEATURE_
 | JWT secret | random, DPAPI-protected | random 64 bytes in `data/jwt.secret`, owner-only file permissions; the role is always read from the database | DPAPI wrapping of this file is listed for Phase 10 |
 | FK enforcement | after approved fixes | **ON** (FK1–FK5, see `FK_AUDIT_REPORT.md`) | n/a |
 | Idempotency | `client_txn_id` column on each table | `idempotency_keys` table (key, route, stored result), written in the same transaction as the sale | One mechanism for every route, no table rebuilds; used by sales now, payments/purchases in Phase 7 |
-| Real-time updates | SSE | **Not built yet** (Phase 8). Every screen reads fresh data from the host when it loads. | Phase order |
+| Real-time updates | SSE | **Server side built in Phase 8a** (see "As built in Phase 8a"). The desktop proxy, the reconnect backoff and the screens' live refresh follow in Phase 8b/8c; until then every screen reads fresh data from the host when it loads. | Phase order |
 | Batch inventory (Phase 6) | §10 | Built as described in §10 "As built in Phase 6". Stock protection is in the database (CHECK + triggers), not only in code. | A missed code path must fail, not silently corrupt stock |
 | Stock invariant check | in-transaction + periodic | at startup only, reported, never repaired; the database triggers make a mismatch impossible through normal writes | Periodic check deferred |
 

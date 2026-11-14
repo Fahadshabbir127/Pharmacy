@@ -37,6 +37,9 @@ export interface RunningServer {
   stop: () => Promise<void>;
   /** Hard kill (SIGKILL): simulates a crash or power cut - no shutdown code runs. */
   kill: () => Promise<void>;
+  /** Graceful shutdown request over IPC (servers started with `ipc: true`); resolves with the exit code. Works the
+   *  same on every OS, unlike SIGTERM, which ends the process at once on Windows. */
+  requestShutdown: () => Promise<number | null>;
 }
 
 export function makeTempDir(prefix = 'pharmacy-test-'): string {
@@ -86,7 +89,7 @@ async function waitForServer(proc: ChildProcess, logs: () => string, timeoutMs =
 /**
  * @param opts.tlsPin  the server is started with TLS (cert files in env); readiness is checked over pinned HTTPS
  */
-export async function startServer(opts: { workDir?: string; entry?: string; seedDb?: string; env?: Record<string, string>; tlsPin?: string } = {}): Promise<RunningServer> {
+export async function startServer(opts: { workDir?: string; entry?: string; seedDb?: string; env?: Record<string, string>; tlsPin?: string; ipc?: boolean } = {}): Promise<RunningServer> {
   if (await portInUse(PORT)) {
     throw new Error(`Port ${PORT} is already in use; stop the other server before running tests.`);
   }
@@ -103,7 +106,7 @@ export async function startServer(opts: { workDir?: string; entry?: string; seed
     // PHARMACY_TEST_TODAY: a fixed pharmacy date, so the demo seed's expiry dates (some in 2026) do not make
     // tests change outcome as the real calendar moves on. Expiry tests set their own date explicitly.
     env: { ...process.env, NODE_ENV: 'production', PHARMACY_TEST_LEGACY_SEED: '1', PHARMACY_TEST_TODAY: '2026-06-01', ...opts.env },
-    stdio: ['ignore', 'pipe', 'pipe'],
+    stdio: opts.ipc ? ['ignore', 'pipe', 'pipe', 'ipc'] : ['ignore', 'pipe', 'pipe'],
   });
   live.add(proc);
   // Record the exit once, when it happens. stop()/kill() must not rely on `exitCode` alone: a process ended by a
@@ -136,6 +139,15 @@ export async function startServer(opts: { workDir?: string; entry?: string; seed
         await exited;
       }
       await waitPortFree();
+    },
+    requestShutdown: async () => {
+      if (!opts.ipc) throw new Error('requestShutdown() needs startServer({ ipc: true })');
+      if (!hasExited) {
+        proc.send({ type: 'shutdown' });
+        await exited;
+      }
+      await waitPortFree();
+      return proc.exitCode;
     },
     stop: async () => {
       if (!hasExited) {
