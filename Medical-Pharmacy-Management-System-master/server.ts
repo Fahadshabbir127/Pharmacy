@@ -29,6 +29,7 @@ import { DiscountAuthorizations, discountLimits } from './server/pos/discountAut
 import { reconcilePayments, PaymentReconciliation } from './server/payments/reconcile';
 import * as Pay from './server/payments/service';
 import { takeInvoiceNumber, raiseSequences } from './server/sales/invoiceNumbers';
+import { LiveEventHub, topicsForWrite, hashToken as hashAccessToken, StreamLimitError, StreamCheck } from './server/events/liveEvents';
 
 const PORT = Number(process.env.PHARMACY_PORT) || 3000;
 // C8: per-installation secret (set in startServer). The original public fallback secret is gone.
@@ -59,8 +60,35 @@ const crashIf = (point: string) => (req: express.Request) => {
     process.kill(process.pid, 'SIGKILL');
   }
 };
-const txHooks = crashSpec ? { beforeCommit: crashIf('before-commit'), afterCommit: crashIf('after-commit') } : {};
-const tx = <H extends (...args: any[]) => any>(handler: H) => transactionalRoute(() => db, handler as any, txHooks);
+// Phase 8a: live events. Intervals are 20 s / 60 s; the PHARMACY_TEST_SSE_* variables shorten them for tests only.
+const testKeepAliveMs = Number(process.env.PHARMACY_TEST_SSE_KEEPALIVE_MS) || 0;
+const testRevalidateMs = Number(process.env.PHARMACY_TEST_SSE_REVALIDATE_MS) || 0;
+if (testKeepAliveMs || testRevalidateMs) console.warn(`[EVENTS] WARNING: test intervals in use (keep-alive ${testKeepAliveMs || 20000} ms, re-check ${testRevalidateMs || 60000} ms). For automated tests only.`);
+const liveEvents = new LiveEventHub({ keepAliveMs: testKeepAliveMs || undefined, revalidateMs: testRevalidateMs || undefined });
+/** After a successful COMMIT: tell the store's live subscribers which kinds of data changed (never on rollback). */
+const emitLiveEvents = (req: express.Request) => {
+  const status = req.res?.statusCode ?? 500;
+  if (status >= 400) return; // refused or failed: nothing a screen needs to reload (4xx commits only audit rows)
+  const topics = topicsForWrite(req.method, req.path);
+  if (!topics.length) return;
+  const user = (req as any).user as { role?: string; tenant_id?: number | null } | undefined;
+  if (!user) return; // unauthenticated writes (login, OTP, pairing) change no shared business data
+  const override = Number((req.query as any)?.tenant_id ?? (req.body as any)?.tenant_id);
+  const superTarget = /^\/api\/superadmin\/tenants\/(\d+)/i.exec(req.path);
+  const tenantId = user.role === 'SUPER_ADMIN'
+    ? (superTarget ? Number(superTarget[1]) : Number.isInteger(override) && override > 0 ? override : null)
+    : (user.tenant_id || 1);
+  if (tenantId) for (const t of topics) liveEvents.emit(tenantId, t);
+  // account or store status may have changed: re-check open streams now instead of within 60 s
+  if (topics.includes('users')) liveEvents.revalidate();
+};
+const crashAfter = crashSpec ? crashIf('after-commit') : null;
+const txHooks = {
+  ...(crashSpec ? { beforeCommit: crashIf('before-commit') } : {}),
+  afterCommit: (req: express.Request) => { crashAfter?.(req); emitLiveEvents(req); },
+};
+const tx = <H extends (...args: any[]) => any>(handler: H, extra: { afterCommit?: (req: express.Request) => void } = {}) =>
+  transactionalRoute(() => db, handler as any, extra.afterCommit ? { ...txHooks, afterCommit: (req) => { txHooks.afterCommit(req); extra.afterCommit!(req); } } : txHooks);
 
 // Database Initialization with Tables and Sample Data
 async function initDatabase() {
@@ -240,6 +268,42 @@ interface UserTokenPayload {
   allowed_services?: string;
 }
 
+type TokenCheck = { ok: true; user: UserTokenPayload; exp?: number } | { ok: false; status: number; error: string; reason: string };
+
+/** Verify an access token and the account/store behind it (the same rules for requests and live-event streams). */
+function verifyAccessToken(token: string): TokenCheck {
+  let payload: UserTokenPayload & { exp?: number };
+  try {
+    payload = jwt.verify(token, JWT_SECRET) as UserTokenPayload & { exp?: number };
+  } catch {
+    return { ok: false, status: 403, error: 'Invalid or expired token', reason: 'TOKEN_INVALID_OR_EXPIRED' };
+  }
+
+  const dbUser = queryOne<any>("SELECT id, status, tenant_id, role, customer_id FROM users WHERE id = ?", [payload.id]);
+  if (!dbUser || dbUser.status !== 'APPROVED') {
+    return { ok: false, status: 403, error: 'User account is no longer active or approved.', reason: 'ACCOUNT_INACTIVE' };
+  }
+
+  if (dbUser.role !== 'SUPER_ADMIN' && dbUser.tenant_id) {
+    const tenant = queryOne<any>("SELECT status FROM tenants WHERE id = ?", [dbUser.tenant_id]);
+    if (tenant && (tenant.status === 'SUSPENDED' || tenant.status === 'DELETED')) {
+      return { ok: false, status: 403, error: 'This pharmacy store account is currently SUSPENDED by Platform Super Admin. Please contact support.', reason: 'STORE_SUSPENDED' };
+    }
+  }
+
+  return {
+    ok: true,
+    exp: payload.exp,
+    user: {
+      ...payload,
+      // the role and customer link always come from the database, never from the token (S1)
+      role: dbUser.role,
+      customerId: dbUser.customer_id ?? undefined,
+      tenant_id: dbUser.tenant_id || payload.tenant_id || 1
+    },
+  };
+}
+
 function authenticateToken(req: AuthRequest, res: express.Response, next: express.NextFunction) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -248,33 +312,10 @@ function authenticateToken(req: AuthRequest, res: express.Response, next: expres
     return res.status(401).json({ error: 'Access token required' });
   }
 
-  jwt.verify(token, JWT_SECRET, (err, decoded) => {
-    if (err) {
-      return res.status(403).json({ error: 'Invalid or expired token' });
-    }
-    const payload = decoded as UserTokenPayload;
-
-    const dbUser = queryOne<any>("SELECT id, status, tenant_id, role, customer_id FROM users WHERE id = ?", [payload.id]);
-    if (!dbUser || dbUser.status !== 'APPROVED') {
-      return res.status(403).json({ error: 'User account is no longer active or approved.' });
-    }
-
-    if (dbUser.role !== 'SUPER_ADMIN' && dbUser.tenant_id) {
-      const tenant = queryOne<any>("SELECT status FROM tenants WHERE id = ?", [dbUser.tenant_id]);
-      if (tenant && (tenant.status === 'SUSPENDED' || tenant.status === 'DELETED')) {
-        return res.status(403).json({ error: 'This pharmacy store account is currently SUSPENDED by Platform Super Admin. Please contact support.' });
-      }
-    }
-
-    req.user = {
-      ...payload,
-      // the role and customer link always come from the database, never from the token (S1)
-      role: dbUser.role,
-      customerId: dbUser.customer_id ?? undefined,
-      tenant_id: dbUser.tenant_id || payload.tenant_id || 1
-    };
-    next();
-  });
+  const r = verifyAccessToken(token);
+  if (r.ok === false) return res.status(r.status).json({ error: r.error });
+  req.user = r.user;
+  next();
 }
 
 function requireRoles(roles: (string)[]) {
@@ -419,7 +460,52 @@ async function startServer() {
     const r = db.run("UPDATE paired_clients SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", [new Date().toISOString(), Number(req.params.id)]);
     if (r.changes) logAudit(null, 'Host computer', 'LAN_CLIENT_REVOKED', `Revoked LAN client #${req.params.id}`, 'LAN_CLIENT', Number(req.params.id), req, 1);
     res.json({ revoked: r.changes === 1 });
-  }));
+  }, { afterCommit: (req) => { liveEvents.closeWhere((st) => st.pairedClientId === Number(req.params.id), 'PAIRING_REVOKED'); } }));
+
+  // ---- Phase 8a: live events (server-sent events; ARCHITECTURE.md §9) ----
+  app.get('/api/events', (req: AuthRequest, res) => {
+    // credentials only in the Authorization header: a token in a URL ends up in logs and history
+    if (Object.keys(req.query).some((k) => /token|auth|jwt|key/i.test(k))) {
+      return res.status(400).json({ error: 'Send the access token in the Authorization header, never in the URL.', code: 'TOKEN_IN_URL' });
+    }
+    const header = req.headers['authorization'];
+    const token = header && /^Bearer\s+(\S+)$/i.exec(header)?.[1];
+    if (!token) return res.status(401).json({ error: 'Access token required' });
+    const first = verifyAccessToken(token);
+    if (first.ok === false) return res.status(first.status).json({ error: first.error });
+    const user = first.user;
+    if (!['ADMIN', 'STAFF', 'SUPER_ADMIN'].includes(user.role)) return res.status(403).json({ error: 'Permission denied for this action' });
+    const pairedClientId: number | undefined = (req as any).pairedClientId;
+    const check = (): StreamCheck => {
+      const r = verifyAccessToken(token);
+      if (r.ok === false) return { ok: false, reason: r.reason };
+      if (pairedClientId !== undefined) {
+        const pc = db.get<{ revoked_at: string | null }>('SELECT revoked_at FROM paired_clients WHERE id = ?', [pairedClientId]);
+        if (!pc || pc.revoked_at) return { ok: false, reason: 'PAIRING_REVOKED' };
+      }
+      return { ok: true };
+    };
+    try {
+      liveEvents.subscribe(res, {
+        userId: user.id,
+        tenantId: user.role === 'SUPER_ADMIN' ? null : (user.tenant_id || 1),
+        tokenHash: hashAccessToken(token),
+        tokenExp: first.exp,
+        pairedClientId,
+        check,
+      });
+    } catch (e: any) {
+      if (e instanceof StreamLimitError) return res.status(429).json({ error: e.message, code: e.code });
+      throw e;
+    }
+  });
+
+  // Logout: ends this token's live-event streams. (Access tokens are stateless JWTs; this does not revoke the token.)
+  app.post('/api/auth/logout', authenticateToken, (req: AuthRequest, res) => {
+    const token = String(req.headers['authorization'] || '').split(' ')[1] || '';
+    const closed = liveEvents.closeWhere((s) => s.tokenHash === hashAccessToken(token), 'LOGGED_OUT');
+    res.json({ loggedOut: true, closedStreams: closed });
+  });
 
   // ---- Pairing (host mode, private network only - enforced by lanGuard) ----
   const pairAttempts = new Map<string, { n: number; reset: number }>();
@@ -3442,6 +3528,12 @@ async function startServer() {
       if (issuedSequences.length) db.transaction(() => raiseSequences(db, issuedSequences));
       logAudit(req.user?.id, req.user?.fullName, 'BACKUP_RESTORE', `Restored database successfully from encrypted backup file${issuedSequences.length ? `; invoice numbering continues after the numbers already issued (${issuedSequences.map((x) => `store ${x.tenant_id}: next ${x.next_value}`).join(', ')})` : ''}`, 'BACKUP', undefined, req);
 
+      // Phase 8a: the whole database changed; every store's screens must refresh, and every open stream is
+      // re-checked against the restored accounts and stores
+      for (const t of db.all<{ id: number }>('SELECT id FROM tenants')) liveEvents.emit(t.id, 'backups');
+      if (!db.get('SELECT 1 AS x FROM tenants WHERE id = 1')) liveEvents.emit(1, 'backups'); // pre-store databases: store 1
+      liveEvents.revalidate();
+
       res.json({ message: 'Database restored successfully! All data and settings have been restored.' });
     } catch (err: any) {
       console.error('Backup restore error:', err);
@@ -3839,6 +3931,7 @@ async function startServer() {
     if (shuttingDown) return;
     shuttingDown = true;
     console.log(`[SHUTDOWN] ${signal} received, closing server and database...`);
+    liveEvents.closeAll('SERVER_SHUTDOWN'); // open event streams would otherwise keep close() waiting
     httpServer.close(() => {
       try { db.close(); } catch (e) { console.error('[SHUTDOWN] database close failed:', e); }
       process.exit(0);
@@ -3849,6 +3942,9 @@ async function startServer() {
   process.on('SIGINT', () => shutdown('SIGINT'));
   // Electron main process asks the utilityProcess to stop gracefully
   (process as any).parentPort?.on('message', (e: any) => { if ((e?.data ?? e)?.type === 'shutdown') shutdown('desktop app quit'); });
+  // The same graceful request over a Node IPC channel (a parent that spawned this server with 'ipc'; used by tests,
+  // because on Windows a signal ends the process at once and no shutdown code runs). Not present in the desktop app.
+  if (typeof process.send === 'function') process.on('message', (m: any) => { if (m?.type === 'shutdown') shutdown('parent process request'); });
 }
 
 startServer().catch(err => {
