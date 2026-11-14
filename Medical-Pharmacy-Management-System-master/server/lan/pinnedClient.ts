@@ -63,9 +63,11 @@ export async function pinnedRequest(url: string, pin: string, req: PinnedRequest
         path: `${u.pathname}${u.search}`,
         method: req.method || 'GET',
         headers: req.headers,
-        createConnection: () => socket, // the already-verified socket; no second, unverified connection
+        // The already-verified socket; no second, unverified connection. NO `agent` option: with an agent
+        // (`agent: false` creates a fresh one) Node ignores `createConnection` and the agent opens its own,
+        // unpinned TLS connection, leaving the verified socket unused, open and without an error listener.
+        createConnection: () => socket,
         rejectUnauthorized: false, // CA checks do not apply to a self-signed cert; the pin was verified in connectPinned()
-        agent: false,
         timeout: req.timeoutMs ?? 15_000,
       },
       resolve,
