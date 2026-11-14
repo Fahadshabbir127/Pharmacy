@@ -44,7 +44,7 @@ All pharmacy data is stored **only on this computer**. The other computers ("cli
 | Wi-Fi drops, or the main computer is switched off | The other computers show **"Pharmacy server unreachable - reconnecting…"** and block selling. They reconnect by themselves when it is back. |
 | The connection drops **while a sale is being saved** | The screen shows **SALE NOT CONFIRMED** and keeps the cart. Do not hand over the receipt yet. **Check status** shows whether the sale was saved. **Retry sale** is always safe: the same sale can never be recorded twice. |
 | "Security certificate changed" | The main computer was reinstalled or its certificate renewed, or another device is pretending to be the server. Ask the administrator, then pair this computer again. |
-| "Different software versions" | Install the same version on all computers |
+| "Different software versions" | Install the same version on all computers. Since Phase 7 Batch 2b the host uses **protocol 4** (check `https://<host>:3747/api/health` → `"apiProtocol":4`); update the host and every client together. |
 
 ## 5. Removing a computer
 

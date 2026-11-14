@@ -46,12 +46,18 @@ describe('offline sales queue (api.ts)', () => {
     for (let i = 0; i < 3; i++) expect(await api.syncPendingOfflineSales()).toEqual({ synced: 0, remaining: 1 });
   });
 
-  it('draft cart is saved and restored from localStorage', async () => {
+  // POS draft recovery fix (was: one shared key 'khushi_pos_draft_cart' for every user and store,
+  // deleted by the POS's own empty-cart autosave before Resume could read it)
+  it('[CHANGED draft fix] the draft cart is saved per store and user, and read back only by its owner', async () => {
     const api = await import('../../src/lib/api');
-    api.saveDraftCart([{ product: { id: 1 }, quantity: 2 } as any], 3, 5);
-    expect(api.loadDraftCart()).toMatchObject({ customerId: 3, discountPercent: 5, cart: [{ quantity: 2 }] });
-    api.clearDraftCart();
-    expect(api.loadDraftCart()).toBeNull();
+    const owner = api.draftOwnerOf({ id: 7, tenant_id: 2 })!;
+    api.saveDraftCart(owner, [{ product: { id: 1, name: 'Panadol' }, quantity: 2, discount_percent: 0 } as any], { id: 3, name: 'Ali' }, 5);
+    expect(localStorage.getItem('khushi_pos_draft_cart:2:7')).not.toBeNull();
+    expect(localStorage.getItem('khushi_pos_draft_cart')).toBeNull();
+    expect(api.inspectDraft(owner).own).toMatchObject({ status: 'ok', draft: { customerId: 3, discountPercent: 5, lines: [{ productId: 1, quantity: 2 }] } });
+    expect(api.inspectDraft(api.draftOwnerOf({ id: 8, tenant_id: 2 })).own).toEqual({ status: 'none' });
+    api.clearDraftCart(owner);
+    expect(api.inspectDraft(owner).own).toEqual({ status: 'none' });
   });
 });
 

@@ -529,8 +529,7 @@ export const api = {
     request<{ customer: Customer; recentInvoices: SaleHeader[]; ledger: LedgerEntry[] }>('/customer-portal/me'),
 };
 
-// Local Draft Cart Auto-Save Utility
-const DRAFT_CART_KEY = 'khushi_pos_draft_cart';
+// Offline sales queue (legacy)
 const OFFLINE_SALES_KEY = 'khushi_pending_offline_sales';
 
 export interface OfflinePendingSale {
@@ -598,32 +597,5 @@ export async function syncPendingOfflineSales(): Promise<{ synced: number; remai
   return { synced, remaining };
 }
 
-export function saveDraftCart(cart: CartItem[], customerId?: number, discountPercent: number = 0): void {
-  try {
-    localStorage.setItem(
-      DRAFT_CART_KEY,
-      JSON.stringify({
-        cart,
-        customerId,
-        discountPercent,
-        timestamp: new Date().toISOString(),
-      })
-    );
-  } catch (e) {
-    console.error('Failed to save draft cart', e);
-  }
-}
-
-export function loadDraftCart(): { cart: CartItem[]; customerId?: number; discountPercent: number } | null {
-  try {
-    const raw = localStorage.getItem(DRAFT_CART_KEY);
-    if (!raw) return null;
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
-export function clearDraftCart(): void {
-  localStorage.removeItem(DRAFT_CART_KEY);
-}
+// POS draft cart: see ./draftCart.ts (one draft per store and user; the old shared key is no longer used).
+export { saveDraftCart, clearDraftCart, inspectDraft, restoreDraftCart, draftOwnerOf } from './draftCart';

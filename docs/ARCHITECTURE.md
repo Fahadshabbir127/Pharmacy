@@ -241,7 +241,7 @@ sales_returns / sales_return_items (sale_item_id, batch_id, qty, restock flag, r
 | Payments | `payment_methods` (configurable, active flag, type CASH/CARD/BANK/WALLET/CREDIT) and `sale_payments` (split); header `payment_method` kept as derived CASH/PARTIAL/UDHAR summary for compatibility |
 | Tax | Settings: tax label, inclusive/exclusive; rate per product (`gst_rate`) |
 | Shifts | `cash_shifts` (terminal, user, opened_at, opening_float, closed_at, counted_cash, expected_cash, variance, notes). Sales and returns are linked to a shift. Setting `require_open_shift`. Daily reconciliation report. |
-| Numbering | `invoice_sequences(tenant_id, branch_code, doc_type, prefix, next_value)`, incremented inside the sale transaction. Configurable format, e.g. `{branch}-{yyyy}-{seq:6}`. Existing invoices keep their numbers; the sequence starts above the current maximum. |
+| Numbering | **Built in Phase 7 Batch 2e (fix R4):** `invoice_sequences(tenant_id, next_value, updated_at)` (migration 0011), advanced inside the sale transaction by `takeInvoiceNumber()` (`server/sales/invoiceNumbers.ts`, an `UPDATE … RETURNING` under the write lock), so a rolled-back sale also rolls back its number. Triggers refuse lowering or deleting a sequence. The format is still `INV-<store>-<n>`; existing invoices keep their numbers; the sequence starts above the highest number found anywhere in the database. A backup restore keeps the higher of the restored and the already-issued sequence. Branch codes, document types and configurable formats are still planned. |
 | Templates | Settings: header/footer text, logo, paper 58 mm / 80 mm / A4, field visibility; one shared renderer used for preview, `window.print` fallback and native `webContents.print` |
 | Voids | Soft-void (`status`, `voided_at`, `voided_by`, `void_reason`) that restores stock to the original batches and reverses the ledger; reports exclude voided sales |
 | Audit | Every financial, stock, security, backup and config action is written to `audit_logs` in the same transaction as the change |
@@ -367,7 +367,7 @@ electron/ipc.ts          channel registry, sender check (app://braintech only), 
 electron/ui/             setup wizard + Connection & Server Settings (no inline scripts)
 server/config.ts         modes, address classification, API protocol version
 server/lan/*             tls, pairing, pinnedClient, guard, discovery
-server/db/*              adapter, migrations 0001-0007, open (integrity + migrate + FK check), legacy import, transactional routes
+server/db/*              adapter, migrations 0001-0011, open (integrity + migrate + FK check), legacy import, transactional routes
 server/inventory/*       expiry rules (D3/D5), FEFO planner, batch helpers (guarded take/add, invariant check)
 server/seed.ts           optional demo catalogue (no logins); legacy test seed (tests only)
 server/security/*        per-install JWT secret

@@ -128,23 +128,26 @@ describe('known defects in the sale path', () => {
     expect((await product(1)).stock).toBe(119);
   });
 
-  it('[LEGACY-BUG R4] after deleting an older invoice, the next sale fails on a duplicate invoice number', async () => {
+  // Phase 7 Batch 2e fix of R4 (was: the next sale computed INV-1-1003 again and failed with a UNIQUE error)
+  it('[FIXED R4] after deleting an older invoice, the next sale gets a new number', async () => {
     const p = await product(1);
     const s1 = await admin.post('/sales', salePayload([cartItem(p, 1)])); // INV-1-1002
     const s2 = await admin.post('/sales', salePayload([cartItem(p, 1)])); // INV-1-1003
     expect(s2.body.invoice_number).toBe('INV-1-1003');
     expect((await admin.del(`/sales/${s1.body.sale_id}`)).status).toBe(200);
-    const s3 = await admin.post('/sales', salePayload([cartItem(p, 1)])); // computes INV-1-1003 again
-    expect(s3.status).toBe(500);
-    expect(s3.body.error).toMatch(/UNIQUE/i);
+    const s3 = await admin.post('/sales', salePayload([cartItem(p, 1)]));
+    expect(s3.status).toBe(200);
+    expect(s3.body.invoice_number).toBe('INV-1-1004');
   });
 
-  it('[LEGACY-BUG R4] deleting the newest invoice causes its number to be re-issued to a different sale', async () => {
+  // Phase 7 Batch 2e fix of R4 (was: the voided number was issued again to a different sale)
+  it('[FIXED R4] a voided newest invoice number is never re-issued', async () => {
     const p = await product(1);
     const s1 = await admin.post('/sales', salePayload([cartItem(p, 1)]));
     await admin.del(`/sales/${s1.body.sale_id}`);
     const s2 = await admin.post('/sales', salePayload([cartItem(p, 2)]));
-    expect(s2.body.invoice_number).toBe(s1.body.invoice_number);
+    expect(s2.body.invoice_number).not.toBe(s1.body.invoice_number);
+    expect(s2.body.invoice_number).toBe('INV-1-1003');
   });
 
   // FK5 fix (was: the sale was recorded against a product that does not exist)

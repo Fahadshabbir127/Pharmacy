@@ -67,7 +67,7 @@ All rows start as `pending`.
 | P15 | Draft cart auto-save, with restore/discard after reload | `saveDraftCart` / `loadDraftCart` | pending |
 | P16 | Thermal receipt modal with print | `ThermalReceiptModal.tsx` | pending |
 | P17 | Automatic `.txt` invoice download after a sale | `downloadSaleInvoiceFile` | pending |
-| P18 | Invoice number per tenant (`INV-<tenant>-<n>`) | `POST /api/sales` | pending (**CHANGE R4 fix**: sequence table, existing numbers kept) |
+| P18 | Invoice number per tenant (`INV-<tenant>-<n>`) | `POST /api/sales` | **CHANGE R4 fixed (Phase 7 Batch 2e)**: per-store sequence (`invoice_sequences`, migration 0011) that only goes up; existing numbers kept; voided numbers never reused; tests `02`, `14`, `invoice-sequence-migration`, LAN E2E |
 | P19 | Stock deducted on sale | `POST /api/sales` | pending (**CHANGE C2**: no oversell; FEFO batches) |
 | P20 | Offline sales queue + auto sync + footer "PENDING SYNC" | `api.ts:443-503`, `App.tsx` | **CHANGE C3**: replaced by NOT CONFIRMED + idempotent retry; legacy queue entries reviewable |
 | P21 | Server accepts client totals | `POST /api/sales` | **CHANGE C9**: server recomputes |
@@ -211,6 +211,14 @@ Features verified in the **desktop app** by automated end-to-end tests on Linux 
 - persistence across restart;
 - data shared between host and client;
 - Phase 6: stock deducted per batch by FEFO and refused when short or expired (P19), receipt with batch lines (P16), purchase entry with batch/mfg/expiry (PU1), inventory batches panel, expiry tracker and per-batch write-off (I1, I4).
+
+**Phase 7 Batch 2 changes to existing behaviour (approved P1–P8, Q1, advance priority; see `PAYMENTS.md`):**
+- P10: payments are recorded per method (Cash, Card, Bank Transfer, Mobile Wallet) with split payments; Full Cash / Partial / Udhar remain as shortcuts. A walk-in customer must pay in full.
+- P13 / C5: every payment is a permanent record applied to the opening balance, confirmed carried-over balances and the oldest invoices; extra money is kept as advance and applied to new debt automatically. Customer payments need a transaction id (the screens send one; retries are safe) and are now audited.
+- C4: the ledger is unchanged; new tabs show open invoices (what is still owed) and payment history.
+- SR1/SR3: each invoice shows its current balance and status next to the at-sale status; payments can be recorded against an invoice; administrators can reverse a payment with a reason.
+- SR5 (until Batch 4): an invoice with later payments cannot be voided; money taken at the sale is reversed and kept as history; the customer balance is reduced exactly (no clamp at 0).
+- P16: the receipt lists each payment method, cash received and change.
 
 **Phase 7 Batch 1 changes to existing behaviour (approved E1–E3):**
 - P8/P9: discounts above the staff limit (default **0 %**) need an administrator's authorization at the counter and a reason; administrators selling directly give a reason. Limits are store settings (Settings → POS Discount Limits).
