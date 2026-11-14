@@ -70,6 +70,37 @@ describe('pinned HTTPS client', () => {
     expect(fake.conns).toEqual([]);
   });
 
+  it('times out (ETIMEDOUT) when the server accepts the connection but never completes the TLS handshake; nothing is left open', async () => {
+    const closed: boolean[] = [];
+    const silent = net.createServer((s) => { // TCP only, never speaks TLS
+      const i = closed.push(false) - 1;
+      s.resume(); // read (and discard) the client hello, so the client's close is seen
+      s.on('close', () => { closed[i] = true; });
+      s.on('error', () => { /* the client resetting the connection is expected here */ });
+    });
+    const port = await listen(silent);
+    const t0 = Date.now();
+    await expect(pinnedJson(`https://127.0.0.1:${port}/api/x`, real.fingerprint, { timeoutMs: 600 })).rejects.toMatchObject({ code: 'ETIMEDOUT' });
+    expect(Date.now() - t0).toBeLessThan(5000);
+    await settle();
+    expect(closed).toEqual([true]); // one connection, and the client closed it
+  });
+
+  it('times out (ETIMEDOUT) when the verified server never answers the request', async () => {
+    const server = https.createServer({ cert: real.certPem, key: real.keyPem }, () => { /* never responds */ });
+    const port = await listen(server);
+    const t0 = Date.now();
+    await expect(pinnedJson(`https://127.0.0.1:${port}/api/x`, real.fingerprint, { timeoutMs: 600 })).rejects.toMatchObject({ code: 'ETIMEDOUT' });
+    expect(Date.now() - t0).toBeLessThan(5000);
+  });
+
+  it('a host that is not running gives a clear connection error (ECONNREFUSED), not a hang', async () => {
+    const probe = net.createServer();
+    const port = await listen(probe);
+    await closers.pop()!(); // free the port: nothing listens there now
+    await expect(pinnedJson(`https://127.0.0.1:${port}/api/x`, real.fingerprint, { timeoutMs: 3000 })).rejects.toMatchObject({ code: 'ECONNREFUSED' });
+  });
+
   it('still refuses a server whose certificate does not match the pin', async () => {
     const { port } = await recordingServer(impostor);
     await expect(pinnedJson(`https://127.0.0.1:${port}/api/x`, real.fingerprint)).rejects.toBeInstanceOf(PinMismatchError);

@@ -10,6 +10,11 @@
  *  - each customer: stored balance = sum of their ledger rows (debit - credit) AND = what the records explain
  *  - every allocation of an advance followed the approved order (no customer has advance while owing anything)
  *  - payments and allocations were never edited or deleted (counts only grow; first rows unchanged)
+ *
+ * Repeatable at any time of day: the sweep sells to and takes customer payments from customers 2 and 3 only.
+ * Customer 1 owes the demo invoice INV-1001, which the seed stamps "today 10:30:00" while every new sale is
+ * stamped with the real time; payments settle the OLDEST invoice first, so for customer 1 the order (and with it
+ * every later random choice) changed at 10:30 UTC. Customer 1 and INV-1001 stay in the data and in every check.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { startServer, Api, RunningServer, cartItem, salePayload } from '../helpers/server';
@@ -34,11 +39,19 @@ describe('financial integrity sweep (seeded, repeatable)', () => {
     const pick = <T>(xs: T[]) => xs[Math.floor(r() * xs.length)];
     const txn = () => `sweep-${Math.floor(r() * 1e12).toString(36)}-${Date.now().toString(36)}`;
     const products: any[] = (await admin.get('/inventory')).body.filter((p: any) => [1, 2, 3, 4, 5].includes(p.id));
-    const customers = [1, 2, 3];
+    const customers = [2, 3]; // customers the sweep sells to and takes payments from (see the note above)
+    const allCustomers = [1, 2, 3];
     const usedTxns: { route: string; body: any; who: Api }[] = [];
     const tally: Record<string, number> = {};
     const count = (k: string) => { tally[k] = (tally[k] || 0) + 1; };
     const methods = ['CASH', 'CARD', 'BANK_TRANSFER'];
+
+    // precondition for repeatability: the sweep's customers owe no invoice made before the sweep, so the
+    // oldest-first order of what they owe is decided only by records the sweep itself creates
+    for (const c of customers) {
+      const o = (await admin.get(`/customers/${c}/outstanding`)).body;
+      expect(o.items.filter((i: any) => i.target !== 'OPENING_BALANCE'), `customer ${c} owes an invoice made before the sweep`).toEqual([]);
+    }
 
     const db0 = await openReadOnly(srv.dbFile);
     const firstPayments = all(db0, 'SELECT * FROM payments ORDER BY id');
@@ -87,7 +100,9 @@ describe('financial integrity sweep (seeded, repeatable)', () => {
         count(`replay ${res.status}`);
         expect(res.body.replayed).toBe(true);
       } else if (op < 0.88) {
-        const pays: any[] = (await admin.get('/payments?limit=1000')).body.filter((p: any) => p.direction === 'IN' && p.customer_id);
+        // by id: the list comes newest-first, and the demo payment's fixed "today 10:30" time would move it
+        // from first to last place at 10:30 UTC, changing which payment the same random number picks
+        const pays: any[] = (await admin.get('/payments?limit=1000')).body.filter((p: any) => p.direction === 'IN' && p.customer_id).sort((x: any, y: any) => x.id - y.id);
         if (!pays.length) continue;
         const p = pick(pays);
         const res = await admin.post(`/payments/${p.id}/reverse`, { reason: `sweep step ${step}`, client_txn_id: txn() });
@@ -136,7 +151,7 @@ describe('financial integrity sweep (seeded, repeatable)', () => {
     expect(rec.mismatches).toEqual([]);
     expect(rec.untracked_sales).toBe(0);
     // approved order: nobody holds an advance while owing anything
-    for (const c of customers) {
+    for (const c of allCustomers) {
       const o = (await admin.get(`/customers/${c}/outstanding`)).body;
       expect(o.difference, `customer ${c}`).toBeCloseTo(0, 2);
       if (o.advance > 0.004) expect(o.items, `customer ${c} has advance and debt`).toEqual([]);
