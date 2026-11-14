@@ -2,7 +2,8 @@ import { PRODUCT_NAME, storeNameOf } from '../lib/branding';
 import React, { useState, useEffect, useRef } from 'react';
 import { Html5Qrcode } from 'html5-qrcode';
 import { Product, Category, Customer, CartItem, SaleHeader, SystemSettings } from '../types';
-import { api, ApiError, saveDraftCart, loadDraftCart, clearDraftCart, getCurrentUser, SaleQuote } from '../lib/api';
+import { api, ApiError, getCurrentUser, SaleQuote } from '../lib/api';
+import { saveDraftCart, clearDraftCart, inspectDraft, removeUnusableDrafts, restoreDraftCart, draftOwnerOf, DraftCart, DRAFT_MAX_AGE_HOURS } from '../lib/draftCart';
 import { priceBill, priceLine, sameMoney } from '../../shared/pricing';
 import { ThermalReceiptModal } from './ThermalReceiptModal';
 import { 
@@ -72,8 +73,15 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
   // Receipt Modal State
   const [completedSale, setCompletedSale] = useState<(SaleHeader & { items?: any[] }) | null>(null);
 
-  // Draft Cart Alert State
-  const [hasDraft, setHasDraft] = useState<boolean>(false);
+  // Draft cart recovery (one draft per store and user, see lib/draftCart.ts).
+  // The draft found when the POS opens is kept here until the cashier chooses Resume or Discard;
+  // until then the autosave below neither overwrites nor deletes it.
+  const draftOwner = useRef(draftOwnerOf(getCurrentUser())).current;
+  const [draftFound] = useState(() => inspectDraft(draftOwner)); // read only: no side effects during render
+  const [pendingDraft, setPendingDraft] = useState<DraftCart | null>(draftFound.own.status === 'ok' ? draftFound.own.draft : null);
+  const pendingDraftRef = useRef<DraftCart | null>(pendingDraft);
+  const [draftNotice, setDraftNotice] = useState<{ kind: 'info' | 'warning' | 'error'; text: string } | null>(null);
+  const [catalogReady, setCatalogReady] = useState<boolean>(false); // current medicines and customers loaded
 
   // Barcode Scanner & Print States
   const [barcodeMode, setBarcodeMode] = useState<boolean>(true);
@@ -94,7 +102,7 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
 
   useEffect(() => {
     fetchInitialData();
-    checkDraftCart();
+    housekeepDrafts();
   }, []);
 
   // Audio Beep Generator using Web Audio API
@@ -309,13 +317,12 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
     }
   }, [showCameraScanner]);
 
-  // Save draft cart to LocalStorage on changes
+  // Autosave the cart as this user's draft. While a recovered draft waits for Resume / Discard, nothing is
+  // saved or deleted, so the empty cart of a freshly opened POS can never remove the pending draft.
   useEffect(() => {
-    if (cart.length > 0) {
-      saveDraftCart(cart, selectedCustomer?.id, overallDiscountPercent);
-    } else {
-      clearDraftCart();
-    }
+    if (!draftOwner || pendingDraftRef.current) return;
+    if (cart.length > 0) saveDraftCart(draftOwner, cart, selectedCustomer, overallDiscountPercent);
+    else clearDraftCart(draftOwner);
   }, [cart, selectedCustomer, overallDiscountPercent]);
 
   const fetchInitialData = async () => {
@@ -329,6 +336,7 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
       setProducts(prodsData);
       setCategories(catsData);
       setCustomers(custsData);
+      setCatalogReady(true);
     } catch (err) {
       console.error('Error fetching billing data:', err);
     } finally {
@@ -336,29 +344,62 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
     }
   };
 
-  const checkDraftCart = () => {
-    const draft = loadDraftCart();
-    if (draft && draft.cart && draft.cart.length > 0) {
-      setHasDraft(true);
+  /** Removes drafts that cannot be offered (expired, unreadable, legacy without an owner) and says so. */
+  const housekeepDrafts = () => {
+    removeUnusableDrafts(draftOwner, draftFound);
+    const notes: string[] = [];
+    if (draftFound.own.status === 'expired') {
+      const d = draftFound.own.draft;
+      notes.push(`A draft cart saved on ${new Date(d.savedAt).toLocaleString()} (${d.lines.length} item${d.lines.length === 1 ? '' : 's'}) was older than ${DRAFT_MAX_AGE_HOURS} hours and was removed.`);
     }
+    if (draftFound.own.status === 'invalid') notes.push(`A saved draft cart was removed because ${draftFound.own.reason}.`);
+    if (draftFound.legacyPresent) notes.push('A draft cart from an older version of the app was found. It does not record which user or store it belongs to, so it was not shown and was removed.');
+    if (notes.length) setDraftNotice({ kind: 'info', text: notes.join(' ') });
   };
 
+  const endDraftDecision = () => {
+    pendingDraftRef.current = null;
+    setPendingDraft(null);
+  };
+
+  /** Resume: rebuild the cart from the kept draft with today's prices and stock. Nothing is sent to the server. */
   const handleRestoreDraft = () => {
-    const draft = loadDraftCart();
-    if (draft && draft.cart) {
-      setCart(draft.cart);
-      if (draft.customerId) {
-        const found = customers.find(c => c.id === draft.customerId);
-        if (found) setSelectedCustomer(found);
-      }
-      setOverallDiscountPercent(draft.discountPercent || 0);
+    const draft = pendingDraftRef.current;
+    if (!draft) return;
+    if (!catalogReady) {
+      setDraftNotice({ kind: 'error', text: 'The current medicine and customer lists could not be loaded yet, so the draft cannot be checked. The draft was kept; trying to load the lists again…' });
+      void fetchInitialData();
+      return;
     }
-    setHasDraft(false);
+    if (cart.length > 0 && !window.confirm(`Replace the ${cart.length} item(s) now in the cart with the saved draft?`)) return;
+    let result: ReturnType<typeof restoreDraftCart>;
+    try {
+      result = restoreDraftCart(draft, { products, customers, sellableOf, expiredOnly });
+    } catch (e: any) {
+      result = { ok: false, error: `The saved cart could not be restored (${e?.message || 'unexpected error'}).` };
+    }
+    if (result.ok === false) {
+      // the draft stays saved and the choice stays open
+      setDraftNotice({ kind: 'error', text: `${result.error} The draft was kept: you can try again later or Discard it.` });
+      return;
+    }
+    endDraftDecision(); // autosave takes over from here and saves the restored cart
+    setCart(result.cart);
+    setSelectedCustomer(result.customer);
+    setOverallDiscountPercent(result.discountPercent);
+    const count = result.cart.length;
+    setDraftNotice(result.notices.length
+      ? { kind: 'warning', text: `Draft restored (${count} item${count === 1 ? '' : 's'}) with changes: ${result.notices.join(' ')}` }
+      : { kind: 'info', text: `Draft restored: ${count} item${count === 1 ? '' : 's'} with current prices and stock.` });
   };
 
+  /** Discard: delete the saved draft explicitly. */
   const handleDiscardDraft = () => {
-    clearDraftCart();
-    setHasDraft(false);
+    if (draftOwner) clearDraftCart(draftOwner);
+    endDraftDecision();
+    setDraftNotice(null);
+    // the cart on screen (if any) becomes this user's draft again
+    if (draftOwner && cart.length) saveDraftCart(draftOwner, cart, selectedCustomer, overallDiscountPercent);
   };
 
   // Add Product to Cart
@@ -691,9 +732,10 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
     const saleDetail: any = await api.getSaleDetail(saleId);
     // Automatically download sale invoice to local PC/device
     downloadSaleInvoiceFile(saleDetail);
-    // Clear Cart & Draft
+    // Clear Cart & Draft (the sale is confirmed by the server at this point). A recovered draft that is still
+    // waiting for Resume / Discard belongs to an earlier cart and is kept.
     setCart([]);
-    clearDraftCart();
+    if (draftOwner && !pendingDraftRef.current) clearDraftCart(draftOwner);
     setDiscountGrant(null);
     setDiscountReason('');
     setOverallDiscountPercent(0);
@@ -872,30 +914,44 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
         {/* LEFT PANE: Product Search & Catalog */}
         <div className="lg:w-7/12 space-y-2">
           
-          {/* Draft Cart Restored Alert */}
-          {hasDraft && (
-            <div className="p-2.5 bg-amber-50 border-l-4 border-amber-500 rounded shadow-sm flex items-center justify-between text-amber-900 text-xs">
+          {/* Draft Cart Recovery */}
+          {pendingDraft && (
+            <div data-testid="draft-alert" className="p-2.5 bg-amber-50 border-l-4 border-amber-500 rounded shadow-sm flex items-center justify-between text-amber-900 text-xs">
               <div className="flex items-center space-x-2">
                 <AlertCircle className="w-4 h-4 text-amber-600" />
                 <div>
                   <p className="font-bold">Draft Cart Recovered</p>
-                  <p className="text-[10px] text-amber-700">Unsaved POS items from previous session found.</p>
+                  <p className="text-[10px] text-amber-700">
+                    Unsaved POS items from previous session found: {pendingDraft.lines.length} item{pendingDraft.lines.length === 1 ? '' : 's'}
+                    {pendingDraft.customerName ? `, customer ${pendingDraft.customerName}` : ''}, saved {new Date(pendingDraft.savedAt).toLocaleString()}.
+                  </p>
                 </div>
               </div>
               <div className="flex items-center space-x-1">
-                <button 
+                <button
+                  data-testid="draft-resume"
                   onClick={handleRestoreDraft}
-                  className="bg-emerald-600 hover:bg-emerald-700 text-white font-bold px-2 py-1 rounded text-[10px]"
+                  disabled={loading}
+                  title={loading ? 'Loading current prices, stock and customers…' : 'Restore the saved cart with current prices and stock'}
+                  className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white font-bold px-2 py-1 rounded text-[10px]"
                 >
-                  Resume
+                  {loading ? 'Loading…' : 'Resume'}
                 </button>
-                <button 
+                <button
+                  data-testid="draft-discard"
                   onClick={handleDiscardDraft}
                   className="bg-slate-200 text-slate-700 hover:bg-slate-300 px-2 py-1 rounded text-[10px]"
                 >
                   Discard
                 </button>
               </div>
+            </div>
+          )}
+          {draftNotice && (
+            <div data-testid="draft-notice" role="status"
+              className={`p-2 rounded border-l-4 text-[11px] flex items-start justify-between gap-2 ${draftNotice.kind === 'error' ? 'bg-red-50 border-red-500 text-red-800' : draftNotice.kind === 'warning' ? 'bg-amber-50 border-amber-500 text-amber-900' : 'bg-emerald-50 border-emerald-500 text-emerald-900'}`}>
+              <span>{draftNotice.text}</span>
+              <button aria-label="Close draft notice" onClick={() => setDraftNotice(null)} className="shrink-0"><X className="w-3.5 h-3.5" /></button>
             </div>
           )}
 
@@ -1191,6 +1247,7 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
               </div>
 
               <select
+                aria-label="POS customer"
                 value={selectedCustomer?.id || ''}
                 onChange={(e) => {
                   const id = Number(e.target.value);
@@ -1301,6 +1358,7 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
                   type="number"
                   min="0"
                   max="100"
+                  aria-label="Bill discount percent"
                   value={overallDiscountPercent || ''}
                   onChange={(e) => setOverallDiscountPercent(Math.min(100, Math.max(0, Number(e.target.value) || 0)))}
                   title={isAdminUser ? 'Discounts need a reason (recorded in the audit log)' : 'Discounts above the staff limit need an administrator'}
