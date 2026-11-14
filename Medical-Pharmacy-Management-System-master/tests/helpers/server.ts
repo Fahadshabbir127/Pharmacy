@@ -53,6 +53,7 @@ function portInUse(port: number): Promise<boolean> {
 
 async function waitForServer(proc: ChildProcess, logs: () => string, timeoutMs = 45000, tlsPin?: string): Promise<void> {
   const start = Date.now();
+  let lastCheck = 'no check completed';
   while (Date.now() - start < timeoutMs) {
     if (proc.exitCode !== null || proc.signalCode !== null) {
       throw new Error(`Server exited early with code ${proc.exitCode ?? proc.signalCode}\n${logs()}`);
@@ -60,17 +61,20 @@ async function waitForServer(proc: ChildProcess, logs: () => string, timeoutMs =
     try {
       if (tlsPin) {
         const { pinnedJson } = await import('../../server/lan/pinnedClient');
-        if ((await pinnedJson(`https://127.0.0.1:${PORT}/api/health`, tlsPin)).status === 200) return;
+        const status = (await pinnedJson(`https://127.0.0.1:${PORT}/api/health`, tlsPin)).status;
+        if (status === 200) return;
+        lastCheck = `HTTP ${status}`;
       } else {
         const res = await fetch(`${BASE_URL}/api/auth/me`);
         if (res.status === 401) return; // routes registered, auth middleware active
+        lastCheck = `HTTP ${res.status}`;
       }
-    } catch {
-      /* not listening yet */
+    } catch (e: any) {
+      lastCheck = e?.cause?.code || e?.code || e?.message || String(e); // not listening yet (normally ECONNREFUSED)
     }
     await new Promise((r) => setTimeout(r, 250));
   }
-  throw new Error(`Server did not become ready within ${timeoutMs} ms\n${logs()}`);
+  throw new Error(`Server did not become ready within ${timeoutMs} ms (server process ${proc.pid} still running; last readiness check: ${lastCheck})\n${logs()}`);
 }
 
 /**
@@ -102,7 +106,11 @@ export async function startServer(opts: { workDir?: string; entry?: string; seed
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   live.add(proc);
-  proc.once('exit', () => live.delete(proc));
+  // Record the exit once, when it happens. stop()/kill() must not rely on `exitCode` alone: a process ended by a
+  // signal has exitCode === null (always so on Windows, where kill('SIGTERM') terminates at once), and a new
+  // once('exit') listener added after the process has gone never fires.
+  let hasExited = false;
+  const exited = new Promise<void>((resolve) => proc.once('exit', () => { hasExited = true; live.delete(proc); resolve(); }));
   proc.stdout!.on('data', (d) => { output += d.toString(); });
   proc.stderr!.on('data', (d) => { output += d.toString(); });
   const logs = () => output;
@@ -111,6 +119,7 @@ export async function startServer(opts: { workDir?: string; entry?: string; seed
     await waitForServer(proc, logs, 45000, opts.tlsPin);
   } catch (e) {
     proc.kill('SIGKILL');
+    await exited; // never leave a half-started server behind holding the port
     throw e;
   }
 
@@ -121,23 +130,23 @@ export async function startServer(opts: { workDir?: string; entry?: string; seed
     workDir,
     dbFile,
     logs,
-    kill: () =>
-      new Promise<void>((resolve) => {
-        if (proc.exitCode !== null || proc.signalCode) return resolve();
-        proc.once('exit', () => resolve());
+    kill: async () => {
+      if (!hasExited) {
         proc.kill('SIGKILL');
-      }).then(waitPortFree),
-    stop: () =>
-      new Promise<void>((resolve) => {
-        if (proc.exitCode !== null) return resolve();
-        const done = () => resolve();
-        proc.once('exit', done);
+        await exited;
+      }
+      await waitPortFree();
+    },
+    stop: async () => {
+      if (!hasExited) {
         proc.kill('SIGTERM');
-        setTimeout(() => { if (proc.exitCode === null) proc.kill('SIGKILL'); }, 5000);
-      }).then(async () => {
-        // wait until the port is released so the next test can bind it
-        for (let i = 0; i < 40 && (await portInUse(PORT)); i++) await new Promise((r) => setTimeout(r, 100));
-      }),
+        const fallback = setTimeout(() => { if (!hasExited) proc.kill('SIGKILL'); }, 5000);
+        await exited;
+        clearTimeout(fallback);
+      }
+      // wait until the port is released so the next test can bind it
+      await waitPortFree();
+    },
   };
 }
 
