@@ -92,6 +92,24 @@ describe('path comparison', () => {
     expect(isInside('/a/data', '/a', 'linux')).toBe(false);
     expect(isInside('/a/data', '/a/data', 'linux')).toBe(true);
   });
+
+  it('the given platform decides the path rules, whatever the host (Windows host failure: path.win32 ignored "linux")', () => {
+    // POSIX rules on any host: letter case matters, a backslash is part of a file name
+    expect(isInside('/a/data', '/a/Data/x', 'linux')).toBe(false);
+    expect(isInside('/a/data', '/a/data/x\\..\\..\\y', 'linux')).toBe(true);
+    expect(samePath('/a/data/X', '/a/data/x', 'darwin')).toBe(false);
+    // Windows rules on any host: drive letters, backslashes and letter case
+    expect(isInside('C:\\Data', 'c:\\DATA\\Backups\\x', 'win32')).toBe(true);
+    expect(isInside('C:\\Data', 'C:\\Data2\\x', 'win32')).toBe(false);
+    expect(isInside('C:\\Data', 'D:\\Data\\x', 'win32')).toBe(false);
+    expect(isInside('C:\\Data', 'C:\\Data\\..\\Other', 'win32')).toBe(false);
+    expect(isInside('C:\\Data', 'C:\\Data\\..foo', 'win32')).toBe(true);
+    expect(isInside('C:\\Data', 'C:/Data/backups/x', 'win32')).toBe(true); // forward slashes are separators on Windows
+    expect(samePath('C:\\Data\\pharmacy.sqlite', 'c:/data/PHARMACY.SQLITE', 'win32')).toBe(true);
+    expect(samePath('C:\\Data\\pharmacy.sqlite', 'C:\\Data\\pharmacy.sqlite-wal', 'win32')).toBe(false);
+    // the host default still applies when no platform is given
+    expect(isInside('/a/data', '/a/data/x')).toBe(true);
+  });
 });
 
 describe('assertNotProtected', () => {

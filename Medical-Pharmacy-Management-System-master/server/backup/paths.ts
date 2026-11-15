@@ -50,17 +50,24 @@ const WINDOWS_RESERVED = /^(con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³]|conin\
 export const realpathNative: (p: string) => Promise<string> = promisify(realpathCb.native);
 
 const isWin = (platform: NodeJS.Platform) => platform === 'win32';
-/** compare two absolute paths (case-insensitively on Windows) */
+/**
+ * The path rules of the given platform, never of the host: path.win32 compares letter case insensitively (e.g. in
+ * relative()), path.posix sensitively, so using the host's module would ignore an explicitly given platform.
+ */
+const pathFor = (platform: NodeJS.Platform) => (isWin(platform) ? path.win32 : path.posix);
+/** compare two absolute paths (case-insensitively on Windows, case-sensitively elsewhere) */
 export function samePath(a: string, b: string, platform: NodeJS.Platform = process.platform): boolean {
-  const pa = path.resolve(a); const pb = path.resolve(b);
+  const p = pathFor(platform);
+  const pa = p.resolve(a); const pb = p.resolve(b);
   return isWin(platform) ? pa.toLowerCase() === pb.toLowerCase() : pa === pb;
 }
-/** true when child is base itself or inside it */
+/** true when child is base itself or inside it (letter case as for samePath) */
 export function isInside(base: string, child: string, platform: NodeJS.Platform = process.platform): boolean {
-  const norm = (p: string) => (isWin(platform) ? path.resolve(p).toLowerCase() : path.resolve(p));
-  const rel = path.relative(norm(base), norm(child));
+  const p = pathFor(platform);
+  const norm = (x: string) => (isWin(platform) ? p.resolve(x).toLowerCase() : p.resolve(x));
+  const rel = p.relative(norm(base), norm(child));
   // only the parent-folder step itself ('..' or '../...') leaves base; a child name may start with '..'
-  return rel === '' || (rel !== '..' && !rel.startsWith(`..${path.sep}`) && !path.isAbsolute(rel));
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${p.sep}`) && !p.isAbsolute(rel));
 }
 
 export function backupLayout(dataDir: string, dbFile: string): BackupLayout {
