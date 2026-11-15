@@ -4,7 +4,7 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import crypto from 'node:crypto';
-import { assertKdfParams, deriveKeys, newSalt, passwordBytes, scryptMemoryBytes, KDF_BOUNDS, KDF_CANDIDATES, SALT_BYTES } from '../../server/backup/kdf';
+import { assertKdfParams, deriveKeys, newSalt, passwordBytes, scryptMemoryBytes, DEFAULT_KDF, KDF_BOUNDS, KDF_CANDIDATES, SALT_BYTES } from '../../server/backup/kdf';
 import { BackupError } from '../../server/backup/errors';
 
 const FAST = { N: 2 ** 15, r: 8, p: 1 };
@@ -122,5 +122,16 @@ describe('KDF parameter bounds (checked before any derivation)', () => {
       expect(scryptMemoryBytes(c)).toBeLessThanOrEqual(KDF_BOUNDS.maxMemoryBytes);
     }
     expect(scryptMemoryBytes({ N: 2 ** 17, r: 8, p: 1 })).toBe(128 * 1024 * 1024);
+  });
+});
+
+describe('DEFAULT_KDF (Phase 9A.2)', () => {
+  it('is N = 2^17, r = 8, p = 1 (128 MiB), frozen, within the bounds and one of the benchmark candidates', () => {
+    expect(DEFAULT_KDF).toEqual({ N: 2 ** 17, r: 8, p: 1 });
+    expect(Object.isFrozen(DEFAULT_KDF)).toBe(true);
+    expect(() => assertKdfParams(DEFAULT_KDF)).not.toThrow();
+    expect(scryptMemoryBytes(DEFAULT_KDF)).toBe(128 * 1024 * 1024);
+    expect(KDF_CANDIDATES).toContainEqual(DEFAULT_KDF);
+    expect(() => { (DEFAULT_KDF as any).N = 2 ** 15; }).toThrow(TypeError);
   });
 });

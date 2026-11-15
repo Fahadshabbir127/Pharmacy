@@ -359,6 +359,11 @@ const EMPTY = Buffer.alloc(0);
 
 type ReaderState = 'preamble' | 'header' | 'frame' | 'body' | 'done' | 'failed';
 
+export interface BackupReaderOptions {
+  /** refuse the file (FILE_TOO_LARGE) as soon as its DATA records would exceed this many plaintext bytes */
+  maxPlaintextBytes?: number;
+}
+
 /**
  * Streaming decoder. Feed the file with `push` (await each call; calls must not overlap) and collect the
  * decrypted DATA chunks it returns; then call `end()`, which returns the verified manifest. Any problem throws a
@@ -383,7 +388,14 @@ export class BackupReader {
   private frame: { type: number; length: number; bytes: Buffer } | null = null;
   private manifest: BackupManifest | null = null;
 
-  constructor(secret: string) { this.secret = secret; }
+  private readonly maxPlaintextBytes: number | null;
+
+  constructor(secret: string, options?: BackupReaderOptions) {
+    this.secret = secret;
+    const max = options?.maxPlaintextBytes;
+    if (max !== undefined && (!Number.isSafeInteger(max) || max <= 0)) throw new TypeError('maxPlaintextBytes must be a positive safe integer');
+    this.maxPlaintextBytes = max ?? null;
+  }
 
   /** header details (no salt or nonce), available once the header has been authenticated */
   get info(): BackupHeaderInfo | null { return this.headerHash && this.parsed ? headerInfo(this.parsed.header) : null; }
@@ -478,6 +490,8 @@ export class BackupReader {
           const max = type === RecordType.DATA ? this.parsed!.header.aead.chunkSize : MAX_MANIFEST_BYTES;
           if (length < 1 || length > max) throw new BackupError('RECORD_INVALID', 'record');
           if (type === RecordType.DATA && this.lastDataShort) throw new BackupError('RECORD_INVALID', 'record'); // non-canonical chunking
+          // size limit, checked before the record body is read or decrypted
+          if (type === RecordType.DATA && this.maxPlaintextBytes !== null && this.size + length > this.maxPlaintextBytes) throw new BackupError('FILE_TOO_LARGE', 'record');
           this.frame = { type, length, bytes };
           this.state = 'body';
           break;
@@ -534,8 +548,8 @@ export async function encodeBackup(payload: Buffer, o: BackupWriterOptions & { m
   }
 }
 
-export async function decodeBackup(file: Buffer, secret: string, pieceSize = file.length || 1): Promise<{ info: BackupHeaderInfo; manifest: BackupManifest; data: Buffer }> {
-  const r = new BackupReader(secret);
+export async function decodeBackup(file: Buffer, secret: string, pieceSize = file.length || 1, options?: BackupReaderOptions): Promise<{ info: BackupHeaderInfo; manifest: BackupManifest; data: Buffer }> {
+  const r = new BackupReader(secret, options);
   const parts: Buffer[] = [];
   for (let i = 0; i < file.length; i += pieceSize) parts.push(...await r.push(file.subarray(i, i + pieceSize)));
   const { info, manifest } = r.end();
