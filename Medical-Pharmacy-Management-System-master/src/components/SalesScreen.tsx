@@ -1,14 +1,17 @@
 import React, { useState, useEffect } from 'react';
 import { api } from '../lib/api';
+import { useLiveRefresh } from '../lib/useLiveRefresh';
 import { SaleHeader, User } from '../types';
 import { Search, Calendar, RefreshCw, ShoppingCart, DollarSign, Package, Printer, FileText, Download } from 'lucide-react';
 import { InvoicePaymentsPanel } from './payments/InvoicePaymentsPanel';
 
 interface SalesScreenProps {
   currentUser?: User;
+  /** Phase 8b: the screen is visible (it stays mounted while hidden) */
+  active?: boolean;
 }
 
-export const SalesScreen: React.FC<SalesScreenProps> = ({ currentUser }) => {
+export const SalesScreen: React.FC<SalesScreenProps> = ({ currentUser, active = true }) => {
   const [sales, setSales] = useState<SaleHeader[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
@@ -21,9 +24,13 @@ export const SalesScreen: React.FC<SalesScreenProps> = ({ currentUser }) => {
     api.getSettings().then(setSettings).catch(console.error);
   }, []);
 
-  const fetchSales = async () => {
-    setLoading(true);
-    setError('');
+  /** `silent`: a live refresh with the current period filter (keeps the list and any error shown until it succeeds). */
+  const fetchSales = async (opts: { silent?: boolean } = {}) => {
+    const silent = opts?.silent === true;
+    if (!silent) {
+      setLoading(true);
+      setError('');
+    }
     try {
       const today = new Date();
       let startDate = '';
@@ -43,12 +50,16 @@ export const SalesScreen: React.FC<SalesScreenProps> = ({ currentUser }) => {
 
       const data = await api.getFullSalesHistory(startDate || undefined, filterType === 'ALL' ? undefined : endDate);
       setSales(data);
+      if (silent) setError('');
     } catch (err: any) {
-      setError(err.message || 'Failed to load sales history');
+      if (!silent) setError(err.message || 'Failed to load sales history');
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
+
+  // Phase 8b: a sale, payment, reversal or void on any computer
+  useLiveRefresh(['sales'], () => fetchSales({ silent: true }), { active });
 
   useEffect(() => {
     fetchSales();

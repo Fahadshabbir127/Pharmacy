@@ -1,6 +1,6 @@
 import { useConnectionState, ConnectionChip, ConnectionOverlay, isDesktop } from './components/ConnectionStatus';
 import { PRODUCT_NAME } from './lib/branding';
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { User, SystemSettings } from './types';
 import { getCurrentUser, getAuthToken, setCurrentUser as setCurrentUserInStorage, removeAuthToken, api, getPendingOfflineSales, syncPendingOfflineSales } from './lib/api';
 import { Navbar } from './components/Navbar';
@@ -18,6 +18,11 @@ import { UserManagementScreen } from './components/UserManagementScreen';
 import { AuditLogScreen } from './components/AuditLogScreen';
 import { SuperAdminScreen } from './components/SuperAdminScreen';
 import { SalesScreen } from './components/SalesScreen';
+import { LiveEventClient, type LiveTopic } from './lib/liveEvents';
+import { dispatchLiveChange } from './lib/useLiveRefresh';
+
+/** topics that change the sidebar alerts and the shared settings */
+const DASHBOARD_TOPICS: LiveTopic[] = ['inventory', 'purchases', 'sales', 'settings'];
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -143,9 +148,51 @@ export default function App() {
   };
 
   const handleLogout = () => {
+    // ask the host to end this session's live-event streams; the request reads the token before it is removed
+    void api.logout().catch(() => { /* host unreachable: the stream also stops below */ });
     removeAuthToken();
     setCurrentUser(null);
   };
+
+  // ---- Phase 8b: one live-event stream per signed-in user (not for customer-portal accounts) ----
+  const fetchAlertsRef = useRef(fetchAlertsAndSettings);
+  fetchAlertsRef.current = fetchAlertsAndSettings;
+  const [liveRestart, setLiveRestart] = useState(0);
+  useEffect(() => {
+    if (!currentUser || currentUser.role === 'CUSTOMER') return;
+    const withDashboard = currentUser.role !== 'SUPER_ADMIN'; // the super admin screen has no store dashboard
+    let dashTimer: ReturnType<typeof setTimeout> | null = null;
+    let restartTimer: ReturnType<typeof setTimeout> | null = null;
+    const refreshDashboardSoon = () => {
+      if (!withDashboard) return;
+      if (dashTimer) clearTimeout(dashTimer);
+      dashTimer = setTimeout(() => { dashTimer = null; void fetchAlertsRef.current(); }, 300);
+    };
+    const client = new LiveEventClient({
+      getToken: getAuthToken,
+      onChange: (c) => {
+        dispatchLiveChange({ topics: [c.topic], reason: 'change' });
+        if (DASHBOARD_TOPICS.includes(c.topic)) refreshDashboardSoon();
+      },
+      onResync: (reason) => {
+        dispatchLiveChange({ topics: 'all', reason });
+        refreshDashboardSoon();
+      },
+      onSessionEnd: (reason) => {
+        if (reason === 'LOGGED_OUT' || reason === 'NO_TOKEN') return; // this app is signing out
+        // the host ended the stream for the session (expired, account or store suspended, pairing revoked):
+        // if the session really is invalid, sign out; otherwise try the stream again later (never in a tight loop)
+        api.getMe()
+          .then(() => { restartTimer = setTimeout(() => setLiveRestart((n) => n + 1), 30_000); })
+          .catch(() => { removeAuthToken(); setCurrentUser(null); });
+      },
+    }).start();
+    return () => {
+      client.stop();
+      if (dashTimer) clearTimeout(dashTimer);
+      if (restartTimer) clearTimeout(restartTimer);
+    };
+  }, [currentUser?.id, currentUser?.role, currentUser?.tenant_id, liveRestart]);
 
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -222,19 +269,19 @@ export default function App() {
 
               {visitedTabs.has('billing') && (
                 <div className={activeTab === 'billing' ? 'block' : 'hidden'}>
-                  <BillingScreen settings={settings} onRefreshData={fetchAlertsAndSettings} />
+                  <BillingScreen settings={settings} onRefreshData={fetchAlertsAndSettings} active={activeTab === 'billing'} />
                 </div>
               )}
 
               {visitedTabs.has('sales') && (
                 <div className={activeTab === 'sales' ? 'block' : 'hidden'}>
-                  <SalesScreen currentUser={currentUser || undefined} />
+                  <SalesScreen currentUser={currentUser || undefined} active={activeTab === 'sales'} />
                 </div>
               )}
 
               {visitedTabs.has('inventory') && (
                 <div className={activeTab === 'inventory' ? 'block' : 'hidden'}>
-                  <InventoryScreen currentUser={currentUser || undefined} />
+                  <InventoryScreen currentUser={currentUser || undefined} active={activeTab === 'inventory'} />
                 </div>
               )}
 
@@ -246,7 +293,7 @@ export default function App() {
 
               {visitedTabs.has('purchases') && (
                 <div className={activeTab === 'purchases' ? 'block' : 'hidden'}>
-                  <PurchaseScreen />
+                  <PurchaseScreen active={activeTab === 'purchases'} />
                 </div>
               )}
 

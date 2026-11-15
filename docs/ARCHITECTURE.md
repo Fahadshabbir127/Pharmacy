@@ -246,6 +246,27 @@ sales_returns / sales_return_items (sale_item_id, batch_id, qty, restock flag, r
 | Voids | Soft-void (`status`, `voided_at`, `voided_by`, `void_reason`) that restores stock to the original batches and reverses the ledger; reports exclude voided sales |
 | Audit | Every financial, stock, security, backup and config action is written to `audit_logs` in the same transaction as the change |
 
+### As built in Phase 8b (front-end live updates)
+- `src/lib/liveEvents.ts`: `LiveEventClient` reads `GET /api/events` with `fetch` + `ReadableStream`, with the token in the `Authorization` header only. It has its own SSE parser (LF, CRLF or CR line ends, multi-line data, comments, any chunking).
+  - **Reconnect:** backoff of 1 s, 2 s, 4 s, 8 s, 16 s, then 30 s. A stream that worked restarts the sequence at 1 s.
+  - **Full refresh ("resync"):** after every reconnect, when the boot id changes (server restarted), when a store's sequence number skips (missed events), and on a `backups` event (restore).
+  - **Session ends:** 401/403 and the server's `end` reasons LOGGED_OUT, TOKEN_INVALID_OR_EXPIRED, ACCOUNT_INACTIVE, STORE_SUSPENDED and PAIRING_REVOKED stop it for good. SERVER_SHUTDOWN and network drops reconnect.
+  - `stop()` aborts the request and all timers.
+- `App.tsx` keeps exactly one client per signed-in non-customer user. It is keyed on user id, role and store, and stopped on logout, user change and unmount. Logout first calls the new `api.logout()`, so the host ends the stream at once.
+  - **Dispatch:** changes and resyncs go out as one typed window `CustomEvent` (`braintech:live-change`, `{topics: LiveTopic[] | 'all', reason}`). Dashboard alerts and settings refresh after store-data changes and resyncs (debounced).
+  - **Session end:** if the host ends the stream for the session, the app checks it with `/api/auth/me`. It signs out if the session is invalid; otherwise it retries the stream after 30 s, never in a tight loop.
+- `src/lib/useLiveRefresh.ts` is the screens' hook. It coalesces bursts (a sale reports three topics) into one refresh, never runs two refreshes at once, and keeps the latest callback (no effect loops). A hidden but mounted screen only marks itself stale and refreshes once when shown again.
+- **Screens** (each gets an `active` prop; their loaders get a `silent` mode that keeps the current view on screen):
+
+| Screen | Refreshes on | What it reloads |
+|---|---|---|
+| Billing | inventory, customers | the medicine, category and customer lists only; never the cart, selected customer, discount, payment state or draft |
+| Inventory | inventory, purchases | the list, with the current filters |
+| Sales Register | sales | the list, with the current period |
+| Purchases | purchases, inventory | supplier, medicine and history lists; the purchase being entered keeps its rows and selections |
+
+- **Desktop:** the stream travels through the existing pinned-HTTPS proxy (`electron/connection.ts`) unchanged. Its 30 s idle timeout is reset by the 20 s keep-alive.
+
 ### As built in Phase 8a (server event system; desktop and screens follow in 8b/8c)
 - `server/events/liveEvents.ts`: `LiveEventHub` with a random `bootId` per server start and one sequence counter per store. A change event is exactly `{seq, topic, tenantId}`; topics are inventory, sales, customers, purchases, settings, users and backups.
 - **Emitted only after COMMIT**, from the `afterCommit` hook of `transactionalRoute`, and only for writes that answered below 400. A rolled-back transaction (an exception, or 5xx) emits nothing, and neither do refused or invalid requests. `topicsForWrite()` maps route groups to topics; login, OTP, SMS/e-mail queues, pairing, local administration, setup, the price quote and the super admin's "log in as" emit nothing.
@@ -363,7 +384,7 @@ Every phase ends with tests, a build check, a regression check against `FEATURE_
 | JWT secret | random, DPAPI-protected | random 64 bytes in `data/jwt.secret`, owner-only file permissions; the role is always read from the database | DPAPI wrapping of this file is listed for Phase 10 |
 | FK enforcement | after approved fixes | **ON** (FK1–FK5, see `FK_AUDIT_REPORT.md`) | n/a |
 | Idempotency | `client_txn_id` column on each table | `idempotency_keys` table (key, route, stored result), written in the same transaction as the sale | One mechanism for every route, no table rebuilds; used by sales now, payments/purchases in Phase 7 |
-| Real-time updates | SSE | **Server side built in Phase 8a** (see "As built in Phase 8a"). The desktop proxy, the reconnect backoff and the screens' live refresh follow in Phase 8b/8c; until then every screen reads fresh data from the host when it loads. | Phase order |
+| Real-time updates | SSE | **Built in Phase 8a (server) and 8b (front end)**. See "As built in Phase 8a/8b". Billing, Inventory, Sales Register and Purchases refresh live; other screens still load fresh data when opened. | Phase order |
 | Batch inventory (Phase 6) | §10 | Built as described in §10 "As built in Phase 6". Stock protection is in the database (CHECK + triggers), not only in code. | A missed code path must fail, not silently corrupt stock |
 | Stock invariant check | in-transaction + periodic | at startup only, reported, never repaired; the database triggers make a mismatch impossible through normal writes | Periodic check deferred |
 

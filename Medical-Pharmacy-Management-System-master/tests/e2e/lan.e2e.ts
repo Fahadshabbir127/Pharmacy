@@ -311,3 +311,32 @@ describe('Phase 7 Batch 2e: invoice numbers after voids (R4 fixed), across host 
     console.log('[2e LAN] voided', targets.map((t) => t.invoice_number).join(', '), '-> new', [...nums].sort().join(', '));
   }, 120_000);
 });
+
+describe('Phase 8b: live updates between the two computers (no reload)', () => {
+  // These run after the host was switched off and started again: the client's event stream had to reconnect on
+  // its own (backoff up to 30 s), so the waits allow for that.
+  it('a stock change made on the host appears on the client\'s open Inventory screen without any click or reload', async () => {
+    if ((await apiFromRenderer(host.win, 'GET', '/sales/history')).status === 401) await loginUi(host.win, ADMIN.user, ADMIN.password);
+    // the receipt from the earlier "Check status" test may still be open on the client
+    if (await client.win.locator('text=Invoice / Thermal Receipt').count()) await client.win.click('button:has-text("Close")');
+    await client.win.click('button:has-text("Inventory & Stock")');
+    const p = (await apiFromRenderer(client.win, 'GET', '/inventory')).body.find((x: any) => x.batch_number === 'HY-908');
+    const row = client.win.locator(`[data-testid="inventory-row-${p.id}"]`);
+    await expect.poll(() => row.innerText(), { timeout: 15_000 }).toContain(`${p.sellable_stock} ${p.unit}s`);
+    const adj = await apiFromRenderer(host.win, 'POST', '/inventory/adjust', { product_id: p.id, adjustment_type: 'ADD', quantity: 7, reason: 'Live update test', reason_code: 'COUNT_CORRECTION', batch_number: 'LIVE-8B', expiry_date: '2027-06-30' });
+    expect(adj.status).toBe(200);
+    await expect.poll(() => row.innerText(), { timeout: 45_000, interval: 250 }).toContain(`${p.sellable_stock + 7} ${p.unit}s`);
+    await client.win.screenshot({ path: path.join(clientBase, '05-live-stock-update.png') });
+  }, 120_000);
+
+  it('a sale made on the client appears in the host\'s open Sales Register without any click or reload', async () => {
+    await host.win.click('button:has-text("Sales Register")');
+    await host.win.waitForTimeout(500);
+    const p = (await apiFromRenderer(client.win, 'GET', '/inventory')).body.find((x: any) => x.batch_number === 'BF-109');
+    const sale = { items: [{ product: p, quantity: 1, unit_price: p.sale_price, discount_percent: 0, discount_amount: 0, gst_amount: 0, subtotal: p.sale_price }], total_amount: p.sale_price, discount_percent: 0, discount_amount: 0, net_amount: p.sale_price, total_gst: 0, grand_total: p.sale_price, payment_method: 'CASH', amount_paid: p.sale_price, client_txn_id: 'e2e-8b-live-0001' };
+    const r = await apiFromRenderer(client.win, 'POST', '/sales', sale);
+    expect(r.status).toBe(200);
+    await expect.poll(() => host.win.locator('main').innerText(), { timeout: 45_000, interval: 250 }).toContain(r.body.invoice_number);
+    await host.win.screenshot({ path: path.join(hostBase, '06-live-sales-register.png') });
+  }, 120_000);
+});

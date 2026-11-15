@@ -2,6 +2,7 @@ import { exportToExcel } from '../lib/excel';
 import React, { useState, useEffect } from 'react';
 import { Product, Category, Supplier, User, ProductBatch, AdjustReasonCode } from '../types';
 import { api } from '../lib/api';
+import { useLiveRefresh } from '../lib/useLiveRefresh';
 import { BatchPanel } from './BatchPanel';
 import { ExpiryTracker } from './ExpiryTracker';
 import { 
@@ -33,9 +34,11 @@ const ADJUST_REASONS: { code: AdjustReasonCode; label: string }[] = [
 
 interface InventoryScreenProps {
   currentUser?: User;
+  /** Phase 8b: the screen is visible (it stays mounted while hidden) */
+  active?: boolean;
 }
 
-export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser }) => {
+export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser, active = true }) => {
   const isStaff = currentUser?.role === 'STAFF';
   const [products, setProducts] = useState<Product[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
@@ -116,9 +119,11 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
     fetchInventory();
   }, [filterLowStock, expiryDaysFilter, selectedCategory]);
 
-  const fetchInventory = async () => {
+  /** `silent`: a live refresh with the current filters; the table stays on screen (no loading state). */
+  const fetchInventory = async (opts: { silent?: boolean } = {}) => {
+    const silent = opts?.silent === true;
     try {
-      setLoading(true);
+      if (!silent) setLoading(true);
       const [prodsData, catsData, suppsData] = await Promise.all([
         api.getInventory({
           search: searchQuery,
@@ -136,9 +141,12 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
     } catch (err) {
       console.error('Error fetching inventory:', err);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
+
+  // Phase 8b: a sale, purchase or stock change on any computer
+  useLiveRefresh(['inventory', 'purchases'], () => fetchInventory({ silent: true }), { active });
 
   const handleOpenAddModal = () => {
     setEditingProduct(null);
@@ -476,7 +484,7 @@ export const InventoryScreen: React.FC<InventoryScreenProps> = ({ currentUser })
                     const is90DaysExpiring = daysUntilExpiry !== null && daysUntilExpiry > 60 && daysUntilExpiry <= 90;
 
                     return (
-                      <tr key={p.id} className="hover:bg-slate-800/40 transition-colors">
+                      <tr key={p.id} data-testid={`inventory-row-${p.id}`} className="hover:bg-slate-800/40 transition-colors">
                         <td className="py-3 px-4">
                           <div className="font-bold text-white text-sm">{p.name}</div>
                           <div className="text-[10px] text-slate-500">HSN: {p.hsn_code || 'N/A'} • GST: {p.gst_rate}% {p.barcode ? `• Code: ${p.barcode}` : ''}</div>

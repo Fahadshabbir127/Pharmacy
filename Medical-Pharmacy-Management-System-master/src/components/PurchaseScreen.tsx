@@ -1,10 +1,12 @@
 import React, { useState, useEffect } from 'react';
 import { Supplier, Product } from '../types';
 import { api } from '../lib/api';
+import { useLiveRefresh } from '../lib/useLiveRefresh';
 import { Truck, Plus, Trash2, CheckCircle, Package, RefreshCw, X, UserPlus, FileText, Mail, History, Calendar, ExternalLink } from 'lucide-react';
 import { PurchaseOrderModal } from './PurchaseOrderModal';
 
-export const PurchaseScreen: React.FC = () => {
+/** `active` (Phase 8b): the screen is visible (it stays mounted while hidden). */
+export const PurchaseScreen: React.FC<{ active?: boolean }> = ({ active = true }) => {
   const [activeSubTab, setActiveSubTab] = useState<'NEW_PO' | 'PO_HISTORY'>('NEW_PO');
   const [suppliers, setSuppliers] = useState<Supplier[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
@@ -66,9 +68,12 @@ export const PurchaseScreen: React.FC = () => {
     fetchData();
   }, []);
 
-  const fetchData = async () => {
+  /** `silent`: a live refresh. Replaces only the supplier, medicine and purchase-history lists; the purchase being
+   *  entered (its rows, selected supplier and product, quantities and prices) is separate state and stays as it is. */
+  const fetchData = async (opts: { silent?: boolean } = {}) => {
+    const silent = opts?.silent === true;
     try {
-      setLoading(true);
+      if (!silent) setLoading(true);
       const [supps, prods, purHist] = await Promise.all([
         api.getSuppliers(),
         api.getInventory(),
@@ -81,9 +86,12 @@ export const PurchaseScreen: React.FC = () => {
     } catch (err) {
       console.error('Error fetching purchase data:', err);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
+
+  // Phase 8b: a purchase or a stock change on any computer
+  useLiveRefresh(['purchases', 'inventory'], () => fetchData({ silent: true }), { active });
 
   const handleAddRow = () => {
     if (!selectedProductId) return;
