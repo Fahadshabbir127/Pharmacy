@@ -3,6 +3,7 @@
  *   main.cjs     Electron main process
  *   preload.cjs  sandboxed preload (window.braintech)
  *   server.cjs   Express backend, run by Electron's utilityProcess (no separate Node.js needed)
+ *   backup-worker.cjs  encrypted-backup worker thread (Phase 9A.3), started by the backup engine next to server.cjs
  *   ui/          setup wizard and connection settings pages
  * The React UI itself is built by `vite build` into dist/.
  * Only `electron` and the native `better-sqlite3` (Node-API prebuilds) stay external.
@@ -28,6 +29,8 @@ await build({ ...common, entryPoints: [path.join(root, 'electron/main.ts')], out
 // the sandboxed preload may only require 'electron': no shim/banner there
 await build({ ...common, define: undefined, banner: undefined, entryPoints: [path.join(root, 'electron/preload.ts')], outfile: path.join(out, 'preload.cjs'), external: ['electron'], sourcemap: false });
 await build({ ...common, entryPoints: [path.join(root, 'server.ts')], outfile: path.join(out, 'server.cjs'), external: ['better-sqlite3', 'vite'] });
+// the backup engine starts this file as a worker thread from the folder of the bundle that contains the engine
+await build({ ...common, entryPoints: [path.join(root, 'server/backup/worker.ts')], outfile: path.join(out, 'backup-worker.cjs'), external: ['better-sqlite3'] });
 
 fs.cpSync(path.join(root, 'electron/ui'), path.join(out, 'ui'), { recursive: true });
 if (!fs.existsSync(path.join(root, 'dist', 'index.html'))) {

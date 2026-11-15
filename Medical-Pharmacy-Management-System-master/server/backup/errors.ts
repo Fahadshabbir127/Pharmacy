@@ -25,7 +25,14 @@ export type BackupErrorCode =
   | 'PATH_REJECTED' //           an unsafe path: outside the backup folders, a link, a protected file or a bad name
   | 'FILE_TOO_LARGE' //          the database or backup file is larger than the supported limit
   | 'FS_BUSY' //                 a file stayed locked by another program (e.g. antivirus) after all retries
-  | 'PERMISSIONS_UNVERIFIED'; // the private backup folder's access rights could not be set or verified
+  | 'PERMISSIONS_UNVERIFIED' // the private backup folder's access rights could not be set or verified
+  // Phase 9A.3: backup engine
+  | 'KDF_FAILED' //              the key derivation itself failed at run time (e.g. not enough memory)
+  | 'SNAPSHOT_FAILED' //         the database snapshot could not be made or did not pass its checks
+  | 'VERIFY_FAILED' //           the encrypted backup did not verify when read back; it was not published
+  | 'WORKER_FAILED' //           the background backup worker crashed, ran out of memory or misbehaved
+  | 'CANCELLED' //               the backup was cancelled
+  | 'TIMEOUT'; //                the backup took too long or stopped making progress
 
 const MESSAGES: Record<BackupErrorCode, string> = {
   EMPTY_SECRET: 'A backup password is required.',
@@ -48,6 +55,12 @@ const MESSAGES: Record<BackupErrorCode, string> = {
   FILE_TOO_LARGE: 'The database or backup file is larger than the supported limit.',
   FS_BUSY: 'A backup file is in use by another program (for example antivirus). Try again in a moment.',
   PERMISSIONS_UNVERIFIED: 'The private backup folder could not be protected or its access rights could not be verified, so no backup was written.',
+  KDF_FAILED: 'The backup key could not be derived (for example, not enough memory). Close other programs and try again.',
+  SNAPSHOT_FAILED: 'A consistent copy of the database could not be made, or the copy failed its checks.',
+  VERIFY_FAILED: 'The new backup did not pass verification and was not saved.',
+  WORKER_FAILED: 'The backup process stopped unexpectedly. No backup was saved.',
+  CANCELLED: 'The backup was cancelled. No backup was saved.',
+  TIMEOUT: 'The backup took too long and was stopped. No backup was saved.',
 };
 
 export class BackupError extends Error {
@@ -62,6 +75,10 @@ export class BackupError extends Error {
   }
   toJSON() { return { name: this.name, code: this.code, stage: this.stage, message: this.message }; }
 }
+
+/** every known error code (used to validate codes reported by the backup worker) */
+export const BACKUP_ERROR_CODES = Object.freeze(Object.keys(MESSAGES) as BackupErrorCode[]);
+export const isBackupErrorCode = (v: unknown): v is BackupErrorCode => typeof v === 'string' && Object.prototype.hasOwnProperty.call(MESSAGES, v);
 
 export const isBackupError = (e: unknown, code?: BackupErrorCode): e is BackupError =>
   e instanceof BackupError && (code === undefined || e.code === code);

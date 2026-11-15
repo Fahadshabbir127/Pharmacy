@@ -4,6 +4,55 @@ This report contains only results that were actually executed. Anything not exec
 
 ---
 
+## Phase 9A.3: encrypted backup engine (library only)
+
+| | |
+|---|---|
+| Date | 2026-11-15 |
+| Platform | Linux (container) and **Windows 11 (run by the owner)**. The engine is not wired into the server yet (Phase 9A.4). |
+
+### Results (Linux)
+| Command | Result |
+|---|---|
+| `npm run lint` (`tsc --noEmit`) | clean |
+| `npx vitest run tests/unit/backup-*.test.ts` | **12 files, 193 passed, 8 skipped, 0 failed** (7 Windows-only, 1 gated large test) |
+| `npx vitest run` (full suite) | **47 files, 637 passed, 8 skipped (the same), 0 failed**, 374 s |
+| `npm run build:desktop` | succeeded; `dist-electron/backup-worker.cjs` (45.4 kB) produced next to `server.cjs` |
+| `BT_LARGE_TESTS=1 npx vitest run tests/unit/backup-engine.test.ts -t "large database"` | passed: **1001 MiB** database backed up and verified with the default KDF in **10.8 s**; peak process RSS +186 MiB (includes scrypt's 128 MiB); main-thread Buffer memory +0 MiB |
+
+### Results (Windows 11, run by the owner)
+| Command | Result |
+|---|---|
+| full test suite | **47 test files passed (47); 634 passed, 11 skipped, 0 failed**; 1213.45 s |
+| focused backup tests (12 files) | **12 test files passed (12); 190 passed, 11 skipped, 0 failed**; 583.56 s |
+| `npm run build:desktop` | successful |
+| previously failing lock cleanup regression test (`backup-engine.test.ts` "another holder of the backup lock") | 1 passed |
+| `git diff --check` | clean |
+
+The first Windows run of the focused backup tests had one failure: `EBUSY` when the test cleanup deleted `.work/backup.lock` while the child process holding the lock was still exiting (Windows cannot delete a file another process still has open; Linux can). It was resolved by a **test-only** change to the `createBackup` `afterEach` cleanup hook in `tests/unit/backup-engine.test.ts`, which now waits for each child process to exit before removing the test folder. The production lock and backup implementation were not changed for this correction.
+
+### New test files
+| File | Tests (Linux) | What |
+|---|---|---|
+| `backup-snapshot.test.ts` | 9 | snapshot of a live WAL database into a private file: self-contained (DELETE journal, no side files), facts correct, live files unchanged, plaintext only in `.work`; **consistent while another process keeps committing**; an uncommitted transaction is excluded; unsafe targets (non-empty, symlink, existing side file, missing source); non-pharmacy database; damaged copy fails integrity; **a locked source is refused (better-sqlite3 resolves with 0 pages — detected)**; SQLite error mapping; > 4 GiB (sparse, Linux-only) |
+| `backup-pipeline.test.ts` | 9 | encrypt/verify round trip against an independent decode; **64 MiB with bounded Buffer memory** (< 32 MiB growth); FILE_TOO_LARGE before key derivation; disk full / write errors / fsync errors / short writes; run-time KDF failure; wrong password, flipped bit, truncation, appended bytes, damaged header, empty file; plaintext limit and oversized file refused before reading; every mismatching fact is VERIFY_FAILED |
+| `backup-engine.test.ts` | 20 + 1 Windows-only + 1 gated | new error codes; KDF_FAILED vs KDF_PARAMS_REJECTED; `'wx+'` partial; `verifyPrivateFile` (POSIX, and Windows rules with an injected runner); end to end: publish only in `encrypted/`, nothing left in `.work`, live database and legacy backups byte-identical, progress stages in order, independent verify and decrypted row counts; default KDF; concurrent writer; lock held by another process; invalid options; disk space; snapshot file access list not verified (no plaintext written); non-pharmacy database; no hard links; plaintext cleanup failure → published with `cleanupPending`, next sweep removes it; **process killed mid-backup → next backup removes the leftovers**; a second backup never replaces the first; no password in results, errors or console |
+| `backup-worker.test.ts` | 20 | worker crash, silent exit, exit code, malformed result, wrong job id, leaked field, hang (idle timeout), endless progress (overall timeout), hang after writing the plaintext snapshot, verification failure after the real job, pass-through and invalid codes/stages, heap over the limit, missing worker script; cancellation before start, while plaintext exists, during a real backup — each followed by: right code, nothing published, `.work` clean, lock free; `verifyBackupFile` (good file, wrong password, corrupt, truncated, trailing data, not a backup, missing, relative path, empty password, symlink); protocol validation |
+| `backup-bundle.test.ts` | 3 | engine and worker bundled like the desktop build and run by **plain Node** (no TypeScript loader): backup and verify, worker found as `backup-worker.cjs`; the real `dist-electron/backup-worker.cjs` runs a backup (skipped if `build:desktop` has not run) |
+
+### Skipped on Linux (Windows-only, to be run by the owner)
+- The 6 from Phase 9A.2 (real PowerShell access lists, junctions, case-insensitive database path).
+- `backup-engine.test.ts`: a new file in the private `.work` has exactly the inherited private entries (real PowerShell).
+- Gated: the ~1 GB test (`BT_LARGE_TESTS=1`).
+
+On Windows these skip instead (POSIX-only): the 8 from Phase 9A.2, `backup-engine.test.ts` POSIX `verifyPrivateFile`, and the sparse > 4 GiB snapshot test.
+
+### Notes
+- Found during implementation: when the source database is locked, better-sqlite3's `backup()` resolves successfully with `{totalPages: 0}` and copies nothing. The snapshot now waits for a read lock (busy timeout) and refuses an empty or incomplete copy (`SNAPSHOT_FAILED` `busy`).
+- Not verified yet: the worker inside Electron's `utilityProcess` (the engine is not imported by `server.cjs` until 9A.4).
+
+---
+
 ## Phase 9A.1 and 9A.2: backup format, key derivation and safe file operations (library only)
 
 | | |
