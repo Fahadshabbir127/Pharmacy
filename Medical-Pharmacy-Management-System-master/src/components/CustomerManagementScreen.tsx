@@ -1,9 +1,10 @@
 import { PRODUCT_NAME, DEFAULT_TEMPLATES, storeNameOf, fileSafe, useStoreSettings } from '../lib/branding';
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { Customer, LedgerEntry } from '../types';
 import { api } from '../lib/api';
 import { User } from '../types';
 import { CustomerPaymentModal } from './payments/CustomerPaymentModal';
+import { useLiveRefresh } from '../lib/useLiveRefresh';
 import { OpenInvoicesTab, PaymentHistoryTab, BalanceReviewModal } from './payments/CustomerAccount';
 import { 
   Users, 
@@ -27,7 +28,8 @@ import {
   Info
 } from 'lucide-react';
 
-export const CustomerManagementScreen: React.FC<{ currentUser?: User }> = ({ currentUser }) => {
+/** `active` (Phase 8c): the screen is visible (it stays mounted while hidden). */
+export const CustomerManagementScreen: React.FC<{ currentUser?: User; active?: boolean }> = ({ currentUser, active = true }) => {
   const canRegister = currentUser?.role === 'SUPER_ADMIN' || currentUser?.allowed_services?.includes('USER_REGISTER');
   const [customers, setCustomers] = useState<Customer[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
@@ -35,6 +37,8 @@ export const CustomerManagementScreen: React.FC<{ currentUser?: User }> = ({ cur
 
   // Selected Customer Ledger
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
+  const selectedIdRef = useRef<number | null>(null); // the customer selected now (a silent refresh must not overwrite a newer choice)
+  selectedIdRef.current = selectedCustomer?.id ?? null;
   const [ledgerEntries, setLedgerEntries] = useState<LedgerEntry[]>([]);
   const [loadingLedger, setLoadingLedger] = useState<boolean>(false);
 
@@ -73,14 +77,19 @@ export const CustomerManagementScreen: React.FC<{ currentUser?: User }> = ({ cur
     api.getSettings().then(setSettings).catch(console.error);
   }, []);
 
-  const fetchCustomers = async (selectedIdToKeep?: number) => {
+  /** `silent` (Phase 8c live refresh): no loading states; keeps the search, the selected customer and every open
+   *  form or window; reloads the list, the selected customer's ledger and its account tabs in place. */
+  const fetchCustomers = async (selectedIdToKeep?: number, opts: { silent?: boolean } = {}) => {
+    const silent = opts.silent === true;
     try {
-      setLoading(true);
+      if (!silent) setLoading(true);
       const data = await api.getCustomers(searchQuery);
       setCustomers(data);
       if (data.length > 0) {
-        const toSelect = selectedIdToKeep ? data.find(c => c.id === selectedIdToKeep) || data[0] : (selectedCustomer ? data.find(c => c.id === selectedCustomer.id) || data[0] : data[0]);
-        handleSelectCustomer(toSelect);
+        const keepId = selectedIdToKeep ?? selectedIdRef.current ?? undefined;
+        const toSelect = keepId ? data.find(c => c.id === keepId) || data[0] : data[0];
+        if (silent) await refreshSelectedSilently(toSelect);
+        else handleSelectCustomer(toSelect);
       } else {
         setSelectedCustomer(null);
         setLedgerEntries([]);
@@ -88,9 +97,24 @@ export const CustomerManagementScreen: React.FC<{ currentUser?: User }> = ({ cur
     } catch (err) {
       console.error('Error fetching customers:', err);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
+
+  /** Live refresh of the selected customer: new figures and ledger without the ledger's loading state. */
+  const refreshSelectedSilently = async (c: Customer) => {
+    setSelectedCustomer(c);
+    try {
+      const data = await api.getCustomerLedger(c.id);
+      if (selectedIdRef.current === c.id) setLedgerEntries(data.ledger); // the user may have picked another customer meanwhile
+    } catch (err) {
+      console.error('Error refreshing customer ledger:', err);
+    }
+    setAccountRefresh((n) => n + 1); // open invoices and payment history follow
+  };
+
+  // Phase 8c: a sale, payment, reversal or customer change on any computer
+  useLiveRefresh(['customers', 'sales'], () => fetchCustomers(undefined, { silent: true }), { active });
 
   const handleSelectCustomer = async (c: Customer) => {
     try {
@@ -452,6 +476,7 @@ export const CustomerManagementScreen: React.FC<{ currentUser?: User }> = ({ cur
                 return (
                   <div
                     key={c.id}
+                    data-testid={`customer-row-${c.id}`}
                     onClick={() => handleSelectCustomer(c)}
                     className={`p-3.5 rounded-xl border transition-all cursor-pointer flex items-center justify-between ${
                       isSelected

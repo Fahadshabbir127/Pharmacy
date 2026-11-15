@@ -13,6 +13,8 @@ import { BrowserWindow, protocol } from 'electron';
 import { pinnedRequest, pinnedJson, PinMismatchError } from '../server/lan/pinnedClient';
 import { API_PROTOCOL } from '../server/config';
 import { log } from './store';
+import { proxyIdleTimeoutMs, HEARTBEAT_INTERVAL_MS, HEARTBEAT_TIMEOUT_MS } from './proxyPolicy';
+import { ReconnectScheduler } from './reconnect';
 
 export const ORIGIN = 'app://braintech';
 
@@ -51,10 +53,18 @@ export class Connection {
   inFlightSales = 0;
   private timer: NodeJS.Timeout | null = null;
   private misses = 0;
+  /** the connection check in progress, if any (heartbeat and reconnect retries never overlap) */
+  private checking: Promise<void> | null = null;
+  /** Phase 8c: extra checks after 1 s, 2 s, 5 s, then every 10 s while disconnected (the heartbeat is unchanged) */
+  private readonly reconnect = new ReconnectScheduler(async () => {
+    await this.heartbeat();
+    return this.state.status !== 'DISCONNECTED' && this.state.status !== 'DEGRADED';
+  });
 
   constructor(private readonly roots: { renderer: string; ui: string }) {}
 
   setTarget(t: Target | null, hostName?: string) {
+    this.reconnect.stop();
     this.target = t;
     this.misses = 0;
     this.setState(t ? { status: 'CONNECTED', hostName, isLocal: t.isLocal } : { status: 'NOT_CONFIGURED', isLocal: false });
@@ -64,28 +74,37 @@ export class Connection {
   setState(s: Omit<ConnectionState, 'since'>) {
     const changed = s.status !== this.state.status || s.detail !== this.state.detail;
     this.state = { ...this.state, ...s, since: changed ? new Date().toISOString() : this.state.since };
+    // reconnect backoff: only while monitoring; any state other than a lost connection ends it
+    if (s.status === 'DISCONNECTED') { if (this.timer) this.reconnect.start(); }
+    else if (s.status !== 'DEGRADED') this.reconnect.stop();
     if (changed) {
       log('connection', `${s.status}${s.detail ? `: ${s.detail}` : ''}`);
       for (const w of BrowserWindow.getAllWindows()) if (!w.isDestroyed()) w.webContents.send('braintech:connection-state', this.state);
     }
   }
 
-  startMonitoring(intervalMs = 5000) {
+  startMonitoring(intervalMs = HEARTBEAT_INTERVAL_MS) {
     this.stopMonitoring();
     this.timer = setInterval(() => void this.heartbeat(), intervalMs);
   }
-  stopMonitoring() { if (this.timer) clearInterval(this.timer); this.timer = null; }
+  stopMonitoring() { if (this.timer) clearInterval(this.timer); this.timer = null; this.reconnect.stop(); }
 
   private headers(): Record<string, string> {
     return this.target?.clientToken ? { 'x-braintech-client': this.target.clientToken } : {};
   }
 
-  async heartbeat(): Promise<void> {
+  /** One connection check; a check already in progress is shared rather than repeated. */
+  heartbeat(): Promise<void> {
+    if (!this.checking) this.checking = this.checkHealth().finally(() => { this.checking = null; });
+    return this.checking;
+  }
+
+  private async checkHealth(): Promise<void> {
     const t = this.target;
     if (!t) return;
     if (this.state.status === 'BACKEND_RESTARTING' || this.state.status === 'BACKEND_FAILED') return;
     try {
-      const r = await pinnedJson(`${t.base}/api/health`, t.fingerprint, { headers: this.headers(), timeoutMs: 3000 });
+      const r = await pinnedJson(`${t.base}/api/health`, t.fingerprint, { headers: this.headers(), timeoutMs: HEARTBEAT_TIMEOUT_MS });
       if (r.status === 200 && r.body?.apiProtocol !== API_PROTOCOL) {
         this.setState({ status: 'VERSION_MISMATCH', detail: `server version ${r.body?.appVersion} (protocol ${r.body?.apiProtocol}); this computer uses protocol ${API_PROTOCOL}. Install the same version on all computers.`, isLocal: t.isLocal, serverVersion: r.body?.appVersion });
         return;
@@ -143,7 +162,8 @@ export class Connection {
     const isSale = method === 'POST' && url.pathname === '/api/sales';
     if (isSale) this.inFlightSales++;
     try {
-      const res = await pinnedRequest(`${t.base}${url.pathname}${url.search}`, t.fingerprint, { method, headers, body, timeoutMs: 30_000 });
+      // Phase 8c: the live-event stream has its own idle timeout; every other request keeps 30 s
+      const res = await pinnedRequest(`${t.base}${url.pathname}${url.search}`, t.fingerprint, { method, headers, body, timeoutMs: proxyIdleTimeoutMs(method, url.pathname) });
       const out = new Headers();
       for (const [k, v] of Object.entries(res.headers)) {
         if (v === undefined || HOP_BY_HOP.has(k.toLowerCase())) continue;

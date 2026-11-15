@@ -1,6 +1,7 @@
 import { exportToExcel } from '../lib/excel';
 import React, { useState, useEffect } from 'react';
 import { api } from '../lib/api';
+import { useLiveRefresh } from '../lib/useLiveRefresh';
 import { DashboardStats } from '../types';
 import { 
   BarChart3, 
@@ -15,7 +16,8 @@ import {
   ArrowUpRight
 } from 'lucide-react';
 
-export const ReportsScreen: React.FC = () => {
+/** `active` (Phase 8c): the screen is visible (it stays mounted while hidden). */
+export const ReportsScreen: React.FC<{ active?: boolean }> = ({ active = true }) => {
   const [stats, setStats] = useState<DashboardStats | null>(null);
   const [salesReport, setSalesReport] = useState<any[]>([]);
   const [topProducts, setTopProducts] = useState<any[]>([]);
@@ -34,9 +36,11 @@ export const ReportsScreen: React.FC = () => {
     fetchReportData();
   }, [startDate, endDate, groupBy]);
 
-  const fetchReportData = async () => {
+  /** `silent` (Phase 8c live refresh): reloads with the current dates and grouping, without a loading state. */
+  const fetchReportData = async (opts: { silent?: boolean } = {}) => {
+    const silent = opts.silent === true;
     try {
-      setLoading(true);
+      if (!silent) setLoading(true);
       const [dashStats, sReport, topProds] = await Promise.all([
         api.getDashboardStats(),
         api.getSalesReport(startDate, endDate, groupBy),
@@ -48,9 +52,12 @@ export const ReportsScreen: React.FC = () => {
     } catch (err) {
       console.error('Error fetching report data:', err);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
+
+  // Phase 8c: sales, purchases, stock and customer balances feed these figures
+  useLiveRefresh(['sales', 'purchases', 'inventory', 'customers'], () => fetchReportData({ silent: true }), { active });
 
   const handleExportSalesReportExcel = () => {
     if (salesReport.length === 0) return;
@@ -186,6 +193,7 @@ export const ReportsScreen: React.FC = () => {
               <span className="text-slate-400">From:</span>
               <input
                 type="date"
+                aria-label="Report start date"
                 value={startDate}
                 onChange={(e) => setStartDate(e.target.value)}
                 className="bg-slate-800 text-white p-2 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500"
@@ -195,6 +203,7 @@ export const ReportsScreen: React.FC = () => {
               <span className="text-slate-400">To:</span>
               <input
                 type="date"
+                aria-label="Report end date"
                 value={endDate}
                 onChange={(e) => setEndDate(e.target.value)}
                 className="bg-slate-800 text-white p-2 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500"
@@ -245,7 +254,7 @@ export const ReportsScreen: React.FC = () => {
               <tfoot className="bg-slate-800/90 font-bold text-white border-t-2 border-slate-700">
                 <tr>
                   <td className="py-3 px-4 text-slate-300">TOTAL ({salesReport.length} Periods)</td>
-                  <td className="py-3 px-4 text-center text-emerald-400 hidden sm:table-cell">
+                  <td data-testid="report-total-orders" className="py-3 px-4 text-center text-emerald-400 hidden sm:table-cell">
                     {salesReport.reduce((acc, r) => acc + (r.total_orders || 0), 0)} Orders
                   </td>
                   <td className="py-3 px-4 text-right hidden md:table-cell">

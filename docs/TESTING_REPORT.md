@@ -4,6 +4,36 @@ This report contains only results that were actually executed. Anything not exec
 
 ---
 
+## Phase 8c: live refresh completed; desktop stream timeout and reconnect backoff
+
+| | |
+|---|---|
+| Date | 2026-11-15 |
+| Platform | Linux (container; desktop tests run Electron under xvfb). **Not yet run on Windows; physical two-PC LAN test still pending.** |
+
+### Results
+| Command | Result |
+|---|---|
+| `npm run lint` (`tsc --noEmit`) | clean |
+| `npm run build` / `npm run build:desktop` | both succeeded (web; `main.cjs`, `preload.cjs`, `server.cjs`) |
+| `npx vitest run --maxWorkers=1 --minWorkers=1` | **35 files, 444/444**, 0 unhandled errors, 0 skipped, 343 s |
+| `xvfb-run -a npm run test:e2e` | **5 files, 51/51** (LAN 12, standalone 18, draft cart 9, payments 8, live screens 4), 0 unhandled errors |
+
+No server process was left running.
+
+### New tests
+| File | Tests | What |
+|---|---|---|
+| `tests/unit/desktop-connection.test.ts` | 8 | **Reconnect backoff:** retries at 1 s, 2 s, 5 s, then 10 s (cumulative 1, 3, 8, 18, 28, 38 s) until a check succeeds, then stops with no timer left; repeated `start()` never adds a schedule; `stop()` clears the pending retry; `stop()` during a running check prevents any later retry; a new run starts again at 1 s; a check that throws continues the backoff. **Stream timeout:** `GET /api/events` gets 45 s and every other request keeps 30 s (including `POST /api/events` and other GETs); 45 s is more than twice the keep-alive, and the server's keep-alive really fires at 20 s. **Heartbeat unchanged:** 5 s with a 3 s timeout, and `connection.ts` uses these values and the stream policy (source check, because the module needs Electron) |
+| `tests/unit/pinned-client.test.ts` | +1 | The timeout is an idle timeout (scaled down): a stream with keep-alives every 100 ms stays open for 1.2 s with a 400 ms timeout; once they stop, the stream ends with an error soon after the timeout |
+| `tests/e2e/live-screens.e2e.ts` (new) | 4 | Real desktop app. **Customers:** a payment recorded elsewhere updates the row by itself; the selected customer (not the first in the list) stays selected; with a search, the text and the filtered list stay. **Hidden screen:** three changes while Customers is hidden cause **no** request from it; when shown, it reloads **exactly once** (one list and one ledger request). **Reports:** a sale elsewhere updates the total by itself, and the chosen start and end dates stay. **Purchases:** with one row added and a second item half-entered, a stock change elsewhere refreshes the medicine list (the option shows the new stock), while the row, supplier, selected item and quantity stay |
+
+### Notes
+- The live-screens tests found one problem in the test itself: an "Add" selector matched hidden buttons on other mounted screens. It now targets the visible item-bar button.
+- Not covered: the reconnect backoff inside the real desktop app is exercised only by the existing LAN "host switched off" E2E (which passes) and by unit tests of the scheduler; there is no test that measures its timing inside Electron.
+
+---
+
 ## Phase 8b: front-end live updates
 
 | | |

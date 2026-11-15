@@ -334,6 +334,7 @@ export const PurchaseScreen: React.FC<{ active?: boolean }> = ({ active = true }
                   </button>
                 </div>
                 <select
+                  aria-label="Supplier"
                   value={selectedSupplierId}
                   onChange={(e) => setSelectedSupplierId(e.target.value)}
                   className="w-full bg-slate-800 text-white p-2.5 rounded-xl border border-slate-700 focus:outline-none focus:border-emerald-500"
@@ -415,6 +416,7 @@ export const PurchaseScreen: React.FC<{ active?: boolean }> = ({ active = true }
             <div className="sm:col-span-4">
               <label className="block text-slate-400 font-semibold mb-1">Medicine Item:</label>
               <select
+                aria-label="Medicine item"
                 value={selectedProductId}
                 onChange={(e) => handleSelectProduct(e.target.value)}
                 className="w-full bg-slate-900 text-white p-2 rounded-lg border border-slate-700 focus:outline-none focus:border-emerald-500"
@@ -523,7 +525,7 @@ export const PurchaseScreen: React.FC<{ active?: boolean }> = ({ active = true }
                   <th className="py-2.5 px-3 text-center">Action</th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-slate-800/60">
+              <tbody data-testid="purchase-rows" className="divide-y divide-slate-800/60">
                 {purchaseItems.length === 0 ? (
                   <tr>
                     <td colSpan={7} className="py-12 text-center text-slate-500">
