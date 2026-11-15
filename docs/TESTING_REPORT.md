@@ -9,15 +9,17 @@ This report contains only results that were actually executed. Anything not exec
 | | |
 |---|---|
 | Date | 2026-11-15 |
-| Platform | Linux (container; desktop tests run Electron under xvfb). **Not yet run on Windows; physical two-PC LAN test still pending.** |
+| Platform | Linux (container; desktop tests run Electron under xvfb) and **Windows 11 (run by the owner)**. Physical two-PC LAN test: **PENDING**. |
 
 ### Results
-| Command | Result |
-|---|---|
-| `npm run lint` (`tsc --noEmit`) | clean |
-| `npm run build` / `npm run build:desktop` | both succeeded (web; `main.cjs`, `preload.cjs`, `server.cjs`) |
-| `npx vitest run --maxWorkers=1 --minWorkers=1` | **35 files, 444/444**, 0 unhandled errors, 0 skipped, 343 s |
-| `xvfb-run -a npm run test:e2e` | **5 files, 51/51** (LAN 12, standalone 18, draft cart 9, payments 8, live screens 4), 0 unhandled errors |
+| Platform | Command | Result |
+|---|---|---|
+| Linux | `npm run lint` (`tsc --noEmit`) | clean |
+| Linux | `npm run build` / `npm run build:desktop` | both succeeded (web; `main.cjs`, `preload.cjs`, `server.cjs`) |
+| Linux | `npx vitest run --maxWorkers=1 --minWorkers=1` | **35 files, 444/444**, 0 unhandled errors, 0 skipped, 343 s |
+| Linux | `xvfb-run -a npm run test:e2e` | **5 files, 51/51** (LAN 12, standalone 18, draft cart 9, payments 8, live screens 4), 0 unhandled errors |
+| Windows 11 (owner) | `npx.cmd vitest run --maxWorkers=1 --minWorkers=1` | **35 files, 444/444 passed** |
+| Windows 11 (owner) | `npm run build:desktop` | completed successfully |
 
 No server process was left running.
 
@@ -32,6 +34,12 @@ No server process was left running.
 - The live-screens tests found one problem in the test itself: an "Add" selector matched hidden buttons on other mounted screens. It now targets the visible item-bar button.
 - Not covered: the reconnect backoff inside the real desktop app is exercised only by the existing LAN "host switched off" E2E (which passes) and by unit tests of the scheduler; there is no test that measures its timing inside Electron.
 
+### Open items after Phase 8 (still open)
+- **Physical two-PC LAN verification: PENDING.** All host/client tests ran as two app instances on one computer over 127.0.0.1. Real Wi-Fi or cable drops, the Windows Firewall prompt, UDP discovery and pairing revocation over a real network are untested.
+- **Pairing revocation of a live-event stream opened over the LAN** is covered by unit tests only. In the test environment every request comes from this computer and carries no paired-client identity.
+- **POS cart shows old stock (known limitation).** A live refresh updates the product cards and lists, but lines already in the cart keep the stock figure from when they were added, which sets the on-screen quantity limit. The host still checks stock on every sale and refuses an oversell.
+- **Windows: intermittent timeout of the `0008` crash test, root cause UNKNOWN.** On a Windows full run of the Phase 8a code, `tests/unit/payment-migration.test.ts` › "the server is killed inside the 0008 transaction…" timed out at 120 s. It takes about 1.4 s on Linux, and the same crash hook passes on Windows in the `0009`/`0010` and `07-durability` crash tests. Commit `e4b5933` bounded each server readiness probe and added step timings to this test, so a recurrence reports where it stops. The test passed in the later Windows full runs (Phase 8b: 435/435; Phase 8c: 444/444); the cause has not been identified.
+
 ---
 
 ## Phase 8b: front-end live updates
@@ -39,15 +47,17 @@ No server process was left running.
 | | |
 |---|---|
 | Date | 2026-11-15 |
-| Platform | Linux (container; desktop tests run Electron under xvfb). **Not yet run on Windows; not tested on two physical computers.** |
+| Platform | Linux (container; desktop tests run Electron under xvfb) and **Windows 11 (run by the owner)**. Physical two-PC LAN test: **PENDING**. |
 
 ### Results
-| Command | Result |
-|---|---|
-| `npm run lint` (`tsc --noEmit`) | clean |
-| `npm run build` (web bundle and server) | succeeded |
-| `npx vitest run --maxWorkers=1 --minWorkers=1` | **34 files, 435/435**, 0 unhandled errors, 0 skipped, 323 s |
-| `xvfb-run -a npm run test:e2e` | **4 files, 47/47** (LAN 12, standalone 18, draft cart 9, payments 8), 0 unhandled errors |
+| Platform | Command | Result |
+|---|---|---|
+| Linux | `npm run lint` (`tsc --noEmit`) | clean |
+| Linux | `npm run build` (web bundle and server) | succeeded |
+| Linux | `npx vitest run --maxWorkers=1 --minWorkers=1` | **34 files, 435/435**, 0 unhandled errors, 0 skipped, 323 s |
+| Linux | `xvfb-run -a npm run test:e2e` | **4 files, 47/47** (LAN 12, standalone 18, draft cart 9, payments 8), 0 unhandled errors |
+| Windows 11 (owner) | `npx.cmd vitest run --maxWorkers=1 --minWorkers=1` | **34 files, 435/435 passed** |
+| Windows 11 (owner) | `npm run build:desktop` | completed successfully (web, Electron main, preload and backend bundles) |
 
 No server process was left running after any run.
 
@@ -60,9 +70,8 @@ No server process was left running after any run.
 | `tests/e2e/draft-cart.e2e.ts` | +1 | A live stock refresh updates the POS product card by itself, while the cart lines, customer, discount and saved draft stay exactly as they were |
 
 ### Not covered
-- Two physical Windows computers on a real network (Wi-Fi drops, firewall).
-- The "hidden screen refreshes once when shown" behaviour is covered by code review only; there is no component test (no DOM test environment in the project).
-- Purchase-form preservation is by construction (a refresh replaces only the lists); there is no E2E test of a form being filled while a change arrives.
+- Two physical Windows computers on a real network (Wi-Fi drops, firewall): **PENDING**.
+- Since Phase 8c, a hidden screen reloading exactly once when shown again and a purchase being entered surviving a live refresh **are covered** by `tests/e2e/live-screens.e2e.ts` (see Phase 8c).
 
 ---
 
@@ -71,16 +80,17 @@ No server process was left running after any run.
 | | |
 |---|---|
 | Date | 2026-11-14 |
-| Platform | Linux (container; desktop tests run Electron under xvfb). **Not yet run on Windows.** |
+| Platform | Linux (container; desktop tests run Electron under xvfb) and **Windows 11 (run by the owner)**. Physical two-PC LAN test: **PENDING**. |
 
 ### Results
-| Command | Result |
-|---|---|
-| `npm run lint` (`tsc --noEmit`) | clean |
-| `npx vitest run tests/unit/live-events.test.ts tests/characterization/16-live-events.test.ts` | 2 files, 25/25 |
-| `16-live-events` repeated three more times | 12/12 each time |
-| `npx vitest run --maxWorkers=1 --minWorkers=1` | **32 files, 420/420**, 0 unhandled errors, 0 skipped, 286 s |
-| `xvfb-run -a npm run test:e2e` (including LAN host and client) | **4 files, 44/44** |
+| Platform | Command | Result |
+|---|---|---|
+| Linux | `npm run lint` (`tsc --noEmit`) | clean |
+| Linux | `npx vitest run tests/unit/live-events.test.ts tests/characterization/16-live-events.test.ts` | 2 files, 25/25 |
+| Linux | `16-live-events` repeated three more times | 12/12 each time |
+| Linux | `npx vitest run --maxWorkers=1 --minWorkers=1` | **32 files, 420/420**, 0 unhandled errors, 0 skipped, 286 s |
+| Linux | `xvfb-run -a npm run test:e2e` (including LAN host and client) | **4 files, 44/44** |
+| Windows 11 (owner) | full Vitest run of the Phase 8a code (420 tests) | **419 passed; 1 timed out**: `payment-migration` › "the server is killed inside the 0008 transaction…" at 120 s. Root cause **UNKNOWN** (see Phase 8c › Open items). The Phase 8a tests, and this test, passed in the later Windows full runs of Phase 8b (435/435) and Phase 8c (444/444). |
 
 No server process was left running after any run.
 
@@ -94,8 +104,8 @@ No server process was left running after any run.
 The super admin's "log in as store owner" (`POST /api/superadmin/tenants/:id/login-as`) was first mapped to `users`/`settings` and emitted two events for the store. It changes no store data, so it now emits nothing. The integration test catches this by checking that a store's first event follows its stream's `ready.seq` with no gap.
 
 ### Not covered (and why)
-- **Pairing revocation of a stream opened over the LAN:** covered by the unit tests only. In the test environment every request comes from this computer (loopback), and loopback requests never carry a paired-client identity. To verify on two computers in Phase 8b/8c.
-- **The desktop proxy, the backoff and the screens' live refresh:** Phase 8b/8c.
+- **Pairing revocation of a stream opened over the LAN:** covered by the unit tests only. In the test environment every request comes from this computer (loopback), and loopback requests never carry a paired-client identity. Still to verify on two physical computers (**PENDING**).
+- **The desktop proxy, the backoff and the screens' live refresh:** done since, in Phase 8b (stream through the pinned proxy, screens) and Phase 8c (Customers and Reports, stream timeout, reconnect backoff); see those sections.
 
 ---
 

@@ -197,7 +197,7 @@ The installer grants `Users:Modify` on this folder. If it is not writable, the a
 - On connect and every 60 s the server re-validates the JWT and the user/tenant status. The stream is closed on expiry, disable, suspension, logout or pairing revocation.
 - **Payload:** only `{seq, topic, tenantId}` with topic ∈ `inventory | sales | customers | purchases | settings | users | backups`. No business data travels in events; clients re-fetch through authorised endpoints, so authorisation is never bypassed.
 - Events are emitted **after commit** only, scoped per tenant, and `seq` is monotonic per server start (with a `bootId`). A client that sees a gap, a new `bootId` or a reconnect performs a full refresh. Duplicate events are harmless because they only trigger a re-fetch.
-- **Front end:** `src/lib/liveUpdates.ts` (`useLiveRefresh(topic, refetch)`), wired into App alerts, Billing (products, customers), Inventory, Customers, Sales, Purchases and Reports. A heartbeat comment every 20 s keeps NAT/Wi-Fi idle timeouts from dropping the stream.
+- **Front end:** `src/lib/liveEvents.ts` (the stream client `LiveEventClient`) and `src/lib/useLiveRefresh.ts` (the screens' hook `useLiveRefresh(topics, refresh, { active })`), wired into App alerts, Billing (products, customers), Inventory, Customers, Sales, Purchases and Reports (see "As built in Phase 8b/8c"). A heartbeat comment every 20 s keeps NAT/Wi-Fi idle timeouts from dropping the stream.
 
 ## 10. Inventory model (batch level)
 
@@ -330,7 +330,7 @@ sales_returns / sales_return_items (sale_item_id, batch_id, qty, restock flag, r
 - **Legacy formats:** `.kmhbackup` import stays supported (read-only CBC path). The MySQL dump export is kept.
 - **UI:** last successful backup time, health chip (OK / STALE > 26 h / FAILED / NO EXTERNAL COPY), history list.
 
-### Phase 9 decisions approved by the owner (recorded; not implemented yet)
+### Phase 9 decisions approved by the owner: DECIDED, NOT IMPLEMENTED
 - **Restore:** only by the SUPER_ADMIN on the host computer. LAN clients can never restore the whole database.
 - **Safety backups** (pre-migration and pre-restore) will be encrypted.
 - **Schedule and retention:** custom. The backup time, backup-on-close behaviour and retention periods must be confirmed with the owner before Phase 9 is implemented; the defaults above are not assumed.
@@ -396,7 +396,7 @@ Every phase ends with tests, a build check, a regression check against `FEATURE_
 | JWT secret | random, DPAPI-protected | random 64 bytes in `data/jwt.secret`, owner-only file permissions; the role is always read from the database | DPAPI wrapping of this file is listed for Phase 10 |
 | FK enforcement | after approved fixes | **ON** (FK1–FK5, see `FK_AUDIT_REPORT.md`) | n/a |
 | Idempotency | `client_txn_id` column on each table | `idempotency_keys` table (key, route, stored result), written in the same transaction as the sale | One mechanism for every route, no table rebuilds; used by sales now, payments/purchases in Phase 7 |
-| Real-time updates | SSE | **Built in Phase 8a (server) and 8b (front end)**. See "As built in Phase 8a/8b". Billing, Inventory, Sales Register and Purchases refresh live; other screens still load fresh data when opened. | Phase order |
+| Real-time updates | SSE | **Built in Phase 8a (server), 8b (front end) and 8c (Customers, Reports, desktop stream timeout and reconnect backoff)**. See "As built in Phase 8a/8b/8c". Billing, Inventory, Customers, Sales Register, Purchases and Reports refresh live; screens outside that list still load fresh data when opened. Physical two-PC verification: PENDING. | Phase order |
 | Batch inventory (Phase 6) | §10 | Built as described in §10 "As built in Phase 6". Stock protection is in the database (CHECK + triggers), not only in code. | A missed code path must fail, not silently corrupt stock |
 | Stock invariant check | in-transaction + periodic | at startup only, reported, never repaired; the database triggers make a mismatch impossible through normal writes | Periodic check deferred |
 
