@@ -218,3 +218,32 @@ describe('(11, 12) legacy and expired drafts', () => {
     expect(await qtys()).toEqual(['1']);
   }, 120_000);
 });
+
+describe('Phase 8b: a live refresh never touches the cart', () => {
+  it('stock changed elsewhere: the POS shows the new stock by itself; cart lines, customer, discount and the saved draft stay exactly as they were', async () => {
+    while (await w().locator('button:has-text("Remove")').count()) await w().locator('button:has-text("Remove")').first().click();
+    await expect.poll(() => getItem(ownerKey)).toBeNull();
+    const brufen = await product('BF-109');
+    const customer = (await apiFromRenderer(w(), 'GET', '/customers')).body[0];
+    await addByCode('AG-442');
+    await addByCode('BF-109', 2);
+    await w().selectOption('select[aria-label="POS customer"]', String(customer.id));
+    await w().fill('input[aria-label="Bill discount percent"]', '3');
+    await expect.poll(async () => (await draftOf(ownerKey))?.discountPercent).toBe(3);
+    const draftBefore = await draftOf(ownerKey);
+    const card = w().locator(`[data-testid="pos-product-${brufen.id}"]`);
+    await expect.poll(() => card.innerText()).toContain(`Stock: ${brufen.sellable_stock} ${brufen.unit}s`);
+
+    // another computer (here: the API, as a client would) adds stock; nothing is clicked on this screen
+    const adj = await apiFromRenderer(w(), 'POST', '/inventory/adjust', { product_id: brufen.id, adjustment_type: 'ADD', quantity: 5, reason: 'Live refresh test', reason_code: 'COUNT_CORRECTION', batch_number: 'LIVE-POS', expiry_date: '2027-06-30' });
+    expect(adj.status).toBe(200);
+    await expect.poll(() => card.innerText(), { timeout: 15_000, interval: 200 }).toContain(`Stock: ${brufen.sellable_stock + 5} ${brufen.unit}s`);
+
+    expect(await qtys()).toEqual(['1', '2']);
+    expect(await w().locator('select[aria-label="POS customer"]').inputValue()).toBe(String(customer.id));
+    expect(await w().locator('input[aria-label="Bill discount percent"]').inputValue()).toBe('3');
+    const draftAfter = await draftOf(ownerKey);
+    expect({ ...draftAfter, savedAt: 'x' }).toEqual({ ...draftBefore, savedAt: 'x' }); // same lines, customer and discount
+    while (await w().locator('button:has-text("Remove")').count()) await w().locator('button:has-text("Remove")').first().click();
+  }, 120_000);
+});

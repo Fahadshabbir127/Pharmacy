@@ -268,6 +268,9 @@ describe('rollback, crash recovery and verified backup', () => {
   });
 
   it('the server is killed inside the 0008 transaction; the next start migrates cleanly; a verified backup of v7 exists', async () => {
+    // progress with elapsed time: if this test is slow or stuck on a computer, its output shows which step
+    const t0 = Date.now();
+    const step = (what: string) => console.log(`[0008 crash test] ${what} (${Date.now() - t0} ms)`);
     // a v7 database (as Phase 6 / Batch 1 left it) is the realistic starting point
     const { dir, file } = copy('payments-edge-cases');
     const v7 = DbAdapter.open(file);
@@ -276,7 +279,9 @@ describe('rollback, crash recovery and verified backup', () => {
     v7.close();
     const dataDir = path.join(dir, 'data');
     fs.renameSync(file, path.join(dataDir, 'khushi_pharmacy.sqlite'));
+    step('v7 database prepared; starting the server that is killed inside 0008');
     await expect(startServer({ workDir: dir, env: { PHARMACY_TEST_CRASH_MIGRATION: '8' } })).rejects.toThrow(/exited early/);
+    step('server killed inside 0008 as intended');
     const mid = DbAdapter.open(path.join(dataDir, 'khushi_pharmacy.sqlite'), { readonly: true });
     expect(currentVersion(mid)).toBe(7);
     expect(mid.tableNames()).not.toContain('payments');
@@ -290,7 +295,9 @@ describe('rollback, crash recovery and verified backup', () => {
     expect(currentVersion(bk)).toBe(7);
     expect(money(bk)).toEqual(before);
     bk.close();
+    step('rolled back to v7 and the v7 backup verified; starting the server again');
     const srv = await startServer({ workDir: dir });
+    step('the second start completed the migration');
     try {
       const db = DbAdapter.open(srv.dbFile, { readonly: true });
       expect(currentVersion(db)).toBe(LATEST);
@@ -301,6 +308,7 @@ describe('rollback, crash recovery and verified backup', () => {
       expect(srv.logs()).toMatch(/\[PAYMENTS\] 2 customer balance\(s\) differ/);
     } finally {
       await srv.stop();
+      step('server stopped');
     }
   }, 120_000);
 });

@@ -167,6 +167,8 @@ export const api = {
       body: JSON.stringify(data),
     }),
   getMe: () => request<{ user: User }>('/auth/me'),
+  /** Phase 8b: tells the host to end this session's live-event streams (best effort; tokens are stateless). */
+  logout: () => request<{ loggedOut: boolean; closedStreams: number }>('/auth/logout', { method: 'POST', body: '{}' }),
 
   // Super Admin Methods (Supervisor & Platform Management)
   getSuperAdminMetrics: () => request<{ totalTenants: number; activeTenants: number; totalSales: number; totalRevenue: number; totalUsers: number }>('/superadmin/metrics'),

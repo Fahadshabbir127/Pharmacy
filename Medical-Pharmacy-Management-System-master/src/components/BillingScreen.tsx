@@ -6,6 +6,7 @@ import { api, ApiError, getCurrentUser, SaleQuote } from '../lib/api';
 import { saveDraftCart, clearDraftCart, inspectDraft, removeUnusableDrafts, restoreDraftCart, draftOwnerOf, DraftCart, DRAFT_MAX_AGE_HOURS } from '../lib/draftCart';
 import { priceBill, priceLine, sameMoney } from '../../shared/pricing';
 import { ThermalReceiptModal } from './ThermalReceiptModal';
+import { useLiveRefresh } from '../lib/useLiveRefresh';
 import { 
   Search, 
   Plus, 
@@ -34,9 +35,11 @@ import {
 interface BillingScreenProps {
   settings?: SystemSettings | null;
   onRefreshData?: () => void;
+  /** Phase 8b: the screen is visible (it stays mounted while hidden) */
+  active?: boolean;
 }
 
-export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefreshData }) => {
+export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefreshData, active = true }) => {
   const [products, setProducts] = useState<Product[]>([]);
   const [categories, setCategories] = useState<Category[]>([]);
   const [customers, setCustomers] = useState<Customer[]>([]);
@@ -325,9 +328,12 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
     else clearDraftCart(draftOwner);
   }, [cart, selectedCustomer, overallDiscountPercent]);
 
-  const fetchInitialData = async () => {
+  /** `silent`: a live refresh; keeps the product grid on screen (no loading state). Never touches the cart,
+   *  the selected customer, payments or the draft: only the medicine, category and customer lists are replaced. */
+  const fetchInitialData = async (opts: { silent?: boolean } = {}) => {
+    const silent = opts?.silent === true;
     try {
-      setLoading(true);
+      if (!silent) setLoading(true);
       const [prodsData, catsData, custsData] = await Promise.all([
         api.getInventory(),
         api.getCategories(),
@@ -340,9 +346,12 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
     } catch (err) {
       console.error('Error fetching billing data:', err);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
+
+  // Phase 8b: another computer changed stock, prices or customers
+  useLiveRefresh(['inventory', 'customers'], () => fetchInitialData({ silent: true }), { active });
 
   /** Removes drafts that cannot be offered (expired, unreadable, legacy without an owner) and says so. */
   const housekeepDrafts = () => {
@@ -1139,6 +1148,7 @@ export const BillingScreen: React.FC<BillingScreenProps> = ({ settings, onRefres
                   return (
                     <div
                       key={product.id}
+                      data-testid={`pos-product-${product.id}`}
                       onClick={() => handleAddToCart(product)}
                       className={`p-2 rounded border transition-all cursor-pointer flex flex-col justify-between ${
                         isOutOfStock

@@ -61,23 +61,26 @@ async function waitForServer(proc: ChildProcess, logs: () => string, timeoutMs =
     if (proc.exitCode !== null || proc.signalCode !== null) {
       throw new Error(`Server exited early with code ${proc.exitCode ?? proc.signalCode}\n${logs()}`);
     }
+    // each probe is bounded: a server that accepts the connection but does not answer must not hold the loop past
+    // `timeoutMs` (Node's fetch waits up to 300 s for headers), or a stall shows up as a bare test timeout without logs
+    const probeMs = Math.max(250, Math.min(5000, timeoutMs - (Date.now() - start)));
     try {
       if (tlsPin) {
         const { pinnedJson } = await import('../../server/lan/pinnedClient');
-        const status = (await pinnedJson(`https://127.0.0.1:${PORT}/api/health`, tlsPin)).status;
+        const status = (await pinnedJson(`https://127.0.0.1:${PORT}/api/health`, tlsPin, { timeoutMs: probeMs })).status;
         if (status === 200) return;
         lastCheck = `HTTP ${status}`;
       } else {
-        const res = await fetch(`${BASE_URL}/api/auth/me`);
+        const res = await fetch(`${BASE_URL}/api/auth/me`, { signal: AbortSignal.timeout(probeMs) });
         if (res.status === 401) return; // routes registered, auth middleware active
         lastCheck = `HTTP ${res.status}`;
       }
     } catch (e: any) {
-      lastCheck = e?.cause?.code || e?.code || e?.message || String(e); // not listening yet (normally ECONNREFUSED)
+      lastCheck = e?.name === 'TimeoutError' ? `no answer within ${probeMs} ms` : e?.cause?.code || e?.code || e?.message || String(e); // normally ECONNREFUSED
     }
     await new Promise((r) => setTimeout(r, 250));
   }
-  throw new Error(`Server did not become ready within ${timeoutMs} ms (server process ${proc.pid} still running; last readiness check: ${lastCheck})\n${logs()}`);
+  throw new Error(`Server did not become ready within ${timeoutMs} ms (server process ${proc.pid} ${proc.exitCode === null && proc.signalCode === null ? 'still running' : `exited with ${proc.exitCode ?? proc.signalCode}`}; last readiness check: ${lastCheck})\n${logs()}`);
 }
 
 /**

@@ -4,6 +4,38 @@ This report contains only results that were actually executed. Anything not exec
 
 ---
 
+## Phase 8b: front-end live updates
+
+| | |
+|---|---|
+| Date | 2026-11-15 |
+| Platform | Linux (container; desktop tests run Electron under xvfb). **Not yet run on Windows; not tested on two physical computers.** |
+
+### Results
+| Command | Result |
+|---|---|
+| `npm run lint` (`tsc --noEmit`) | clean |
+| `npm run build` (web bundle and server) | succeeded |
+| `npx vitest run --maxWorkers=1 --minWorkers=1` | **34 files, 435/435**, 0 unhandled errors, 0 skipped, 323 s |
+| `xvfb-run -a npm run test:e2e` | **4 files, 47/47** (LAN 12, standalone 18, draft cart 9, payments 8), 0 unhandled errors |
+
+No server process was left running after any run.
+
+### New tests
+| File | Tests | What |
+|---|---|---|
+| `tests/unit/live-client.test.ts` | 13 | SSE parser: LF, CRLF and CR; multi-line data; comments; the same result for every chunk size, including CR and LF split across chunks. Client: token only in the Authorization header; changes in order; a gap resyncs and still delivers the change; a restore resyncs; reconnect after a drop resyncs; a new boot id is reported and its seq 1 is not a gap; backoff of 1, 2, 4, 8, 16, 30, 30 s, restarting at 1 s after a working stream; 429 and 503 retried; 401 and 403 end without retrying; the five session-end reasons stop the client while SERVER_SHUTDOWN reconnects; `stop()` aborts and nothing reconnects; no token, no connection; all-stores streams track each store; topic matching |
+| `tests/characterization/17-live-client.test.ts` | 2 | The client against a real server: receives changes; after a **server restart** it reconnects by itself, reports `boot-changed` and continues without a false gap; a suspended account and logout end the session and the client stops |
+| `tests/e2e/lan.e2e.ts` | +2 | Two real Electron instances over the pinned-HTTPS proxy, run after the host was switched off and on again: a stock change on the **host** appears on the **client**'s open Inventory screen with no click or reload; a sale on the **client** appears in the **host**'s open Sales Register with no click or reload |
+| `tests/e2e/draft-cart.e2e.ts` | +1 | A live stock refresh updates the POS product card by itself, while the cart lines, customer, discount and saved draft stay exactly as they were |
+
+### Not covered
+- Two physical Windows computers on a real network (Wi-Fi drops, firewall).
+- The "hidden screen refreshes once when shown" behaviour is covered by code review only; there is no component test (no DOM test environment in the project).
+- Purchase-form preservation is by construction (a refresh replaces only the lists); there is no E2E test of a form being filled while a change arrives.
+
+---
+
 ## Phase 8a: server event system (server-sent events)
 
 | | |
