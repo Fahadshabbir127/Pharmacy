@@ -23,7 +23,8 @@ export function lanGuard(opts: { mode: () => ServerMode; db: () => DbAdapter }) 
     if (mode === 'legacy') return next(); // original behaviour for tests/dev; the desktop app never runs in this mode
     if (mode !== 'host') return res.status(403).json({ error: 'This computer does not accept network connections (standalone mode).' });
     if (!isPrivateLan(ip)) return res.status(403).json({ error: 'Only computers on the local network may connect.' });
-    if (OPEN_PATHS.some((r) => r.test(req.path))) return next();
+    const routePath = req.baseUrl ? `${req.baseUrl}${req.path}` : req.path;
+    if (OPEN_PATHS.some((r) => r.test(routePath))) return next();
     const token = req.get(CLIENT_HEADER);
     const client = token
       ? opts.db().get<{ id: number; revoked_at: string | null }>('SELECT id, revoked_at FROM paired_clients WHERE token_hash = ?', [hashToken(token)])

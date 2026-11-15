@@ -10,6 +10,7 @@ import crypto from 'node:crypto';
 import { startServer, Api, RunningServer, cartItem, salePayload, makeTempDir, PORT } from '../helpers/server';
 import { openReadOnly, one } from '../helpers/db';
 import { generateCertificate } from '../../server/lan/tls';
+import { isPrivateLan } from '../../server/config';
 import { pinnedJson, pairWithHost, probeCertificate, PinMismatchError } from '../../server/lan/pinnedClient';
 
 const FRESH = { PHARMACY_TEST_LEGACY_SEED: '0' };
@@ -153,7 +154,7 @@ describe('HTTPS, pinning, host mode and pairing', () => {
 
       // the container's real interface (192.0.2.2, TEST-NET-1) is NOT a private LAN range -> refused
       const lanIp = Object.values(os.networkInterfaces()).flat().find((i) => i && i.family === 'IPv4' && !i.internal)?.address;
-      if (lanIp) {
+      if (lanIp && !isPrivateLan(lanIp)) {
         const r = await pinnedJson(`https://${lanIp}:${PORT}/api/health`, cert.fingerprint);
         expect(r.status).toBe(403);
         expect(r.body.error).toMatch(/local network/);
