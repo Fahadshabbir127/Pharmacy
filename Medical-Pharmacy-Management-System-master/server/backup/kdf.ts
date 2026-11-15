@@ -87,7 +87,8 @@ const HKDF_INFO_MAC = Buffer.from('BTBACKUP v1 hmac-sha256 header', 'utf8');
 function scryptAsync(password: Buffer, salt: Buffer, params: ScryptParams): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     crypto.scrypt(password, salt, KEY_BYTES, { N: params.N, r: params.r, p: params.p, maxmem: scryptMemoryBytes(params) + 16 * 1024 * 1024 }, (err, key) => {
-      if (err) reject(new BackupError('KDF_PARAMS_REJECTED', 'kdf')); // never pass the native message through
+      // parameters were already checked, so a failure here is a run-time problem (e.g. memory); never pass the native message through
+      if (err) reject(new BackupError('KDF_FAILED', 'kdf'));
       else resolve(key);
     });
   });

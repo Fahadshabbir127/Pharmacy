@@ -89,17 +89,18 @@ function heldLayout(lock: unknown): BackupLayout {
 }
 
 /**
- * Create a new, empty temporary file in .work with 'wx' and mode 0600. Requires the held backup lock. The name is
- * random; on the (practically impossible) collision another name is tried, at most 3 times. The target is checked to
- * be inside .work.
+ * Create a new, empty temporary file in .work with 'wx' (or 'wx+' with readWrite: the encrypted .partial is written
+ * and then read back through the same handle) and mode 0600. Requires the held backup lock. The name is random; on
+ * the (practically impossible) collision another name is tried, at most 3 times. The target is checked to be inside
+ * .work. An existing name is never opened.
  */
-export async function createWorkFile(lock: BackupLock, purpose: string): Promise<CreatedFile> {
+export async function createWorkFile(lock: BackupLock, purpose: string, opts: { readWrite?: boolean } = {}): Promise<CreatedFile> {
   const layout = heldLayout(lock);
   for (let i = 0; i < 3; i++) {
     const file = resolveInside(layout.workDir, newWorkName(purpose), WORK_NAME);
     await assertNotProtected(file, layout);
     try {
-      return { path: file, handle: await fs.open(file, 'wx', 0o600) };
+      return { path: file, handle: await fs.open(file, opts.readWrite ? 'wx+' : 'wx', 0o600) };
     } catch (e: any) {
       if (e?.code === 'EEXIST') continue;
       throw mapWriteError(e, 'create');

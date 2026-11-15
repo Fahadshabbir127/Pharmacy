@@ -65,7 +65,14 @@ export const APPLY_ACL_SCRIPT = [
   "[Console]::Out.Write('{\"applied\":true}')",
 ].join('\n');
 
-export type AclScript = 'read' | 'apply';
+/**
+ * Fixed script: like READ_ACL_SCRIPT, for a file ($env:BT_ACL_TARGET). Used on each new temporary file in .work
+ * before plaintext is written to it: its access list must be exactly the entries inherited from the private folder.
+ */
+export const READ_FILE_ACL_SCRIPT = READ_ACL_SCRIPT
+  .replace('$di = [System.IO.DirectoryInfo]::new($p)', '$di = [System.IO.FileInfo]::new($p)');
+
+export type AclScript = 'read' | 'apply' | 'readFile';
 /** Runs one of the two fixed scripts against a folder; returns its standard output. Injectable for tests. */
 export type AclRunner = (script: AclScript, target: string) => Promise<string>;
 
@@ -84,7 +91,7 @@ export function aclChildEnv(target: string, base: NodeJS.ProcessEnv = process.en
 }
 
 export const defaultAclRunner: AclRunner = (script, target) => new Promise((resolve, reject) => {
-  const text = script === 'read' ? READ_ACL_SCRIPT : APPLY_ACL_SCRIPT;
+  const text = script === 'read' ? READ_ACL_SCRIPT : script === 'readFile' ? READ_FILE_ACL_SCRIPT : APPLY_ACL_SCRIPT;
   const encoded = Buffer.from(text, 'utf16le').toString('base64');
   execFile(powershellPath(), ['-NoProfile', '-NonInteractive', '-NoLogo', '-EncodedCommand', encoded], {
     env: aclChildEnv(target),
@@ -129,6 +136,34 @@ export function isExpectedSddl(sddl: string, userSid: string): boolean {
     if (type !== 'A' || objGuid !== '' || inhGuid !== '') return false;
     const fl = (aceFlags.match(/.{2}/g) ?? []).sort().join('');
     if (aceFlags.length !== 4 || fl !== 'CIOI') return false;
+    if (rights !== 'FA' && rights.toLowerCase() !== '0x1f01ff') return false;
+    const sid = SDDL_ALIASES[rawSid] ?? rawSid;
+    if (!want.has(sid) || seen.has(sid)) return false;
+    seen.add(sid);
+  }
+  return seen.size === 3;
+}
+
+/**
+ * Independent check of a FILE's access list inside a private folder: not protected (the entries come from the
+ * folder), exactly three inherited (ID) allow entries with full access for exactly the user, SYSTEM and
+ * Administrators, and nothing else.
+ */
+export function isExpectedInheritedFileSddl(sddl: string, userSid: string): boolean {
+  const m = /^D:([A-Z]*)((?:\([^()]*\))+)$/.exec(sddl);
+  if (!m) return false;
+  const dacl: string[] = m[1].match(/AI|AR/g) ?? []; // a protected (P) file DACL would not come from the folder
+  if (dacl.join('') !== m[1] || new Set(dacl).size !== dacl.length) return false;
+  const aces = m[2].slice(1, -1).split(')(');
+  if (aces.length !== 3) return false;
+  const want = new Set([userSid, SID_SYSTEM, SID_ADMINISTRATORS]);
+  if (want.size !== 3) return false;
+  const seen = new Set<string>();
+  for (const ace of aces) {
+    const parts = ace.split(';');
+    if (parts.length !== 6) return false;
+    const [type, aceFlags, rights, objGuid, inhGuid, rawSid] = parts;
+    if (type !== 'A' || objGuid !== '' || inhGuid !== '' || aceFlags !== 'ID') return false;
     if (rights !== 'FA' && rights.toLowerCase() !== '0x1f01ff') return false;
     const sid = SDDL_ALIASES[rawSid] ?? rawSid;
     if (!want.has(sid) || seen.has(sid)) return false;
@@ -198,4 +233,31 @@ export async function ensurePrivateDir(dir: string, opts: PrivateDirOptions = {}
   }
   try { await fs.chmod(dir, 0o700); } catch { throw new BackupError('PERMISSIONS_UNVERIFIED', 'mode'); }
   await verifyPrivateDir(dir, opts);
+}
+
+/**
+ * Verify (never change) that `file` is a private temporary file: a regular file with exactly one name (no symlink,
+ * junction or hard link) at its expected real path, owned by this account, readable by nobody else.
+ * Windows: owner as for folders, and exactly the access entries inherited from the private folder.
+ * POSIX: owned by this user, no group/other permission bits. Throws PATH_REJECTED or PERMISSIONS_UNVERIFIED.
+ */
+export async function verifyPrivateFile(file: string, opts: PrivateDirOptions = {}): Promise<void> {
+  const platform = opts.platform ?? process.platform;
+  let st;
+  try { st = await fs.lstat(file); } catch { throw new BackupError('PATH_REJECTED', 'private-file'); }
+  if (st.isSymbolicLink() || !st.isFile() || st.nlink !== 1) throw new BackupError('PATH_REJECTED', 'private-file');
+  let real: string;
+  try { real = await realpathNative(file); } catch { throw new BackupError('PATH_REJECTED', 'private-file'); }
+  if (!samePath(real, file, platform)) throw new BackupError('PATH_REJECTED', 'private-file');
+  if (platform === 'win32') {
+    const runner = opts.aclRunner ?? defaultAclRunner;
+    let r: AclReport;
+    try { r = parseReport(await runner('readFile', file)); } catch { throw new BackupError('PERMISSIONS_UNVERIFIED', 'acl-file'); }
+    if (r.reparse || !(r.owner === r.user || r.owner === r.tokenOwner) || !isExpectedInheritedFileSddl(r.sddl, r.user)) {
+      throw new BackupError('PERMISSIONS_UNVERIFIED', 'acl-file');
+    }
+    return;
+  }
+  const uid = opts.uid ?? (typeof process.getuid === 'function' ? process.getuid() : -1);
+  if (st.uid !== uid || (st.mode & 0o077) !== 0) throw new BackupError('PERMISSIONS_UNVERIFIED', 'mode-file');
 }
