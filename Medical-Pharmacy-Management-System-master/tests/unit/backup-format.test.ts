@@ -508,3 +508,37 @@ describe('end() during an in-flight push (review finding M1)', () => {
     expect(Buffer.concat(parts).equals(payload)).toBe(true);
   });
 });
+
+describe('maxPlaintextBytes reader option (Phase 9A.2)', () => {
+  it('existing callers are unchanged: no option means no limit', async () => {
+    expect((await decodeBackup(file, SECRET)).data.equals(payload)).toBe(true);
+    expect((await decodeBackup(file, SECRET, file.length, {})).data.equals(payload)).toBe(true);
+    expect((await decodeBackup(file, SECRET, file.length, { maxPlaintextBytes: undefined })).data.equals(payload)).toBe(true);
+  });
+
+  it('exactly the limit is accepted; one byte less is FILE_TOO_LARGE', async () => {
+    expect((await decodeBackup(file, SECRET, 4096, { maxPlaintextBytes: payload.length })).data.equals(payload)).toBe(true);
+    await expectCode(decodeBackup(file, SECRET, 4096, { maxPlaintextBytes: payload.length - 1 }), 'FILE_TOO_LARGE');
+    const empty = await encodeBackup(Buffer.alloc(0), base);
+    expect((await decodeBackup(empty, SECRET, empty.length, { maxPlaintextBytes: 1 })).data.length).toBe(0);
+  });
+
+  it('the limit is enforced from the frame header, before the record body is read or decrypted, and the reader stays failed', async () => {
+    const rs = records(file);
+    const r = new BackupReader(SECRET, { maxPlaintextBytes: CHUNK - 1 });
+    await expect(r.push(file.subarray(0, rs[0].offset + FRAME_HEADER_BYTES))).rejects.toMatchObject({ code: 'FILE_TOO_LARGE' });
+    expect((r as any).keys).toBeNull();
+    await expect(r.push(file.subarray(rs[0].offset + FRAME_HEADER_BYTES))).rejects.toMatchObject({ code: 'FILE_TOO_LARGE' });
+    expect(() => r.end()).toThrow(expect.objectContaining({ code: 'FILE_TOO_LARGE' }));
+    // a later record crossing the limit: the earlier ones were within it
+    await expectCode(decodeBackup(file, SECRET, file.length, { maxPlaintextBytes: CHUNK * 2 + 10 }), 'FILE_TOO_LARGE');
+  });
+
+  it('invalid option values are a programming error (TypeError), not a file error', () => {
+    for (const v of [0, -1, 1.5, NaN, Infinity, 2 ** 53, '10', null]) {
+      expect(() => new BackupReader(SECRET, { maxPlaintextBytes: v as any }), String(v)).toThrow(TypeError);
+    }
+    expect(() => new BackupReader(SECRET, { maxPlaintextBytes: 1 })).not.toThrow();
+    expect(() => new BackupReader(SECRET, { maxPlaintextBytes: Number.MAX_SAFE_INTEGER })).not.toThrow();
+  });
+});

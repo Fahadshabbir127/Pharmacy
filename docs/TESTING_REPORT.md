@@ -4,6 +4,46 @@ This report contains only results that were actually executed. Anything not exec
 
 ---
 
+## Phase 9A.1 and 9A.2: backup format, key derivation and safe file operations (library only)
+
+| | |
+|---|---|
+| Date | 2026-11-15 |
+| Platform | Linux (container). Windows: 9A.1 focused tests run by the owner (70/70) and the scrypt benchmark; **9A.2 Windows run: PENDING (owner)**. |
+
+### Results (Linux)
+| Command | Result |
+|---|---|
+| `npm run lint` (`tsc --noEmit`) | clean |
+| `npx vitest run tests/unit/backup-*.test.ts` | **7 files, 131 passed, 6 skipped (Windows-only), 0 failed** |
+| `npx vitest run` (full suite) | **42 files, 575 passed, 6 skipped (the same Windows-only backup tests), 0 failed**, 0 unhandled errors, 358 s |
+
+### Backup test files
+| File | Tests (Linux) | What |
+|---|---|---|
+| `backup-kdf.test.ts` | 28 | scrypt + HKDF keys, NFC, salts, hostile parameters rejected before scrypt, wiping, `DEFAULT_KDF` (2^17/8/1, frozen, within bounds) |
+| `backup-format.test.ts` | 41 | round trip, header and record tampering, wrong password, record type/order, truncation, insertion, removal, trailing data, cross-file records, versions, no secrets in errors, `end()` during `push()` races, `maxPlaintextBytes` (no option = unchanged; exactly the limit accepted, one byte over refused from the frame header before the body; invalid values are a TypeError) |
+| `backup-detect.test.ts` | 6 | `.btbackup`, legacy `.kmhbackup`, SQLite, base64 SQLite, unknown; read-only |
+| `backup-paths.test.ts` | 11 + 1 Windows-only | layout, `isInside` (a child named `..foo` is inside; `..` itself is not), a real-path error such as a symlink loop is PATH_REJECTED (not ignored), generated names (unique), traversal / separators / streams / reserved names / look-alikes refused, protected paths (database, `-wal`, `-shm`, `-journal`, legacy backups, data folder), symlink to the database refused, 4 GiB limits and format overhead |
+| `backup-private-dir.test.ts` | 10 + 4 Windows-only | scripts use no cmdlets (only the PowerShell language and .NET types); the child environment pins `PSModulePath` to the system modules and drops look-alike variables; SDDL check (exact owner/SYSTEM/Administrators, inheritance blocked; extra, deny, inherited, read-only and other-account entries refused); injected PowerShell runner: owner must be the process user or the token owner reported by Windows, fail closed on blocked/timeout/bad output, apply then independent read-back; fixed scripts; POSIX 0700 and owner, symlinked folder refused |
+| `backup-fs.test.ts` | 20 | creating and publishing require a held `BackupLock` (a released lock, a layout or a look-alike object is refused, nothing created or published); `encrypted/` must verify as private before publishing (POSIX mode/symlink, and with an injected Windows runner); on Windows a lasting EPERM while linking is FS_BUSY, ENOTSUP is still HARDLINK_UNSUPPORTED; retry codes and waits (7.95 s, then FS_BUSY); exclusive creation (0600, never opens an existing name); short writes, full disk; hard-link publishing (exact bytes, never replaces an existing backup, no-hard-link disks fail safely, locked link retried, cleanup pending); unsafe inputs refused; free space rule; 4 GiB database limit (sparse file); backup-file size checked without reading; a full cycle leaves the live database, its WAL and legacy backups byte-identical (hash, size, mtime) |
+| `backup-lock.test.ts` | 15 + 1 Windows-only | lock in one process (rollback journal, empty lock database); **separate processes:** a child holding the lock during asynchronous work blocks this process and the reverse, a killed holder releases at once; planted symlink / hard link as lock or journal refused; symlinked or open `.work` refused; **journal:** exists while held and is removed at release, a dead holder's journal is handled by SQLite, another holder gives BACKUP_IN_PROGRESS immediately without its journal being touched; sweep removes only our temporary files (not folders, links, unknown names or multi-name files), removes a cleanup-pending `.partial`, and cleans up after a writer killed mid-write |
+
+### Skipped on Linux (Windows-only, to be run by the owner)
+- `backup-private-dir.test.ts` "Windows (real access lists through PowerShell)": new folder gets exactly owner/SYSTEM/Administrators with inheritance blocked (independent read-back); an existing open folder is tightened; a path with spaces, quotes, brackets and `$` is handled literally; a junction is refused.
+- `backup-lock.test.ts`: `.work` replaced by a junction is refused.
+- `backup-paths.test.ts`: a differently-cased path to the live database is refused.
+
+On Windows these tests skip instead (POSIX-only): the symlink cases in `backup-paths` (2, including the symlink-loop test) and `backup-lock` (2), the POSIX folder-mode tests in `backup-private-dir` (2), and in `backup-fs` the sparse 4 GiB file test (NTFS would allocate the space) and the non-private `encrypted/` POSIX test (2).
+
+### Notes
+- Implementation found one error in the reviewed plan: SQLite creates `backup.lock-journal` itself while the lock is held (an empty database), so a journal on disk may belong to an active holder. The planned deletion of an existing journal before locking was removed (approved by the owner); the journal is only checked to be a plain single-name file and SQLite handles it.
+- Security review corrections (approved): M1 creating/publishing require the held lock and a verified `encrypted/`; M2 PowerShell scripts without cmdlets and a pinned `PSModulePath`; L1 lasting EPERM on Windows is FS_BUSY; L2 `isInside` accepts child names starting with `..`; L3 real-path errors other than ENOENT are refused; L7 KDF documentation corrected.
+- The PowerShell scripts could not be executed here (no PowerShell in the Linux container); they are exercised only by the Windows-only tests.
+- Not covered: another Windows account squatting `.work` (needs a second account; the logic is covered with the injected runner); PowerShell blocked by policy on a real machine (covered with the injected runner); SMB/network folders.
+
+---
+
 ## Phase 8c: live refresh completed; desktop stream timeout and reconnect backoff
 
 | | |

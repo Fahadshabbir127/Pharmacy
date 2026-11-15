@@ -43,6 +43,12 @@ export const KDF_CANDIDATES: readonly ScryptParams[] = [
   { N: 2 ** 18, r: 8, p: 1 }, // 256 MiB
 ];
 
+/**
+ * Production default, approved after the Windows benchmark (128 MiB of scrypt memory). Writers pass it explicitly;
+ * the reader always uses the parameters stored in the file (within KDF_BOUNDS).
+ */
+export const DEFAULT_KDF: Readonly<ScryptParams> = Object.freeze({ N: 2 ** 17, r: 8, p: 1 });
+
 export const scryptMemoryBytes = (p: ScryptParams) => 128 * p.N * p.r;
 
 /** Throws KDF_PARAMS_REJECTED unless the parameters are within KDF_BOUNDS. Cheap: no derivation happens. */
