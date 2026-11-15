@@ -287,7 +287,7 @@ export default function App() {
 
               {visitedTabs.has('customers') && (
                 <div className={activeTab === 'customers' ? 'block' : 'hidden'}>
-                  <CustomerManagementScreen currentUser={currentUser} />
+                  <CustomerManagementScreen currentUser={currentUser} active={activeTab === 'customers'} />
                 </div>
               )}
 
@@ -299,7 +299,7 @@ export default function App() {
 
               {visitedTabs.has('reports') && (
                 <div className={activeTab === 'reports' ? 'block' : 'hidden'}>
-                  <ReportsScreen />
+                  <ReportsScreen active={activeTab === 'reports'} />
                 </div>
               )}
 

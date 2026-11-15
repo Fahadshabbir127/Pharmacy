@@ -246,6 +246,13 @@ sales_returns / sales_return_items (sale_item_id, batch_id, qty, restock flag, r
 | Voids | Soft-void (`status`, `voided_at`, `voided_by`, `void_reason`) that restores stock to the original batches and reverses the ledger; reports exclude voided sales |
 | Audit | Every financial, stock, security, backup and config action is written to `audit_logs` in the same transaction as the change |
 
+### As built in Phase 8c (live refresh completed; desktop connection)
+- **Customers** refreshes on `customers` and `sales`. It keeps the search, the selected customer (by id; a slower answer never overwrites a newer choice) and every open window or form (add, edit, payment, message). It reloads the list, the selected customer's ledger and its account tabs in place, with no loading state.
+- **Reports** refreshes on `sales`, `purchases`, `inventory` and `customers`, with the chosen dates and grouping. Both screens get an `active` prop, so a hidden, mounted screen reloads once when shown again.
+- **Desktop proxy** (`electron/proxyPolicy.ts`): `GET /api/events` gets its own idle timeout of 45 s. That is more than twice the server's 20 s keep-alive, so one late keep-alive is tolerated and a silent host still ends the stream (the window's client then reconnects). Every other proxied request keeps 30 s.
+- **Desktop reconnect** (`electron/reconnect.ts`): when the connection becomes DISCONNECTED while monitoring is on, extra connection checks run after 1 s, 2 s, 5 s, then every 10 s until one succeeds. They stop when the connection is back, monitoring stops or the target changes, and there is never more than one retry timer.
+  - **The heartbeat is unchanged:** every 5 s with a 3 s timeout. A check already running is shared, so the heartbeat and a retry never overlap.
+
 ### As built in Phase 8b (front-end live updates)
 - `src/lib/liveEvents.ts`: `LiveEventClient` reads `GET /api/events` with `fetch` + `ReadableStream`, with the token in the `Authorization` header only. It has its own SSE parser (LF, CRLF or CR line ends, multi-line data, comments, any chunking).
   - **Reconnect:** backoff of 1 s, 2 s, 4 s, 8 s, 16 s, then 30 s. A stream that worked restarts the sequence at 1 s.
@@ -322,6 +329,11 @@ sales_returns / sales_return_items (sale_item_id, batch_id, qty, restock flag, r
   7. on failure, automatically roll back to the safety backup.
 - **Legacy formats:** `.kmhbackup` import stays supported (read-only CBC path). The MySQL dump export is kept.
 - **UI:** last successful backup time, health chip (OK / STALE > 26 h / FAILED / NO EXTERNAL COPY), history list.
+
+### Phase 9 decisions approved by the owner (recorded; not implemented yet)
+- **Restore:** only by the SUPER_ADMIN on the host computer. LAN clients can never restore the whole database.
+- **Safety backups** (pre-migration and pre-restore) will be encrypted.
+- **Schedule and retention:** custom. The backup time, backup-on-close behaviour and retention periods must be confirmed with the owner before Phase 9 is implemented; the defaults above are not assumed.
 
 ## 13. Branding and configuration
 

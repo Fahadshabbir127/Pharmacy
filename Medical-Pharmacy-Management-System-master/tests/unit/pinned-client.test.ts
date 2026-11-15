@@ -9,7 +9,7 @@ import https from 'node:https';
 import net from 'node:net';
 import tls from 'node:tls';
 import { generateCertificate } from '../../server/lan/tls';
-import { pinnedJson, PinMismatchError } from '../../server/lan/pinnedClient';
+import { pinnedJson, pinnedRequest, PinMismatchError } from '../../server/lan/pinnedClient';
 
 const real = generateCertificate({ commonName: 'pharmacy host', ips: ['127.0.0.1'] });
 const impostor = generateCertificate({ commonName: 'impostor', ips: ['127.0.0.1'] });
@@ -99,6 +99,31 @@ describe('pinned HTTPS client', () => {
     const port = await listen(probe);
     await closers.pop()!(); // free the port: nothing listens there now
     await expect(pinnedJson(`https://127.0.0.1:${port}/api/x`, real.fingerprint, { timeoutMs: 3000 })).rejects.toMatchObject({ code: 'ECONNREFUSED' });
+  });
+
+  it('the timeout is an idle timeout: a stream with regular keep-alives stays open past it; once they stop, the stream ends with an error', async () => {
+    // the desktop proxy's event-stream rule (Phase 8c), scaled down: keep-alive every 100 ms, idle timeout 400 ms
+    let stopSending = () => {};
+    const server = https.createServer({ cert: real.certPem, key: real.keyPem }, (req, res) => {
+      res.writeHead(200, { 'Content-Type': 'text/event-stream' });
+      const t = setInterval(() => res.write(': keep-alive\n\n'), 100);
+      stopSending = () => clearInterval(t); // the host goes silent but keeps the connection open
+      req.on('close', () => clearInterval(t));
+    });
+    const port = await listen(server);
+    const t0 = Date.now();
+    const res = await pinnedRequest(`https://127.0.0.1:${port}/api/events`, real.fingerprint, { timeoutMs: 400 });
+    let received = 0;
+    const ended = (async () => { for await (const c of res) received += (c as Buffer).length; })();
+    await new Promise((r) => setTimeout(r, 1200)); // three times the timeout, kept alive
+    expect(received).toBeGreaterThan(0);
+    stopSending();
+    const stoppedAt = Date.now();
+    await expect(ended).rejects.toThrow();
+    const after = Date.now() - stoppedAt;
+    expect(Date.now() - t0).toBeGreaterThan(1200);
+    expect(after).toBeGreaterThanOrEqual(250); // not before the idle timeout...
+    expect(after).toBeLessThan(2500); // ...but soon after it
   });
 
   it('still refuses a server whose certificate does not match the pin', async () => {
